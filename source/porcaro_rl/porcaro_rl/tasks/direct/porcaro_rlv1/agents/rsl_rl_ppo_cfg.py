@@ -12,11 +12,16 @@ from isaaclab_rl.rsl_rl import (
 
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 16
-    max_iterations = 150
+    # ★変更: 16 -> 48
+    # 50Hzで約1秒分（2拍分）の未来まで見通して、次の動作を計画させます。
+    num_steps_per_env = 48
+    
+    # ★変更: 150 -> 1500
+    # 長時間のエピソードで安定したリズムを習得するため、試行回数を増やします。
+    max_iterations = 1500
+    
     save_interval = 50
-    # 実験名をRNN有効化がわかるように変更
-    experiment_name = "porcaro_rslrl_recurrent_lstm"
+    experiment_name = "porcaro_rslrl_recurrent_lstm_120bpm" # 名前を変えておくと管理しやすいです
     
     # 💡 修正点2: PolicyクラスをRecurrentバージョンに変更
     policy = RslRlPpoActorCriticRecurrentCfg(

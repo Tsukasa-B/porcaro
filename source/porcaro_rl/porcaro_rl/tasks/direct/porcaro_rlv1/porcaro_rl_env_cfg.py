@@ -51,9 +51,13 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     stick_contact_cfg: ContactSensorCfg = contact_forces_stick_at_drum_cfg
     drum_contact_cfg: ContactSensorCfg = drum_vs_stick_cfg
     
-    # --- RL 設定 (porcaro から移植 / 調整) ---
+    # --- RL 設定 ---
+    # dt=1/200, decimation=4 なので 制御周期=50Hz (20ms)
     decimation: int = 4
-    episode_length_s: float = 1.0
+    
+    # ★変更: 1.0s -> 8.0s
+    # 120BPM (0.5s間隔) で16回の打撃を行うのに十分な時間です。
+    episode_length_s: float = 8.0
     
     # --- 空間定義 (porcaro の仕様に合わせる) ---
     # アクション空間: (theta_eq, K_wrist, K_grip) の 3次元

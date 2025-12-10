@@ -106,8 +106,13 @@ class PorcaroRLEnv(DirectRLEnv):
         self.reward_manager = RewardManager(
             cfg=self.cfg.rewards,
             num_envs=self.num_envs,
-            device=self.device
+            device=self.device,
+            dt=self.cfg.sim.dt,
         )
+
+        # リズム計算用
+        self.bpm = self.cfg.rewards.target_bpm
+        self.beat_interval = 60.0 / self.bpm if self.bpm > 0 else 1.0
 
     def _setup_scene(self):
         """シーンにアセット（ロボット、ドラム、地面、ライト、センサ）をセットアップする"""
@@ -198,15 +203,41 @@ class PorcaroRLEnv(DirectRLEnv):
         # 制御対象の関節の「速度」を抽出 (num_envs, 2)
         joint_vel_obs = qd[:, self.dof_idx]
         
-        # --- 変更: リズム情報 4次元をゼロ埋め (Placeholder) ---
-        # 内訳: [time_to_next_hit, target_force, phase_signal, previous_reward]
-        rhythm_info = torch.zeros(
-            (self.num_envs, 4), device=self.device, dtype=torch.float32
-        )
+        # --- ▼▼▼ リズム情報の計算 (詳細実装) ▼▼▼ ---
         
-        # 観測 = [位置(2), 速度(2), リズム情報(4)] の合計 8 次元
-        # (cfg.observation_space = 8 と一致させる)
-        obs = torch.hstack((joint_pos_obs, joint_vel_obs, rhythm_info)) # <-- 変更
+        # 現在の環境内時刻 (resetで0に戻る)
+        t = self.logging_manager.current_time_s.reshape(-1) # [num_envs]
+        
+        # 1. 次の打撃タイミングまでの時間 (Countdown)
+        # target_time = ceil(t / interval) * interval
+        # time_left = target_time - t
+        # (直近の未来の拍をターゲットとする)
+        # ※ t=0.0 のとき ceil(0)=0 になるのを防ぐため少し足すか、
+        #    拍は t=interval, 2*interval... と仮定する
+        beat_index = torch.floor(t / self.beat_interval) + 1.0
+        next_beat_time = beat_index * self.beat_interval
+        time_to_next_hit = next_beat_time - t
+        
+        # 2. 目標強度 (Configから取得して固定値を入れる)
+        target_f = torch.full_like(t, self.cfg.rewards.target_force_fd)
+        
+        # 3. 位相信号 (Phase: 0->1->0) または Sin波
+        # LSTMにとって周期性を掴みやすい Sin/Cos を入れるのが定石
+        phase_signal = torch.sin(2 * torch.pi * t / self.beat_interval)
+        
+        # 4. 前回の報酬 (今回はシンプルに0 or ヒットカウント等を入れる)
+        # ここでは「ヒット回数」を入れて、エージェントに「もう叩いたか？」を教える
+        hit_status = self.reward_manager.hit_count.float()
+
+        rhythm_info = torch.stack([
+            time_to_next_hit,
+            target_f,
+            phase_signal,
+            hit_status
+        ], dim=-1)
+        
+        # 結合: [Pos(2), Vel(2), Rhythm(4)] = 8次元
+        obs = torch.hstack((joint_pos_obs, joint_vel_obs, rhythm_info))
         
         return {"policy": obs}
 
@@ -229,7 +260,8 @@ class PorcaroRLEnv(DirectRLEnv):
         rewards = self.reward_manager.compute_reward_and_dones(
             force_z_history=force_z_history_in_step,     # (C) Z軸の力履歴 (num_envs, decimation)
             episode_length_buf=self.episode_length_buf,    
-            max_episode_length=(self.max_episode_length - 1) 
+            max_episode_length=(self.max_episode_length - 1),
+            current_time_s=self.logging_manager.current_time_s.reshape(-1) # [num_envs] 
         )
         
         # 2. (変更なし) 更新された f1 と reward を取得
