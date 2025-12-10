@@ -78,35 +78,68 @@ class TorqueActionController(ActionController):
     def apply(self, *, actions: torch.Tensor, q: torch.Tensor,
               joint_ids: tuple[int, int], robot: RobotLike) -> None:
         wid, gid = joint_ids
-        assert actions.shape[-1] == 3, "TorqueActionController expects 3-dim action (DF,F,G)."
+        # Action次元のチェックを新しい設計に合わせる
+        assert actions.shape[-1] == 3, "TorqueActionController expects 3-dim action (theta_eq, K_wrist, K_grip)."
         n_envs = int(q.shape[0])
 
-        # 余分な軸が混入しても [n_envs] に落とすユーティリティ
+        # 余分な軸が混入しても [n_envs] に落とすユーティリティ (変更なし)
         def _env1(x: torch.Tensor) -> torch.Tensor:
-            # 例： [n_envs] / [n_envs,1] / [n_envs,K] / [n_envs*K] などを許容
             x = x.reshape(n_envs, -1)
-            return x[:, 0].contiguous()  # 先頭列を採用（平均にしたいなら .mean(dim=1) に変更）
+            return x[:, 0].contiguous()
 
-        # 1) 行動 → 圧力コマンド [0, Pmax]
-        # a = torch.tanh(actions)                            # (-1..1)
+        # Actionの定義:
+        # a[:, 0]: theta_eq (平衡点指令) [-1, 1]
+        # a[:, 1]: K_wrist (手首剛性指令) [-1, 1]
+        # a[:, 2]: K_grip (グリップ剛性指令) [-1, 1]
         a = actions
-        P_cmd = (a + 1.0) * 0.5 * self.Pmax               # (0..Pmax)
-        # P_cmd = torch.maximum(P_cmd, torch.full_like(P_cmd, 0.02))
-        self._dbg("P_cmd(mean DF,F,G)", P_cmd.mean(dim=0))
+        
+        # --- 1) 平衡点制御のための圧力指令値の計算 (Translatorロジック) ---
+        
+        # 暫定的な最大圧力係数。Pmax (0.6MPa)を基に決定。
+        # 論文の定義 [cite: 2025 12 10-1] に基づき、Pmaxの値を参照
+        MAX_P_BASE = self.Pmax * 0.5  # ベース圧の最大値 (0.3 MPa)
+        MAX_P_DIFF = self.Pmax * 0.5  # 差圧の最大値 (0.3 MPa)
+        
+        # 1.1) P_base: 手首剛性ベース圧力 (拮抗筋の同時収縮レベル)
+        # P_base = max_P_base * (a_K_wrist + 1) / 2
+        P_base = MAX_P_BASE * (a[:, 1] + 1.0) * 0.5
+        
+        # 1.2) P_diff: 手首平衡点差圧
+        # P_diff = max_P_diff * a_theta_eq
+        P_diff = MAX_P_DIFF * a[:, 0] 
+        
+        # 1.3) Wrist PAMs の圧力指令 (DF/F)
+        # P_DF = clamp(P_base + P_diff) [cite: 2025 12 10-1]
+        P_cmd_DF = torch.clamp(P_base + P_diff, 0.0, self.Pmax)
+        # P_F = clamp(P_base - P_diff) [cite: 2025 12 10-1]
+        P_cmd_F  = torch.clamp(P_base - P_diff, 0.0, self.Pmax)
+        
+        # 1.4) Grip PAMs の圧力指令 (G)
+        # P_G = Pmax * (a_K_grip + 1) / 2 [cite: 2025 12 10-1]
+        P_cmd_G = self.Pmax * (a[:, 2] + 1.0) * 0.5
+        
+        # P_cmd を一つにまとめる (DF, F, G の順)
+        P_cmd_stack = torch.stack([P_cmd_DF, P_cmd_F, P_cmd_G], dim=-1)
+        
+        self._dbg("P_cmd(mean DF,F,G)", P_cmd_stack.mean(dim=0))
 
         # 2) 一次遅れ＋デッドタイム（各チャネル）
-        P_DF, P_F, P_G = self.ch_DF.step(P_cmd[:, 0]), self.ch_F.step(P_cmd[:, 1]), self.ch_G.step(P_cmd[:, 2])
+        # 修正: P_cmd_stack を使用
+        P_DF, P_F, P_G = (self.ch_DF.step(P_cmd_stack[:, 0]), 
+                          self.ch_F.step(P_cmd_stack[:, 1]), 
+                          self.ch_G.step(P_cmd_stack[:, 2]))
+        
         P_DF, P_F, P_G = _env1(P_DF), _env1(P_F), _env1(P_G)  # ← 正規化
         self._dbg("P_delayed(mean DF,F,G)", P_DF, P_F, P_G)
 
-        # 3) 収縮率 h(θ) は env ベクトルに統一
+        # 3) 収縮率 h(θ) は env ベクトルに統一 (変更なし)
         theta_w = q[:, wid]; theta_g = q[:, gid]          # [num_envs]
         h_DF = _env1(contraction_ratio_from_angle(theta_w, self.theta_t["DF"], self.r, self.L))
         h_F  = _env1(contraction_ratio_from_angle(theta_w, self.theta_t["F"],  self.r, self.L))
         h_G  = _env1(contraction_ratio_from_angle(theta_g, self.theta_t["G"],  self.r, self.L))
         self._dbg("h(mean DF,F,G)", h_DF, h_F, h_G)
 
-        # 4) F(P,h)（CSVマップが無ければ簡易式で代用）
+        # 4) F(P,h)（CSVマップが無ければ簡易式で代用） (変更なし)
         if self.force_map is not None:
             F_DF = _env1(self.force_map(P_DF, h_DF))
             F_F  = _env1(self.force_map(P_F,  h_F))
@@ -117,7 +150,7 @@ class TorqueActionController(ActionController):
             F_G  = _env1(Fpam_quasi_static(P_G,  h_G,  N=self.N, Pmax=self.Pmax))
         self._dbg("F(mean DF,F,G)", F_DF, F_F, F_G)
 
-        # 4.5) 弛み判定（h > h0(P) なら 0）
+        # 4.5) 弛み判定（h > h0(P) なら 0） (変更なし)
         if self.h0_map is not None:
             h0_DF = _env1(self.h0_map(P_DF)); h0_F = _env1(self.h0_map(P_F)); h0_G = _env1(self.h0_map(P_G))
             self._dbg("h0(mean DF,F,G)", h0_DF, h0_F, h0_G)
@@ -125,7 +158,7 @@ class TorqueActionController(ActionController):
             F_F  = torch.where(h_F  <= h0_F,  F_F,  torch.zeros_like(F_F))
             F_G  = torch.where(h_G  <= h0_G,  F_G,  torch.zeros_like(F_G))
 
-        # 5) 関節トルク印加（ここから置き換え）
+        # 5) 関節トルク印加（ここから置き換え） (変更なし)
         def _env_vec(x):
             x = x.reshape(-1)
             # 期待：numel == n_envs。違う場合は (n_envs, k) と見なして env 次元に畳み込む
@@ -140,7 +173,7 @@ class TorqueActionController(ActionController):
         tau_w = _env1(self.r * (F_F - F_DF))
         tau_g = _env1(self.r * F_G)
 
-        # フルサイズのトルク行列を作って該当列に代入
+        # フルサイズのトルク行列を作って該当列に代入 (変更なし)
         n_envs = q.shape[0]
         n_dof  = q.shape[1] if q.ndim > 1 else 1
         tau_full = torch.zeros(n_envs, n_dof, device=q.device, dtype=q.dtype)
@@ -162,7 +195,7 @@ class TorqueActionController(ActionController):
             taut_G  = torch.zeros_like(h_G)
 
         self._last_telemetry = {
-            "P_cmd": P_cmd.detach(),  # [n_envs,3]
+            "P_cmd": P_cmd_stack.detach(),  # [n_envs,3]
             "P_out": torch.stack([P_DF, P_F, P_G], -1),  # [n_envs,3]
             "F":     torch.stack([F_DF, F_F, F_G], -1),  # [n_envs,3]
             "h":     torch.stack([h_DF, h_F, h_G], -1),  # [n_envs,3]

@@ -209,6 +209,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # set agent to evaluation mode
     runner.agent.set_running_mode("eval")
 
+    # Jetson用にモデルを変換(JIT Trace)して保存する処理
+    print("-" * 50)
+    export_path = os.path.join(log_dir, "policy.pt")
+    print(f"[INFO] Exporting policy to: {export_path}")
+
+    try:
+        # 1. Jetson用のラッパー（入力を辞書に変換し、出力からアクションだけ取り出す）
+        class JetsonPolicy(torch.nn.Module):
+            def __init__(self, agent):
+                super().__init__()
+                self.policy = agent.policy
+            def forward(self, obs):
+                # skrlは入力を辞書形式で要求するため変換
+                inputs = {"states": obs}
+                # 推論実行 (role="policy" でアクションを取得)
+                # 戻り値は (action, log_std, info) なので action だけ返す
+                output, _, _ = self.policy.compute(inputs, role="policy")
+                return output
+
+        # 2. ダミー入力を作成
+        # 観測空間のサイズを自動取得
+        obs_dim = 4 #env.unwrapped.observation_space.shape[0] if hasattr(env.unwrapped, "observation_space") else env.observation_space.shape[0]
+        dummy_obs = torch.zeros(1, obs_dim, device=runner.agent.device)
+
+        # 3. 変換と保存
+        wrapper = JetsonPolicy(runner.agent)
+        traced_policy = torch.jit.trace(wrapper, dummy_obs)
+        traced_policy.save(export_path)
+        print(f"[INFO] Successfully exported 'policy.pt'!")
+        print("-" * 50)
+
+    except Exception as e:
+        print(f"[ERROR] Export failed: {e}")
+
     # reset environment
     obs, _ = env.reset()
     timestep = 0
