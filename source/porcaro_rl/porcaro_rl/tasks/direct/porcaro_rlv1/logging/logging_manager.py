@@ -102,7 +102,8 @@ class LoggingManager:
     def buffer_step_data(self, 
                          q_full: torch.Tensor,       # robot.data.joint_pos
                          qd_full: torch.Tensor,      # robot.data.joint_vel
-                         telemetry: dict | None      # action_controller.get_last_telemetry()
+                         telemetry: dict | None,      # action_controller.get_last_telemetry()
+                         actions: torch.Tensor
                          ):
         """
         (変更) ログデータをCSVに書き込まず、一時バッファに保存する。
@@ -118,6 +119,9 @@ class LoggingManager:
         try:
             # 1. 時間
             time_s_tensor = self.current_time_s[env_idx].reshape(-1) # <-- 修正
+
+            # actions[0] を取得し、(3,) の形にする
+            act = actions[env_idx].reshape(-1)
             
             # 2. 関節角度・速度
             q = q_full[env_idx, self.dof_idx].reshape(-1)      # (2,) <-- 修正
@@ -136,16 +140,15 @@ class LoggingManager:
                 tau_w = torch.zeros(1, device=self.device)
                 tau_g = torch.zeros(1, device=self.device)
 
-            # (変更) f1 を除くデータをバッファに保存
             self.step_data_buffer = [
-                time_s_tensor, # "time_s"
-                q,             # "q_wrist", "q_grip"
-                qd,            # "qd_wrist", "qd_grip"
-                # force,         # "stick_force_x", "stick_force_y", "stick_force_z"
-                p_cmd,         # "P_cmd_DF", "P_cmd_F", "P_cmd_G"
-                p_out,         # "P_out_DF", "P_out_F", "P_out_G"
-                tau_w,         # "tau_w"
-                tau_g,         # "tau_g"
+                time_s_tensor, # time_s
+                act,           # act_theta_eq, act_K_wrist, act_K_grip (<-- ここに追加)
+                q,             # q_wrist, q_grip
+                qd,            # qd_wrist, qd_grip
+                p_cmd,         # P_cmd...
+                p_out,         # P_out...
+                tau_w,         # tau_w
+                tau_g,         # tau_g
             ]
             
         except Exception as e:
@@ -199,7 +202,7 @@ class LoggingManager:
                     # (C) データリストを再構築
                     log_tensors_dt = list(base_data_tensors) # コピー
                     log_tensors_dt[0] = time_s_current_step.reshape(-1) # (A) 時刻を上書き
-                    log_tensors_dt.insert(3, force) # (B) 力を挿入
+                    log_tensors_dt.insert(4, force) # (B) 力を挿入
                     log_tensors_dt.append(f1)       # (C) f1 を追加
                 
                     data_row_tensor = torch.cat(log_tensors_dt)

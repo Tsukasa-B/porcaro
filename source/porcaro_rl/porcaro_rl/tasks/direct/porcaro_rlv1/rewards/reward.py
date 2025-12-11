@@ -1,159 +1,208 @@
-# source/porcaro_rl/porcaro_rl/tasks/direct/porcaro_rlv1/rewards/reward.py
-
+# rewards/reward.py
 from __future__ import annotations
 import torch
 from typing import Sequence
+
 from ..cfg.rewards_cfg import RewardsCfg
 
 class RewardManager:
-    def __init__(self, cfg: RewardsCfg, num_envs: int, device: str | torch.device, dt: float):
-        # ★引数に dt を追加しました (時刻計算用)
+    """
+    リズム演奏用の報酬計算クラス。
+    """
+    def __init__(self, cfg: RewardsCfg, num_envs: int, device: str | torch.device):
         self.cfg = cfg
         self.num_envs = num_envs
         self.device = torch.device(device)
-        self.dt = dt  # 物理ステップ時間 (sim.dt)
         
-        # 設定値のロード
+        # 設定値のキャッシュ
         self.hit_threshold = float(cfg.hit_threshold_force)
         self.target_force = float(cfg.target_force_fd)
-        self.sigma_f = float(cfg.sigma_f)
-        self.w1 = float(cfg.weight_w1_force)
-        self.w2 = float(cfg.weight_w2_hit_count)
+        self.target_bpm = float(cfg.target_bpm)
+        self.beat_interval = 60.0 / self.target_bpm
         
-        # --- リズム用 ---
-        self.bpm = float(cfg.target_bpm)
-        self.beat_interval = 60.0 / self.bpm if self.bpm > 0 else 1.0
+        # ガウス関数のパラメータ
+        self.sigma_f = float(cfg.sigma_f)
         self.sigma_t = float(cfg.sigma_t)
-        self.w3 = float(cfg.weight_w3_timing)
+        
+        # 重み
+        self.w_force = float(cfg.weight_force)
+        self.w_timing = float(cfg.weight_timing)
 
-        # バッファ類 (既存と同じ)
+        # 内部状態
         self.hit_count = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.first_hit_force = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        
+        # ステートマシン (0=IDLE, 1=RISING, 2=FALLING)
         self.hit_state = torch.zeros(self.num_envs, device=self.device, dtype=torch.int8)
         self.current_peak_force = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        # ピーク時の時刻を記録するバッファ
+        self.current_peak_time = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+
+        # 終了判定バッファ
         self.terminated_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.truncated_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        # ▼▼▼ 追加: 最新のヒットのピーク力を保持するバッファ ▼▼▼
+        self.last_hit_peak_force = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
 
     def reset_idx(self, env_ids: torch.Tensor | Sequence[int]):
+        """リセット処理"""
         self.hit_count[env_ids] = 0
-        self.first_hit_force[env_ids] = 0.0
         self.hit_state[env_ids] = 0
         self.current_peak_force[env_ids] = 0.0
+        self.current_peak_time[env_ids] = 0.0
         self.terminated_buf[env_ids] = False
         self.truncated_buf[env_ids] = False
+        self.last_hit_peak_force[env_ids] = 0.0 # リセット時は0に戻す
 
-    def _process_hit_event(self, env_ids: torch.Tensor, peak_force: torch.Tensor, 
-                           hit_time: torch.Tensor, # <--- 時刻を受け取るように変更
-                           rewards: torch.Tensor):
-        if len(env_ids) == 0: return
+    def _process_hit_event(self, env_ids: torch.Tensor, peak_forces: torch.Tensor, peak_times: torch.Tensor, rewards: torch.Tensor):
+        """
+        打撃確定時の報酬計算 (Force + Timing)
+        """
+        if len(env_ids) == 0:
+            return
 
+        # 1. カウント更新
         self.hit_count[env_ids] += 1
-        is_first_hit_mask = (self.hit_count[env_ids] == 1)
-        first_hit_ids = env_ids[is_first_hit_mask]
         
-        if len(first_hit_ids) > 0:
-            # --- 1. 力の正確性 (r_F1) ---
-            f1 = peak_force[is_first_hit_mask]
-            self.first_hit_force[first_hit_ids] = f1
-            r_f1 = torch.exp(-0.5 * torch.square((f1 - self.target_force) / self.sigma_f))
-            
-            # --- 2. タイミングの正確性 (r_time) ---
-            # そのヒット時刻 t に最も近い「正解の拍」を探す
-            # nearest_beat = round(t / interval) * interval
-            t_hit = hit_time[is_first_hit_mask]
-            nearest_beat_time = torch.round(t_hit / self.beat_interval) * self.beat_interval
-            time_diff = torch.abs(t_hit - nearest_beat_time)
-            
-            r_time = torch.exp(-0.5 * torch.square(time_diff / self.sigma_t))
+        # 2. 力の報酬 (r_F)
+        # target_force との誤差
+        force_error = peak_forces - self.target_force
+        r_force = torch.exp(-0.5 * torch.square(force_error / self.sigma_f))
+        
+        # 3. タイミングの報酬 (r_T)
+        # 「最も近いビート」とのズレを計算
+        # nearest_beat = round(t / interval) * interval
+        # ※ round は .5 で偶数丸めになることがあるが、リズム用途なら許容範囲
+        beat_indices = torch.round(peak_times / self.beat_interval)
+        nearest_beat_times = beat_indices * self.beat_interval
+        
+        timing_error = peak_times - nearest_beat_times
+        r_timing = torch.exp(-0.5 * torch.square(timing_error / self.sigma_t))
+        
+        # 4. 報酬の合算
+        # hitした瞬間にドカンと報酬を与える
+        total_reward = (self.w_force * r_force) + (self.w_timing * r_timing)
+        rewards[env_ids] += total_reward
 
-            # 報酬の合算
-            total_r = (self.w1 * r_f1) + (self.w3 * r_time)
-            rewards[first_hit_ids] += total_r
+        # ▼▼▼ 追加: ピーク値を記録（次のヒットまで保持される） ▼▼▼
+        self.last_hit_peak_force[env_ids] = peak_forces
 
     def compute_reward_and_dones(self, 
-                                 force_z_history: torch.Tensor,
+                                 force_z_history: torch.Tensor, # (num_envs, decimation)
+                                 current_time_s: torch.Tensor,  # (num_envs,) 現在時刻
+                                 dt_step: float,                # 物理ステップ時間 (1/200s)
                                  episode_length_buf: torch.Tensor,
-                                 max_episode_length: int,
-                                 current_time_s: torch.Tensor # <--- 現在時刻を受け取る
+                                 max_episode_length: int
                                  ) -> torch.Tensor:
-        
+        """
+        物理ステップごとの履歴を走査してヒット検知 & 報酬計算
+        """
         rewards = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
         decimation = force_z_history.shape[1]
 
-        # 履歴を古い順に処理 (インデックス: decimation-1 -> 0)
-        # 履歴[0]が最新(現在時刻)。履歴[i]の時刻は (現在 - i*dt)
+        # 履歴を古い順 ([decimation-1] -> [0]) に処理
+        # 時刻も遡って計算する必要がある
+        
+        # current_time_s は「この制御ステップの終了時刻」を指す
+        # history[0] の時刻 = current_time_s - dt_step
+        # history[i] の時刻 = current_time_s - (i + 1) * dt_step
+        
         for i in range(decimation - 1, -1, -1):
+            # 該当ステップの力
+            f_val = force_z_history[:, i]
+            # 該当ステップの時刻
+            # i=0 (最新) -> time - 1*dt
+            # i=decimation-1 (最古) -> time - decimation*dt
+            t_val = current_time_s - (i + 1) * dt_step
             
-            # このサンプルの時刻を計算
-            # current_time_s は [num_envs]
-            step_time = current_time_s - (i * self.dt)
+            is_above = (f_val >= self.hit_threshold)
             
-            current_force = force_z_history[:, i].reshape(-1)
-            is_above_threshold = (current_force >= self.hit_threshold)
+            # ステート遷移ロジック
+            # (IDLE -> RISING, RISING -> FALLING 等は前回のコードと同様)
+            # ただし、ピーク更新時に「その時刻」も記録する点が異なる
             
-            # ステートマシン (IDLE, RISING, FALLING)
+            # --- 状態マスク作成 ---
             state_idle = (self.hit_state == 0)
             state_rising = (self.hit_state == 1)
             state_falling = (self.hit_state == 2)
-            
+
             # (A) IDLE -> RISING
-            rising_edge_mask = state_idle & is_above_threshold
-            rising_edge_ids = torch.where(rising_edge_mask)[0]
-            if len(rising_edge_ids) > 0:
-                self.hit_state[rising_edge_ids] = 1 
-                self.current_peak_force[rising_edge_ids] = current_force[rising_edge_ids]
+            rising_edge = state_idle & is_above
+            if rising_edge.any():
+                ids = torch.where(rising_edge)[0]
+                self.hit_state[ids] = 1
+                self.current_peak_force[ids] = f_val[ids]
+                self.current_peak_time[ids] = t_val[ids] # 時刻記録
 
             # (B) RISING -> (Update Peak or FALLING)
-            rising_state_mask = state_rising & is_above_threshold
-            rising_state_ids = torch.where(rising_state_mask)[0]
-            if len(rising_state_ids) > 0:
-                f_sub = current_force[rising_state_ids]
-                p_sub = self.current_peak_force[rising_state_ids]
+            rising_mask = state_rising & is_above
+            if rising_mask.any():
+                ids = torch.where(rising_mask)[0]
+                curr_f = f_val[ids]
+                peak_f = self.current_peak_force[ids]
                 
-                up_mask = (f_sub >= p_sub)
-                self.current_peak_force[rising_state_ids[up_mask]] = f_sub[up_mask]
+                # まだ上がっている
+                up_mask = (curr_f >= peak_f)
+                up_ids = ids[up_mask]
+                self.current_peak_force[up_ids] = curr_f[up_mask]
+                self.current_peak_time[up_ids] = t_val[up_ids] # 時刻更新
                 
-                down_mask = (f_sub < p_sub)
-                self.hit_state[rising_state_ids[down_mask]] = 2 # FALLING
+                # 下がり始めた -> FALLING
+                down_mask = (curr_f < peak_f)
+                down_ids = ids[down_mask]
+                self.hit_state[down_ids] = 2
 
-            # (C) RISING -> IDLE (Short pulse)
-            rising_end_mask = state_rising & (~is_above_threshold)
-            ids = torch.where(rising_end_mask)[0]
-            if len(ids) > 0:
-                self.hit_state[ids] = 0
-                # ヒット確定処理: 時刻(step_time)を渡す
-                self._process_hit_event(ids, self.current_peak_force[ids], step_time[ids], rewards)
+            # (C) RISING/FALLING -> IDLE (イベント終了＝打撃確定)
+            # RISINGから直接落ちるケースと、FALLINGから落ちるケース
+            # どちらも「閾値を割った」瞬間にイベント確定とする
+            falling_edge = (state_rising | state_falling) & (~is_above)
+            if falling_edge.any():
+                ids = torch.where(falling_edge)[0]
+                self.hit_state[ids] = 0 # IDLEへ
+                
+                # ★ここで報酬計算★
+                self._process_hit_event(
+                    ids, 
+                    self.current_peak_force[ids], 
+                    self.current_peak_time[ids], 
+                    rewards
+                )
+                
+                # バッファクリア
                 self.current_peak_force[ids] = 0.0
+                self.current_peak_time[ids] = 0.0
 
-            # (D) FALLING -> RISING (Double hit)
-            falling_up_mask = state_falling & is_above_threshold & (current_force >= self.current_peak_force)
-            ids = torch.where(falling_up_mask)[0]
-            if len(ids) > 0:
-                self.hit_state[ids] = 1 # RISING again
-                # 前の山の確定処理
-                self._process_hit_event(ids, self.current_peak_force[ids], step_time[ids], rewards)
-                self.current_peak_force[ids] = current_force[ids] # 新しい山の開始
+            # (D) FALLING -> RISING (ダブルヒット: リバウンド中に再上昇)
+            # これは高度な制御だが、一旦「新しい打撃」として扱うか、
+            # あるいは「1つの打撃の続き」とするか。
+            # ここではシンプルに「前の打撃を確定させて、新しい打撃を開始」する
+            re_rising = state_falling & is_above
+            if re_rising.any():
+                ids = torch.where(re_rising)[0]
+                curr_f = f_val[ids]
+                peak_f = self.current_peak_force[ids]
+                
+                # ピークを超えて再上昇した場合のみ処理
+                # (ノイズで微増しただけなら無視したいが、簡易的に上昇なら即検知)
+                rising_again = (curr_f > peak_f) # 単純比較
+                ra_ids = ids[rising_again]
+                
+                if len(ra_ids) > 0:
+                    # 前の山を確定させる
+                    self._process_hit_event(
+                        ra_ids, 
+                        self.current_peak_force[ra_ids], 
+                        self.current_peak_time[ra_ids], 
+                        rewards
+                    )
+                    # 新しい山の開始
+                    self.hit_state[ra_ids] = 1 # RISING
+                    self.current_peak_force[ra_ids] = curr_f[rising_again]
+                    self.current_peak_time[ra_ids] = t_val[ra_ids]
 
-            # (E) FALLING -> IDLE (End of hit)
-            falling_end_mask = state_falling & (~is_above_threshold)
-            ids = torch.where(falling_end_mask)[0]
-            if len(ids) > 0:
-                self.hit_state[ids] = 0
-                self._process_hit_event(ids, self.current_peak_force[ids], step_time[ids], rewards)
-                self.current_peak_force[ids] = 0.0
-
-        # 終了判定
-        #self.terminated_buf = (self.hit_count >= 2)
-        # 転倒や関節制限違反がない限り、エピソード時間(8秒)いっぱいまで叩かせます。
-        self.terminated_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        # --- 終了判定 ---
+        # 時間切れ (Truncated) のみ判定し、打撃回数による終了 (Terminated) はしない
         self.truncated_buf = (episode_length_buf >= max_episode_length)
-
-        # タイムアウト時の生存ボーナス的な処理
-        truncated_ids = torch.where(self.truncated_buf)[0]
-        if len(truncated_ids) > 0:
-            success_ids = truncated_ids[self.hit_count[truncated_ids] == 1]
-            if len(success_ids) > 0:
-                rewards[success_ids] += self.w2
+        self.terminated_buf[:] = False # 常にFalse (転倒などがない限り)
 
         return rewards
 
@@ -161,4 +210,6 @@ class RewardManager:
         return self.terminated_buf, self.truncated_buf
     
     def get_first_hit_force(self) -> torch.Tensor:
-        return self.first_hit_force
+        """ログ用に、最新の打撃のピーク力を返す"""
+        # ▼▼▼ 修正: 保持しておいたバッファを返す ▼▼▼
+        return self.last_hit_peak_force

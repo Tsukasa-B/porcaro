@@ -7,21 +7,21 @@ from isaaclab.utils import configclass
 class RewardsCfg:
     """報酬の重みを管理する設定"""
     
-    # --- 既存の設定 ---
-    target_force_fd: float = 20.0
-    sigma_f: float = 10.0
-    weight_w1_force: float = 10.0
-    weight_w2_hit_count: float = 5.0
-    hit_threshold_force: float = 1.0
-
-    # --- ▼▼▼ 新規追加: リズム報酬の設定 ▼▼▼ ---
-    
-    # 目標BPM (Beats Per Minute)
+    # --- リズムタスク設定 ---
     target_bpm: float = 120.0
     
-    # タイミング報酬のガウス幅 sigma_t [秒]
-    # 値が小さいほど、ジャストタイミング以外は評価されなくなる
+    # --- 報酬重み ---
+    # r_F (打撃力) の重み
+    weight_force: float = 10.0
+    # r_T (タイミング) の重み <-- 追加
+    weight_timing: float = 10.0
+    
+    # --- 評価基準 ---
+    target_force_fd: float = 20.0
+    # 力の許容誤差 (標準偏差)
+    sigma_f: float = 10.0
+    # タイミングの許容誤差 [秒] (この秒数ズレたら報酬が約6割に減る目安) <-- 追加
     sigma_t: float = 0.05 
     
-    # タイミング報酬の重み w3
-    weight_w3_timing: float = 10.0
+    # --- 打撃検出 ---
+    hit_threshold_force: float = 1.0

@@ -107,7 +107,6 @@ class PorcaroRLEnv(DirectRLEnv):
             cfg=self.cfg.rewards,
             num_envs=self.num_envs,
             device=self.device,
-            dt=self.cfg.sim.dt,
         )
 
         # リズム計算用
@@ -187,7 +186,8 @@ class PorcaroRLEnv(DirectRLEnv):
         self.logging_manager.buffer_step_data(
             q_full=q_full,
             qd_full=self.robot.data.joint_vel,
-            telemetry=self.action_controller.get_last_telemetry()
+            telemetry=self.action_controller.get_last_telemetry(),
+            actions=self.actions
         )
 
     def _get_observations(self) -> dict:
@@ -252,16 +252,24 @@ class PorcaroRLEnv(DirectRLEnv):
         current_rl_step_force_history = force_history_tensor[:, 0:self.cfg.decimation, :]
         
         # (C) このRLステップ間の「Z軸力」の履歴 (num_envs, decimation)
-        force_z_history_in_step = current_rl_step_force_history[..., 2]
+        force_z_raw = current_rl_step_force_history[..., 2]
+        force_z_history_in_step = force_z_raw.reshape(self.num_envs, self.cfg.decimation) # <--- ここで修正！
+
+        # --- 追加: 現在時刻と物理dtを取得 ---
+        # logging_managerが管理している時刻を使用
+        # (reshape(-1) で [num_envs] にする)
+        current_time = self.logging_manager.current_time_s.reshape(-1)
+        dt_sim = self.cfg.sim.dt # 物理ステップ (例: 1/200)
         
         
         # 1. 報酬と終了判定を計算 (f1 が内部で更新される)
         # (変更) RewardManager に (C) のZ軸力「履歴」を渡す
         rewards = self.reward_manager.compute_reward_and_dones(
-            force_z_history=force_z_history_in_step,     # (C) Z軸の力履歴 (num_envs, decimation)
+            force_z_history=force_z_history_in_step,
+            current_time_s=current_time,   # <--- 追加
+            dt_step=dt_sim,                # <--- 追加
             episode_length_buf=self.episode_length_buf,    
-            max_episode_length=(self.max_episode_length - 1),
-            current_time_s=self.logging_manager.current_time_s.reshape(-1) # [num_envs] 
+            max_episode_length=(self.max_episode_length - 1) 
         )
         
         # 2. (変更なし) 更新された f1 と reward を取得
