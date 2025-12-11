@@ -28,8 +28,22 @@ class RewardManager:
         self.w_force = float(cfg.weight_force)
         self.w_timing = float(cfg.weight_timing)
 
+        # ▼▼▼ 追加: ペナルティ用パラメータ ▼▼▼
+        self.w_penalty = float(cfg.weight_contact_penalty)
+        self.safe_window = float(cfg.penalty_safe_window)
+        # ---------------------------------------
+
         # 内部状態
         self.hit_count = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+
+        # ▼▼▼ 修正: アーミング（タメ）判定用のパラメータ ▼▼▼
+        # 最低これだけの時間、空中にいないと「次の打撃」として認めない
+        # 120BPMの16分音符(0.125s)の半分くらいを目安に (0.05s = 50ms)
+        self.arming_duration_threshold = 0.05
+        
+        # 内部状態
+        self.air_time_counter = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.is_armed = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         
         # ステートマシン (0=IDLE, 1=RISING, 2=FALLING)
         self.hit_state = torch.zeros(self.num_envs, device=self.device, dtype=torch.int8)
@@ -52,6 +66,8 @@ class RewardManager:
         self.terminated_buf[env_ids] = False
         self.truncated_buf[env_ids] = False
         self.last_hit_peak_force[env_ids] = 0.0 # リセット時は0に戻す
+        self.air_time_counter[env_ids] = 0.0
+        self.is_armed[env_ids] = True # 最初は「装填済み」からスタートしてあげる（最初の1打のため）
 
     def _process_hit_event(self, env_ids: torch.Tensor, peak_forces: torch.Tensor, peak_times: torch.Tensor, rewards: torch.Tensor):
         """
@@ -114,7 +130,38 @@ class RewardManager:
             # i=decimation-1 (最古) -> time - decimation*dt
             t_val = current_time_s - (i + 1) * dt_step
             
-            is_above = (f_val >= self.hit_threshold)
+            is_touching = (f_val >= self.hit_threshold)
+
+            # --- ▼▼▼ アーミング（充填）ロジック ▼▼▼ ---
+            # 触っていなければカウンターを増やす、触っていたらリセット
+            # (ベクトル演算のため、whereを使って条件分岐)
+            self.air_time_counter = torch.where(
+                ~is_touching, 
+                self.air_time_counter + dt_step, 
+                torch.zeros_like(self.air_time_counter)
+            )
+            
+            # 一定時間浮いていたら「装填 (ARMED)」
+            just_armed = (self.air_time_counter >= self.arming_duration_threshold)
+            self.is_armed = self.is_armed | just_armed
+            # ---------------------------------------------
+
+            # --- ▼▼▼ 追加: 接触ペナルティの計算 ▼▼▼ ---
+            
+            # 最も近いビート時刻との距離を計算
+            # beat_index = round(t / interval)
+            beat_indices = torch.round(t_val / self.beat_interval)
+            nearest_beat_times = beat_indices * self.beat_interval
+            time_diff = torch.abs(t_val - nearest_beat_times)
+            
+            # 「ウィンドウの外側」かつ「接触している」ならペナルティ
+            is_illegal_contact = (time_diff > self.safe_window) & is_touching
+            
+            if is_illegal_contact.any():
+                # 該当する環境IDに減点 (broadcast)
+                rewards[is_illegal_contact] -= self.w_penalty
+            
+            # ---------------------------------------------
             
             # ステート遷移ロジック
             # (IDLE -> RISING, RISING -> FALLING 等は前回のコードと同様)
@@ -126,15 +173,26 @@ class RewardManager:
             state_falling = (self.hit_state == 2)
 
             # (A) IDLE -> RISING
-            rising_edge = state_idle & is_above
+            # ★ここで「装填されているか？」をチェック
+            rising_edge = (self.hit_state == 0) & is_touching
             if rising_edge.any():
                 ids = torch.where(rising_edge)[0]
-                self.hit_state[ids] = 1
-                self.current_peak_force[ids] = f_val[ids]
-                self.current_peak_time[ids] = t_val[ids] # 時刻記録
+                
+                # 装填されている環境だけ RISING に移行する（＝有効打撃の候補にする）
+                # 装填されていない（押し付け中の）環境は IDLE のまま無視する
+                valid_start_ids = ids[self.is_armed[ids]]
+                
+                if len(valid_start_ids) > 0:
+                    self.hit_state[valid_start_ids] = 1 # RISING
+                    self.current_peak_force[valid_start_ids] = f_val[valid_start_ids]
+                    self.current_peak_time[valid_start_ids] = t_val[valid_start_ids]
+                    
+                    # 打撃を開始したので「弾」を消費（未装填に戻す）
+                    self.is_armed[valid_start_ids] = False
+                    self.air_time_counter[valid_start_ids] = 0.0
 
             # (B) RISING -> (Update Peak or FALLING)
-            rising_mask = state_rising & is_above
+            rising_mask = (self.hit_state == 1) & is_touching
             if rising_mask.any():
                 ids = torch.where(rising_mask)[0]
                 curr_f = f_val[ids]
@@ -154,50 +212,50 @@ class RewardManager:
             # (C) RISING/FALLING -> IDLE (イベント終了＝打撃確定)
             # RISINGから直接落ちるケースと、FALLINGから落ちるケース
             # どちらも「閾値を割った」瞬間にイベント確定とする
-            falling_edge = (state_rising | state_falling) & (~is_above)
+            falling_edge = ((self.hit_state == 1) | (self.hit_state == 2)) & (~is_touching)
+            
             if falling_edge.any():
                 ids = torch.where(falling_edge)[0]
                 self.hit_state[ids] = 0 # IDLEへ
                 
-                # ★ここで報酬計算★
+                # 報酬計算
                 self._process_hit_event(
                     ids, 
                     self.current_peak_force[ids], 
                     self.current_peak_time[ids], 
                     rewards
                 )
-                
                 # バッファクリア
                 self.current_peak_force[ids] = 0.0
                 self.current_peak_time[ids] = 0.0
 
-            # (D) FALLING -> RISING (ダブルヒット: リバウンド中に再上昇)
-            # これは高度な制御だが、一旦「新しい打撃」として扱うか、
-            # あるいは「1つの打撃の続き」とするか。
-            # ここではシンプルに「前の打撃を確定させて、新しい打撃を開始」する
-            re_rising = state_falling & is_above
-            if re_rising.any():
-                ids = torch.where(re_rising)[0]
-                curr_f = f_val[ids]
-                peak_f = self.current_peak_force[ids]
+            # # (D) FALLING -> RISING (ダブルヒット: リバウンド中に再上昇)
+            # # これは高度な制御だが、一旦「新しい打撃」として扱うか、
+            # # あるいは「1つの打撃の続き」とするか。
+            # # ここではシンプルに「前の打撃を確定させて、新しい打撃を開始」する
+            # re_rising = state_falling & is_above
+            # if re_rising.any():
+            #     ids = torch.where(re_rising)[0]
+            #     curr_f = f_val[ids]
+            #     peak_f = self.current_peak_force[ids]
                 
-                # ピークを超えて再上昇した場合のみ処理
-                # (ノイズで微増しただけなら無視したいが、簡易的に上昇なら即検知)
-                rising_again = (curr_f > peak_f) # 単純比較
-                ra_ids = ids[rising_again]
+            #     # ピークを超えて再上昇した場合のみ処理
+            #     # (ノイズで微増しただけなら無視したいが、簡易的に上昇なら即検知)
+            #     rising_again = (curr_f > peak_f) # 単純比較
+            #     ra_ids = ids[rising_again]
                 
-                if len(ra_ids) > 0:
-                    # 前の山を確定させる
-                    self._process_hit_event(
-                        ra_ids, 
-                        self.current_peak_force[ra_ids], 
-                        self.current_peak_time[ra_ids], 
-                        rewards
-                    )
-                    # 新しい山の開始
-                    self.hit_state[ra_ids] = 1 # RISING
-                    self.current_peak_force[ra_ids] = curr_f[rising_again]
-                    self.current_peak_time[ra_ids] = t_val[ra_ids]
+            #     if len(ra_ids) > 0:
+            #         # 前の山を確定させる
+            #         self._process_hit_event(
+            #             ra_ids, 
+            #             self.current_peak_force[ra_ids], 
+            #             self.current_peak_time[ra_ids], 
+            #             rewards
+            #         )
+            #         # 新しい山の開始
+            #         self.hit_state[ra_ids] = 1 # RISING
+            #         self.current_peak_force[ra_ids] = curr_f[rising_again]
+            #         self.current_peak_time[ra_ids] = t_val[ra_ids]
 
         # --- 終了判定 ---
         # 時間切れ (Truncated) のみ判定し、打撃回数による終了 (Terminated) はしない

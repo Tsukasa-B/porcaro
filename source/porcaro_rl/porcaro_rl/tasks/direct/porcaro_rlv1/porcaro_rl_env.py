@@ -62,7 +62,7 @@ class PorcaroRLEnv(DirectRLEnv):
 
         # --- 追加: コントローラの初期化 ---
         # dt_ctrl = sim.dt * decimation
-        dt_ctrl = self.cfg.sim.dt * self.cfg.decimation
+        dt_ctrl = self.cfg.sim.dt #* self.cfg.decimation
         ctrl_cfg = self.cfg.controller
         
         self.action_controller = TorqueActionController(
@@ -96,11 +96,11 @@ class PorcaroRLEnv(DirectRLEnv):
             decimation=self.cfg.decimation      # <-- (新規追加) デシメーション
         )
 
-        print(f"[DEBUG] ロギングを強制的に有効化します (Config上: {self.cfg.logging.enabled})")
-        self.logging_manager.force_enable()
-        # (追加) 報酬ログも強制有効化
-        print(f"[DEBUG] 報酬ログを強制的に有効化します (Config上: {self.cfg.reward_logging.enabled})")
-        self.logging_manager.force_enable_reward_log()
+        # print(f"[DEBUG] ロギングを強制的に有効化します (Config上: {self.cfg.logging.enabled})")
+        # self.logging_manager.force_enable()
+        # # (追加) 報酬ログも強制有効化
+        # print(f"[DEBUG] 報酬ログを強制的に有効化します (Config上: {self.cfg.reward_logging.enabled})")
+        # self.logging_manager.force_enable_reward_log()
         
         # 2. 報酬マネージャ
         self.reward_manager = RewardManager(
@@ -112,6 +112,17 @@ class PorcaroRLEnv(DirectRLEnv):
         # リズム計算用
         self.bpm = self.cfg.rewards.target_bpm
         self.beat_interval = 60.0 / self.bpm if self.bpm > 0 else 1.0
+
+        # ▼▼▼ 追加: 診断用プリント（ここを入れてください！） ▼▼▼
+        print("=" * 80)
+        print(f"[DEBUG DIAGNOSTIC] 環境設定値の確認")
+        print(f"  - sim.dt (物理ステップ): {self.cfg.sim.dt}")
+        print(f"  - decimation (間引き数): {self.cfg.decimation}")
+        
+        actual_dt_ctrl = self.cfg.sim.dt * self.cfg.decimation
+        print(f"  - dt_ctrl (制御周期)   : {actual_dt_ctrl:.5f} 秒")
+        print("=" * 80)
+        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
     def _setup_scene(self):
         """シーンにアセット（ロボット、ドラム、地面、ライト、センサ）をセットアップする"""
@@ -179,8 +190,7 @@ class PorcaroRLEnv(DirectRLEnv):
         # --- 変更: データロギング (マネージャに委譲) ---
         
         # 内部時刻を更新
-        dt_ctrl = self.cfg.sim.dt * self.cfg.decimation
-        self.logging_manager.update_time(dt_ctrl)
+        self.logging_manager.update_time(self.cfg.sim.dt)
         
         # (変更) f1 を渡さず、buffer_step_data を呼ぶ
         self.logging_manager.buffer_step_data(
