@@ -31,6 +31,7 @@ class RewardManager:
         # ▼▼▼ 追加: ペナルティ用パラメータ ▼▼▼
         self.w_penalty = float(cfg.weight_contact_penalty)
         self.safe_window = float(cfg.penalty_safe_window)
+        self.w_double_hit = float(cfg.weight_double_hit_penalty)
         # ---------------------------------------
 
         # 内部状態
@@ -56,6 +57,8 @@ class RewardManager:
         self.truncated_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         # ▼▼▼ 追加: 最新のヒットのピーク力を保持するバッファ ▼▼▼
         self.last_hit_peak_force = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        # ▼▼▼ 追加: 最後に報酬を与えたビートのインデックス (-1で初期化) ▼▼▼
+        self.last_rewarded_beat = torch.full((self.num_envs,), -1, device=self.device, dtype=torch.long)
 
     def reset_idx(self, env_ids: torch.Tensor | Sequence[int]):
         """リセット処理"""
@@ -68,38 +71,68 @@ class RewardManager:
         self.last_hit_peak_force[env_ids] = 0.0 # リセット時は0に戻す
         self.air_time_counter[env_ids] = 0.0
         self.is_armed[env_ids] = True # 最初は「装填済み」からスタートしてあげる（最初の1打のため）
+        # ▼▼▼ 追加: ビート管理バッファのリセット ▼▼▼
+        self.last_rewarded_beat[env_ids] = -1
 
     def _process_hit_event(self, env_ids: torch.Tensor, peak_forces: torch.Tensor, peak_times: torch.Tensor, rewards: torch.Tensor):
         """
-        打撃確定時の報酬計算 (Force + Timing)
+        打撃確定時の報酬計算 (Force + Timing + Double Hit Penalty)
         """
         if len(env_ids) == 0:
             return
 
-        # 1. カウント更新
-        self.hit_count[env_ids] += 1
+        # 1. 今叩いたのが「何番目のビート」を狙ったものか計算
+        #    例: 0.48秒 -> 0.5秒間隔なら「1番目のビート」
+        current_beat_indices = torch.round(peak_times / self.beat_interval).long()
         
-        # 2. 力の報酬 (r_F)
-        # target_force との誤差
+        # 2. 重複チェック
+        #    「記録されているビート番号」と「今回のビート番号」が違うなら新規 (True)
+        #    同じなら重複 (False)
+        is_new_beat_mask = (current_beat_indices != self.last_rewarded_beat[env_ids])
+        
+        # --- 報酬計算 (Force + Timing) ---
+        
+        # 力の評価 (Target Forceとの誤差)
         force_error = peak_forces - self.target_force
         r_force = torch.exp(-0.5 * torch.square(force_error / self.sigma_f))
         
-        # 3. タイミングの報酬 (r_T)
-        # 「最も近いビート」とのズレを計算
-        # nearest_beat = round(t / interval) * interval
-        # ※ round は .5 で偶数丸めになることがあるが、リズム用途なら許容範囲
-        beat_indices = torch.round(peak_times / self.beat_interval)
-        nearest_beat_times = beat_indices * self.beat_interval
-        
+        # タイミングの評価 (Target Timeとの誤差)
+        nearest_beat_times = current_beat_indices * self.beat_interval
         timing_error = peak_times - nearest_beat_times
         r_timing = torch.exp(-0.5 * torch.square(timing_error / self.sigma_t))
         
-        # 4. 報酬の合算
-        # hitした瞬間にドカンと報酬を与える
-        total_reward = (self.w_force * r_force) + (self.w_timing * r_timing)
-        rewards[env_ids] += total_reward
+        # ベース報酬 (掛け算ロジック: タイミングが合わないと力報酬もゼロ)
+        base_score = (self.w_force * r_force) + self.w_timing
+        hit_reward = base_score * r_timing
+        
+        # --- 最終的な加算値の決定 ---
+        
+        # A. 新規ヒットの場合 (is_new_beat_mask=True):
+        #    正当な報酬を与える (hit_reward)
+        #
+        # B. 重複ヒットの場合 (is_new_beat_mask=False):
+        #    報酬は与えず、ペナルティを与える (-w_double_hit)
+        
+        # マスクを float に変換 (True->1.0, False->0.0)
+        mask_float = is_new_beat_mask.float()
+        
+        # 最終スコア = (報酬 * マスク) - (ペナルティ * 反転マスク)
+        final_score = (hit_reward * mask_float) - (self.w_double_hit * (1.0 - mask_float))
+        
+        rewards[env_ids] += final_score
+        
+        # --- 状態更新 ---
+        
+        # ヒットカウントを加算
+        self.hit_count[env_ids] += 1 
+        
+        # 新しく報酬を与えた環境だけ、ビート番号を更新して記録
+        # (これにより、同じビート番号での次回の打撃は重複判定される)
+        valid_ids = env_ids[is_new_beat_mask]
+        if len(valid_ids) > 0:
+            self.last_rewarded_beat[valid_ids] = current_beat_indices[is_new_beat_mask]
 
-        # ▼▼▼ 追加: ピーク値を記録（次のヒットまで保持される） ▼▼▼
+        # ログ用にピーク力を記録
         self.last_hit_peak_force[env_ids] = peak_forces
 
     def compute_reward_and_dones(self, 
