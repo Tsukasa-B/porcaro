@@ -29,7 +29,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     
     # --- シミュレーション設定 (porcaro から移植) ---
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 200, 
+        dt=1 / 200,     # 物理エンジンが計算する最小単位1/200=5ms 
         render_interval=4,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             static_friction=1.0, dynamic_friction=1.0, restitution=0.5
@@ -52,7 +52,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     drum_contact_cfg: ContactSensorCfg = drum_vs_stick_cfg
     
     # --- RL 設定 ---
-    # dt=1/200, decimation=4 なので 制御周期=50Hz (20ms)
+    # dt=1/200, decimation=4 なので 制御周期=50Hz (20ms)　Agentの出力をdt*decimationとして計算する
     decimation: int = 4
     
     # ★変更: 1.0s -> 8.0s

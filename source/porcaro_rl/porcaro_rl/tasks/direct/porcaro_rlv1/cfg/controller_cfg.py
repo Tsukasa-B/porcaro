@@ -7,6 +7,9 @@ from .assets import FORCE_MAP_CSV, H0_MAP_CSV
 @configclass
 class TorqueControllerCfg:
     """TorqueActionController の設定"""
+    # 制御モード ("ep" or "pressure")
+    control_mode: str = "ep"
+    
     r: float = 0.014
     L: float = 0.150
     theta_t_DF_deg: float = 0.0

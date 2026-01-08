@@ -5,23 +5,34 @@ from isaaclab.utils import configclass
 @configclass
 class LoggingCfg:
     """データロギングの設定"""
-    enabled: bool = False  # ロギングを有効にするか
-    filepath: str = "simulation_log.csv" # 保存先ファイル名
+    enabled: bool = False
+    filepath: str = "simulation_log.csv"
     
-    # CSVのヘッダー（列名）
-    # ※ この順序と、env.py で渡すデータの順序を厳密に一致させる必要があります
+    # CSVヘッダー定義
+    # LoggingManagerが出力するリストの順序と完全に一致させています
     headers: list[str] = [
+        # --- Time ---
         "time_s",
-        "act_theta_eq",  # <-- 追加
-        "act_K_wrist",   # <-- 追加
-        "act_K_grip",    # <-- 追加
-        "q_wrist", "q_grip",
-        "qd_wrist", "qd_grip",
-        "stick_force_x", "stick_force_y", "stick_force_z",
-        "P_cmd_DF", "P_cmd_F", "P_cmd_G",
-        "P_out_DF", "P_out_F", "P_out_G",
-        "tau_w", "tau_g",
-        "f1_force",
+        
+        # --- Actions (Modeによって意味が変わるため汎用名にする) ---
+        "action_0", # EP: theta_eq / Pressure: P_cmd_DF
+        "action_1", # EP: K_wrist / Pressure: P_cmd_F
+        "action_2", # EP: K_grip  / Pressure: P_cmd_G
+        
+        # --- Joint States (Degree) ---
+        "q_wrist_deg",  "q_grip_deg",
+        "qd_wrist_deg", "qd_grip_deg",
+        
+        # --- Contact Forces (Z-axis only) ---
+        "force_z",      # 瞬時値 (Newtons)
+        "f1_score",     # 打撃判定されたピーク値
+        
+        # --- Internal Pressures (MPa) ---
+        "P_cmd_DF", "P_cmd_F", "P_cmd_G", # 指令値
+        "P_out_DF", "P_out_F", "P_out_G", # 遅延後の実際値
+        
+        # --- Torques (Nm) ---
+        "tau_wrist", "tau_grip",
     ]
 
 @configclass
@@ -29,5 +40,4 @@ class RewardLoggingCfg:
     """ステップごとの報酬ロギング設定"""
     enabled: bool = False
     filepath: str = "reward_log.csv"
-    # ヘッダー (時間とステップ報酬)
     headers: list[str] = ["time_s", "step_reward"]

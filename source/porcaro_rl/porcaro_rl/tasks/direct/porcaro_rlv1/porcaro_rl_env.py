@@ -61,12 +61,13 @@ class PorcaroRLEnv(DirectRLEnv):
         self.actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
 
         # --- 追加: コントローラの初期化 ---
-        # dt_ctrl = sim.dt * decimation
-        dt_ctrl = self.cfg.sim.dt #* self.cfg.decimation
+        # dt_ctrl = sim.dt
+        dt_ctrl = self.cfg.sim.dt # 物理エンジンのステップ数cfgで設定したものと同じ
         ctrl_cfg = self.cfg.controller
         
         self.action_controller = TorqueActionController(
             dt_ctrl=dt_ctrl,
+            control_mode=ctrl_cfg.control_mode,
             r=ctrl_cfg.r,
             L=ctrl_cfg.L,
             theta_t_DF_deg=ctrl_cfg.theta_t_DF_deg,
@@ -87,13 +88,10 @@ class PorcaroRLEnv(DirectRLEnv):
 
         # 1. ロギングマネージャ
         self.logging_manager = LoggingManager(
-            cfg=self.cfg.logging,
-            reward_cfg=self.cfg.reward_logging,
-            dof_idx=self.dof_idx,
-            num_envs=self.num_envs,
-            device=self.device,
-            dt=self.cfg.sim.dt,                  # <-- (新規追加) 物理ステップdt
-            decimation=self.cfg.decimation      # <-- (新規追加) デシメーション
+            env=self,                            # ★これが最重要！環境自体を渡す
+            dt=self.cfg.sim.dt,                  # 物理ステップ時間 (0.005s)
+            log_filepath=self.cfg.logging.filepath, 
+            enable_logging=self.cfg.logging.enabled
         )
 
         # print(f"[DEBUG] ロギングを強制的に有効化します (Config上: {self.cfg.logging.enabled})")
@@ -194,10 +192,11 @@ class PorcaroRLEnv(DirectRLEnv):
         
         # (変更) f1 を渡さず、buffer_step_data を呼ぶ
         self.logging_manager.buffer_step_data(
-            q_full=q_full,
+            q_full=self.robot.data.joint_pos,
             qd_full=self.robot.data.joint_vel,
             telemetry=self.action_controller.get_last_telemetry(),
-            actions=self.actions
+            actions=self.actions,
+            current_sim_time=self.sim.current_time, # ★ここを追加！(物理時間を渡す)
         )
 
     def _get_observations(self) -> dict:

@@ -9,6 +9,7 @@ from .pam import (
 class TorqueActionController(ActionController):
     def __init__(self,
                  dt_ctrl: float,
+                 control_mode: str = "ep", # "ep"or"pressure"
                  r: float = 0.014, L: float = 0.150,
                  theta_t_DF_deg: float = 0.0,
                  theta_t_F_deg:  float = -90.0,
@@ -22,6 +23,7 @@ class TorqueActionController(ActionController):
 
         # === ここで apply が使う全メンバを定義 ===
         self.dt_ctrl = float(dt_ctrl)
+        self.control_mode = control_mode
         self.r, self.L = float(r), float(L)
         self.theta_t = {"DF": float(theta_t_DF_deg),
                         "F":  float(theta_t_F_deg),
@@ -46,6 +48,7 @@ class TorqueActionController(ActionController):
         self.ch_G  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut)
 
         self._dbg_n = 0  # デバッグ出力回数カウンタ
+        print(f"[TorqueActionController] Initialized with Mode: {self.control_mode}")
 
     # --- デバッグ出力（最初の数回だけ） ---
     def _dbg(self, name, *xs):
@@ -74,54 +77,72 @@ class TorqueActionController(ActionController):
         self.ch_F.reset_idx(env_ids)
         self.ch_G.reset_idx(env_ids)
 
+    def _compute_command_pressure(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        正規化されたエージェント出力(Action)を指令圧力(P_cmd)に変換する。
+        Returns:
+            P_cmd_stack: [num_envs, 3] (DF, F, G の順、単位: MPa)
+        """
+        if self.control_mode == "pressure":
+            # --- モード1: 圧力直接制御 ---
+            # Action [-1, 1] -> Pressure [0, Pmax]
+            # シンプルなスケーリングのみ
+            P_cmd_unscaled = (actions + 1.0) * 0.5
+            P_cmd_stack = P_cmd_unscaled * self.Pmax
+            
+        elif self.control_mode == "ep":
+            # --- モード2: 平衡点制御 (EP) ---
+            # Action[0]: theta_eq (平衡点)
+            # Action[1]: K_wrist (手首剛性/ベース圧)
+            # Action[2]: K_grip (グリップ剛性/把持圧)
+            
+            # 定数の定義 (論文準拠)
+            MAX_P_BASE = self.Pmax * 0.5
+            MAX_P_DIFF = self.Pmax * 0.5
+            
+            a = actions
+            
+            # 1) 手首ベース圧 (同時収縮レベル)
+            P_base = MAX_P_BASE * (a[:, 1] + 1.0) * 0.5
+            
+            # 2) 手首差圧 (平衡点)
+            P_diff = MAX_P_DIFF * a[:, 0] 
+            
+            # 3) 手首PAM圧力 (DF/F)
+            P_cmd_DF = torch.clamp(P_base + P_diff, 0.0, self.Pmax)
+            P_cmd_F  = torch.clamp(P_base - P_diff, 0.0, self.Pmax)
+            
+            # 4) グリップPAM圧力 (G)
+            P_cmd_G = self.Pmax * (a[:, 2] + 1.0) * 0.5
+            
+            P_cmd_stack = torch.stack([P_cmd_DF, P_cmd_F, P_cmd_G], dim=-1)
+            
+        else:
+            raise ValueError(f"[TorqueActionController] Unknown control mode: {self.control_mode}")
+            
+        # 最終的な安全クリップ
+        return torch.clamp(P_cmd_stack, 0.0, self.Pmax)
+
     @torch.no_grad()
     def apply(self, *, actions: torch.Tensor, q: torch.Tensor,
               joint_ids: tuple[int, int], robot: RobotLike) -> None:
         wid, gid = joint_ids
-        # Action次元のチェックを新しい設計に合わせる
-        assert actions.shape[-1] == 3, "TorqueActionController expects 3-dim action (theta_eq, K_wrist, K_grip)."
         n_envs = int(q.shape[0])
+
+        # Action次元のチェックを新しい設計に合わせる
+        assert actions.shape[-1] == 3, "Actions must be 3-dim"
+
+        # --- 1) 変換モジュールを通して P_cmd を取得 ---
+        # これにより、ActuatorNet導入時はここより下の処理を差し替えるだけで済みます
+        P_cmd_stack = self._compute_command_pressure(actions)
+        
+        self._dbg("P_cmd(mean DF,F,G)", P_cmd_stack.mean(dim=0))
+        
 
         # 余分な軸が混入しても [n_envs] に落とすユーティリティ (変更なし)
         def _env1(x: torch.Tensor) -> torch.Tensor:
             x = x.reshape(n_envs, -1)
             return x[:, 0].contiguous()
-
-        # Actionの定義:
-        # a[:, 0]: theta_eq (平衡点指令) [-1, 1]
-        # a[:, 1]: K_wrist (手首剛性指令) [-1, 1]
-        # a[:, 2]: K_grip (グリップ剛性指令) [-1, 1]
-        a = actions
-        
-        # --- 1) 平衡点制御のための圧力指令値の計算 (Translatorロジック) ---
-        
-        # 暫定的な最大圧力係数。Pmax (0.6MPa)を基に決定。
-        # 論文の定義 [cite: 2025 12 10-1] に基づき、Pmaxの値を参照
-        MAX_P_BASE = self.Pmax * 0.5  # ベース圧の最大値 (0.3 MPa)
-        MAX_P_DIFF = self.Pmax * 0.5  # 差圧の最大値 (0.3 MPa)
-        
-        # 1.1) P_base: 手首剛性ベース圧力 (拮抗筋の同時収縮レベル)
-        # P_base = max_P_base * (a_K_wrist + 1) / 2
-        P_base = MAX_P_BASE * (a[:, 1] + 1.0) * 0.5
-        
-        # 1.2) P_diff: 手首平衡点差圧
-        # P_diff = max_P_diff * a_theta_eq
-        P_diff = MAX_P_DIFF * a[:, 0] 
-        
-        # 1.3) Wrist PAMs の圧力指令 (DF/F)
-        # P_DF = clamp(P_base + P_diff) [cite: 2025 12 10-1]
-        P_cmd_DF = torch.clamp(P_base + P_diff, 0.0, self.Pmax)
-        # P_F = clamp(P_base - P_diff) [cite: 2025 12 10-1]
-        P_cmd_F  = torch.clamp(P_base - P_diff, 0.0, self.Pmax)
-        
-        # 1.4) Grip PAMs の圧力指令 (G)
-        # P_G = Pmax * (a_K_grip + 1) / 2 [cite: 2025 12 10-1]
-        P_cmd_G = self.Pmax * (a[:, 2] + 1.0) * 0.5
-        
-        # P_cmd を一つにまとめる (DF, F, G の順)
-        P_cmd_stack = torch.stack([P_cmd_DF, P_cmd_F, P_cmd_G], dim=-1)
-        
-        self._dbg("P_cmd(mean DF,F,G)", P_cmd_stack.mean(dim=0))
 
         # 2) 一次遅れ＋デッドタイム（各チャネル）
         # 修正: P_cmd_stack を使用

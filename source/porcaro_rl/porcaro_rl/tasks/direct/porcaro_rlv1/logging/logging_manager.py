@@ -1,171 +1,168 @@
-# logging/logging_manager.py
+# source/porcaro_rl/porcaro_rl/tasks/direct/porcaro_rlv1/logging/logging_manager.py
 from __future__ import annotations
 import torch
-from typing import Sequence, List, Any
+from typing import TYPE_CHECKING, Any, List, Sequence
+import traceback
 
-from ..cfg.logging_cfg import LoggingCfg, RewardLoggingCfg
-from .datalogger import DataLogger
+if TYPE_CHECKING:
+    from ..porcaro_rl_env import PorcaroRLEnv
+    from .datalogger import DataLogger
 
 class LoggingManager:
-    """
-    シミュレーションのデータロギングを管理するクラス。
-    """
     def __init__(self, 
-                 cfg: LoggingCfg, 
-                 reward_cfg: RewardLoggingCfg,
-                 dof_idx: Sequence[int], 
-                 num_envs: int, 
-                 device: str | torch.device,
-                 dt: float,
-                 decimation: int,
-                 ):
+                 env: PorcaroRLEnv, 
+                 dt: float, 
+                 log_filepath: str | None = None,
+                 enable_logging: bool = False):
         
-        self.cfg = cfg
-        self.reward_cfg = reward_cfg
-        self.dof_idx = dof_idx
-        self.num_envs = num_envs
-        self.device = torch.device(device)
+        self.env = env
+        self.device = env.device
         self.dt = dt
-        self.decimation = decimation
-        
-        self.logger: DataLogger | None = None
-        self.reward_logger: DataLogger | None = None
-        
-        # Cfg に基づいてロガーを初期化
-        if cfg.enabled:
-            print(f"[LoggingManager] ロギング有効 (Simulation Data)")
-            self.logger = DataLogger(filepath=cfg.filepath, headers=cfg.headers)
-
-        if reward_cfg.enabled:
-            print(f"[LoggingManager] ロギング有効 (Reward Data)")
-            self.reward_logger = DataLogger(filepath=reward_cfg.filepath, headers=reward_cfg.headers)
-
-        # 内部変数
+        self.num_envs = env.num_envs
         self.current_time_s = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        self.log_step_counter: int = 0
-        self.log_save_interval: int = 2000 
-        self.step_data_buffer: List[Any] | None = None
 
-    def force_enable(self):
-        """Playスクリプトなどから強制的に有効化する場合"""
-        if self.logger is None:
-            print(f"[LoggingManager] ロギングを強制有効化します")
-            self.logger = DataLogger(filepath=self.cfg.filepath, headers=self.cfg.headers)
+        self.logger: DataLogger | None = None
+        if enable_logging and log_filepath is not None:
+            # ヘッダー定義
+            headers = [
+                "time_s",
+                "action_0", "action_1", "action_2",
+                "q_wrist_deg", "q_grip_deg",
+                "qd_wrist_deg", "qd_grip_deg",
+                "force_z", "f1_score",
+                "P_cmd_DF", "P_cmd_F", "P_cmd_G",
+                "P_out_DF", "P_out_F", "P_out_G",
+                "tau_wrist", "tau_grip"
+            ]
+            from .datalogger import DataLogger
+            self.logger = DataLogger(log_filepath, headers=headers)
+            print(f"[LoggingManager] Logging enabled -> {log_filepath}")
 
-    def force_enable_reward_log(self):
-        """Playスクリプトなどから強制的に有効化する場合"""
-        if self.reward_logger is None:
-            print(f"[LoggingManager] 報酬ロギングを強制有効化します")
-            self.reward_logger = DataLogger(filepath=self.reward_cfg.filepath, headers=self.reward_cfg.headers)
+        self.step_data_buffer: List[List[float]] = []
+        # デバッグ用: 最初の1回だけデータ受信確認ログを出すフラグ
+        self._debug_print_done = False 
 
-    def update_time(self, dt_ctrl: float):
-        """時刻更新 (これは学習に必要なため常に実行)"""
-        self.current_time_s.add_(dt_ctrl)
+    def reset_idx(self, env_ids: torch.Tensor | Sequence[int] | None = None):
+        self.step_data_buffer = []
+        if env_ids is not None:
+            self.current_time_s[env_ids] = 0.0
+        else:
+            self.current_time_s.fill_(0.0)
 
-    def reset_idx(self, env_ids: Sequence[int]):
-        """リセット"""
-        self.current_time_s[env_ids] = 0.0
-    
-    def buffer_step_data(self, q_full, qd_full, telemetry, actions):
-        """
-        データを一時バッファに保存。
-        ★修正: ロガーが無効なら即リターンし、リスト作成やメモリアクセスを回避
-        """
+    def reset(self):
+        self.reset_idx(None)
+        if self.logger:
+            # DataLogger側でファイルをリセットしたければここで
+            # self.logger.reset() # 既存の実装にはないのでコメントアウト
+            pass
+
+    def save_on_exit(self):
+        """終了時の処理"""
+        print("[LoggingManager] Saving logs on exit...")
+        # ★重要修正: DataLoggerのバッファをファイルに書き出す
+        if self.logger:
+            self.logger.save()
+        self.step_data_buffer = []
+
+    def update_time(self, dt: float):
+        self.current_time_s += dt
+
+    def buffer_step_data(self, 
+                         q_full: torch.Tensor, 
+                         qd_full: torch.Tensor, 
+                         telemetry: dict | None, 
+                         actions: torch.Tensor,
+                         current_sim_time: float):
+        """物理ステップごとに呼ばれ、データをリストに「追記」する"""
         if self.logger is None:
             return
 
+        # デバッグ: データが来ているか確認 (最初の1回のみ表示)
+        if not self._debug_print_done:
+            print(f"[LoggingManager] Received data at t={current_sim_time:.3f}. Buffering...")
+            self._debug_print_done = True
+
         env_idx = 0 
+        
         try:
-            # テンソル操作とリスト作成のコストはロガー有効時のみ払う
-            time_s_tensor = self.current_time_s[env_idx].reshape(-1)
-            act = actions[env_idx].reshape(-1)
-            q = q_full[env_idx, self.dof_idx].reshape(-1)
-            qd = qd_full[env_idx, self.dof_idx].reshape(-1)
+            t = current_sim_time
+            act = actions[env_idx].detach().cpu().tolist()
+            
+            dof_ids = self.env.dof_idx
+            q_deg = torch.rad2deg(q_full[env_idx, dof_ids]).detach().cpu().tolist()
+            qd_deg = torch.rad2deg(qd_full[env_idx, dof_ids]).detach().cpu().tolist()
             
             if telemetry:
-                p_cmd = telemetry["P_cmd"][env_idx].reshape(-1)
-                p_out = telemetry["P_out"][env_idx].reshape(-1)
-                tau_w = telemetry["tau_w"][env_idx].reshape(-1)
-                tau_g = telemetry["tau_g"][env_idx].reshape(-1)
+                p_cmd = telemetry["P_cmd"][env_idx].detach().cpu().tolist()
+                p_out = telemetry["P_out"][env_idx].detach().cpu().tolist()
+                tau_w = telemetry["tau_w"][env_idx].item()
+                tau_g = telemetry["tau_g"][env_idx].item()
             else:
-                p_cmd = torch.zeros(3, device=self.device)
-                p_out = torch.zeros(3, device=self.device)
-                tau_w = torch.zeros(1, device=self.device)
-                tau_g = torch.zeros(1, device=self.device)
+                p_cmd = [0.0]*3; p_out = [0.0]*3; tau_w = 0.0; tau_g = 0.0
 
-            self.step_data_buffer = [
-                time_s_tensor, act, q, qd, p_cmd, p_out, tau_w, tau_g
-            ]
-        except Exception:
-            self.step_data_buffer = None
+            row = [t] + act + q_deg + qd_deg + p_cmd + p_out + [tau_w, tau_g]
+            self.step_data_buffer.append(row)
+            
+        except Exception as e:
+            print(f"[LoggingManager] Buffer Error: {e}")
+            traceback.print_exc()
 
-    def finalize_log_step(self, peak_force, f1_force, step_reward):
-        """
-        バッファデータと最新データを組み合わせてログ書き込み
-        ★修正: 両方のロガーが無効なら即リターン
-        """
-        if self.logger is None and self.reward_logger is None:
-            return  # << ここで完全に処理を打ち切る
+    def finalize_log_step(self, peak_force: torch.Tensor, f1_force: torch.Tensor, step_reward: torch.Tensor):
+        """エージェントステップの終わりに呼ばれる"""
+        if self.logger is None:
+            self.step_data_buffer = []
+            return
+
+        # バッファが空なら何もしない
+        if not self.step_data_buffer:
+            return
 
         env_idx = 0
-
-        # --- 1. シミュレーションログ ---
-        if self.logger is not None and self.step_data_buffer is not None:
-            try:
-                rows_to_log: list[list[float]] = []
-                base_data = self.step_data_buffer
-                time_s_end = base_data[0]
-                f1 = f1_force[env_idx].reshape(-1)
-                
-                # CPUへの転送(tolist)を含む重いループ処理
-                for i in range(self.decimation):
-                    history_idx = (self.decimation - 1) - i
-                    time_s_curr = time_s_end - (self.decimation - i) * self.dt
-                    force = peak_force[env_idx, history_idx].reshape(-1)
-                    
-                    row_tensors = list(base_data)
-                    row_tensors[0] = time_s_curr.reshape(-1)
-                    row_tensors.insert(4, force)
-                    row_tensors.append(f1)
-                
-                    # 連結してリスト化 (最も重い処理)
-                    data_row = torch.cat(row_tensors).cpu().tolist()
-                    rows_to_log.append(data_row)
-
-                if rows_to_log:
-                    self.logger.add_data_batch(rows_to_log)
-
-            except Exception as e:
-                print(f"[WARN] Log error: {e}")
+        try:
+            rows_to_write = []
+            num_history = len(self.step_data_buffer)
             
-            self.step_data_buffer = None
+            force_history = peak_force[env_idx].detach().cpu()
+            # 空テンソルチェック & Flip
+            if force_history.numel() > 0:
+                if force_history.dim() > 0:
+                    force_history = torch.flip(force_history, dims=[0])
+            
+            f1_val = f1_force[env_idx].item()
 
-        # --- 2. 報酬ログ ---
-        if self.reward_logger is not None:
-            try:
-                time_s = self.current_time_s[env_idx].cpu().item()
-                reward_val = step_reward[env_idx].cpu().item()
-                self.reward_logger.add_step([time_s, reward_val])
-            except Exception:
-                pass
+            for i in range(num_history):
+                base_data = self.step_data_buffer[i]
+                
+                # --- Forceのマージ (Flatten & Safe Access) ---
+                f_val = 0.0
+                if force_history.numel() > 0 and i < force_history.shape[0]:
+                    current_force = force_history[i]
+                    flat_force = current_force.flatten()
+                    if flat_force.numel() >= 3:
+                        f_val = flat_force[2].item() # Z軸
+                    elif flat_force.numel() > 0:
+                        f_val = flat_force[0].item() # スカラー
 
-        # --- 3. 定期保存 ---
-        # ここもロガー有効時のみ実行するように変更
-        self.log_step_counter += 1
-        if (self.log_step_counter % self.log_save_interval) == 0:
-            # print も save も、ロガーが存在するときだけ行う
-            if self.logger:
-                print(f"[DataLogger] 定期保存 (Sim) ...")
+                final_row = (
+                    [base_data[0]] +        # Time
+                    base_data[1:4] +        # Act
+                    base_data[4:6] +        # Q
+                    base_data[6:8] +        # Qd
+                    [f_val, f1_val] +       # Force, F1
+                    base_data[8:11] +       # P_cmd
+                    base_data[11:14] +      # P_out
+                    base_data[14:16]        # Tau
+                )
+                rows_to_write.append(final_row)
+
+            if rows_to_write:
+                self.logger.add_data_batch(rows_to_write)
+                # ★重要修正: ここで毎回ファイルに書き込む (リアルタイム保存)
                 self.logger.save()
-            if self.reward_logger:
-                # 報酬ログだけの時はうるさいのでprintしないか、控えめに
-                self.reward_logger.save()
 
-    def save_on_exit(self):
-        """終了時の保存"""
-        if self.logger:
-            print("[INFO] Saving sim logs...")
-            self.logger.save()
-        if self.reward_logger:
-            print("[INFO] Saving reward logs...")
-            self.reward_logger.save()
+        except Exception as e:
+            print(f"[LoggingManager] Finalize Error: {e}")
+            traceback.print_exc()
+        
+        finally:
+            self.step_data_buffer = []
