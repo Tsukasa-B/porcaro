@@ -87,15 +87,17 @@ ROBOT_CFG = ArticulationCfg(
     actuators={
         "wrist": ImplicitActuatorCfg(
             joint_names_expr=["Base_link_Wrist_joint"],
-            stiffness=0,
-            damping=0,
+            stiffness=0.0,
+            damping=0.05,
             effort_limit_sim=500.0,
+            friction=1,
         ),
         "grip": ImplicitActuatorCfg(
             joint_names_expr=["Hand_link_Grip_joint"],
-            stiffness=0,
-            damping=0,
+            stiffness=0.0,
+            damping=0.05,
             effort_limit_sim=500.0,
+            friction=1,
         ),
     },
 )
@@ -104,7 +106,7 @@ DRUM_CFG = RigidObjectCfg(
     prim_path="/World/envs/env_.*/Drum", # PrimPath は Cfg クラス内で上書き
     spawn=sim_utils.UsdFileCfg(
         usd_path=DRUM_USD,
-        mass_props=MassPropertiesCfg(mass=1.0e3),
+        mass_props=MassPropertiesCfg(mass=1.0e2),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             kinematic_enabled=False,
             disable_gravity=False,

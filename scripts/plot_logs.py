@@ -28,7 +28,7 @@ def plot_rewards():
         if SAVE_PLOTS:
             plt.savefig('reward_plot.png')
             print("[INFO] Saved reward_plot.png")
-        plt.show()
+        #plt.show()
     except Exception as e:
         print(f"[ERROR] Failed to plot rewards: {e}")
 
@@ -141,7 +141,7 @@ def plot_simulation():
 
         if SAVE_PLOTS: fig4.savefig('sim_forces.png')
 
-        plt.show()
+        
 
     except KeyError as e:
         print(f"[ERROR] Key not found in CSV: {e}")
@@ -159,4 +159,5 @@ if __name__ == "__main__":
         
     print("Plotting results...")
     plot_simulation()
-    # plot_rewards() # 必要に応じてコメントアウト解除
+    plot_rewards() # 必要に応じてコメントアウト解除
+    plt.show()

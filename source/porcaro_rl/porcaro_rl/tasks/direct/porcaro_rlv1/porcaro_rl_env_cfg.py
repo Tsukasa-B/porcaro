@@ -16,6 +16,9 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
+import isaaclab.envs.mdp as mdp
+from isaaclab.managers import EventTermCfg as EventTerm
+
 from .cfg.assets import ROBOT_CFG, DRUM_CFG
 from .cfg.sensors import contact_forces_stick_at_drum_cfg, drum_vs_stick_cfg
 from .cfg.controller_cfg import TorqueControllerCfg
@@ -38,7 +41,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
 
     # --- シーン設定 (porcaro から移植) ---
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=512, # ※ main() で上書きされます
+        num_envs=32, # ※ main() で上書きされます
         env_spacing=3.0,
         replicate_physics=True,
     )
