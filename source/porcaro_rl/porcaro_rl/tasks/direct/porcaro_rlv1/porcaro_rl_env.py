@@ -21,7 +21,8 @@ from .actions.base import ActionController # IF (型ヒント用)
 from .actions.torque import TorqueActionController
 from .logging.logging_manager import LoggingManager # <-- 新規追加
 from .rewards.reward import RewardManager          # <-- 新規追加
-
+from .cfg.rewards_cfg import RewardsCfg # 明示的にインポート
+from .rhythm_generator import RhythmGenerator # <--- 新規追加
 
 
 
@@ -108,9 +109,45 @@ class PorcaroRLEnv(DirectRLEnv):
             device=self.device,
         )
 
-        # リズム計算用
-        self.bpm = self.cfg.rewards.target_bpm
-        self.beat_interval = 60.0 / self.bpm if self.bpm > 0 else 1.0
+        # target_bpm が Config にない場合は、bpm_max またはデフォルト値(120)を使う
+        self.bpm = getattr(self.cfg.rewards, "target_bpm", getattr(self.cfg.rewards, "bpm_max", 120.0))
+        self.beat_interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
+
+        # --- ▼▼▼ 追加項目: リズム生成器の初期化 ▼▼▼ ---
+        # エラー防止: cfg内に必要なパラメータがあるか確認し、無ければデフォルト値を使う安全策を入れる
+        bpm_range = (
+            getattr(self.cfg.rewards, "bpm_min", 60.0),
+            getattr(self.cfg.rewards, "bpm_max", 160.0)
+        )
+        prob_rest = getattr(self.cfg.rewards, "prob_rest", 0.3)
+        prob_double = getattr(self.cfg.rewards, "prob_double", 0.2)
+
+        # 制御周期の計算 (Sim dt * decimation)
+        self.dt_ctrl = self.cfg.sim.dt * self.cfg.decimation
+
+        self.rhythm_generator = RhythmGenerator(
+            num_envs=self.num_envs,
+            device=self.device,
+            dt=self.dt_ctrl,
+            max_episode_length=self.max_episode_length,
+            bpm_range=bpm_range,
+            prob_rest=prob_rest,
+            prob_double=prob_double
+        )
+        
+        # 先読みステップ数の計算
+        lookahead_horizon = getattr(self.cfg, "lookahead_horizon", 0.5) # cfgに無い場合は0.5秒
+        self.lookahead_steps = int(lookahead_horizon / self.dt_ctrl)
+        
+        # [安全確認] 観測空間の次元チェック
+        # Joint Pos(2) + Vel(2) + BPM(1) + Buffer(lookahead_steps)
+        expected_dim = 2 + 2 + 1 + self.lookahead_steps
+        if self.cfg.observation_space != expected_dim:
+            print(f"[WARNING] 観測空間の次元不一致の可能性があります。")
+            print(f"  Config設定値: {self.cfg.observation_space}")
+            print(f"  計算上の必要数: {expected_dim}")
+            print("  -> porcaro_rl_env_cfg.py の observation_space を修正してください。")
+        # -----------------------------------------------
 
         # ▼▼▼ 追加: 診断用プリント（ここを入れてください！） ▼▼▼
         print("=" * 80)
@@ -129,6 +166,10 @@ class PorcaroRLEnv(DirectRLEnv):
             self.event_manager.apply(mode="startup") # 質量などのランダム化を実行
         else:
             self.event_manager = None
+
+        print("[INFO] Initializing rhythm patterns for all environments...")
+        all_ids = torch.arange(self.num_envs, device=self.device)
+        self.rhythm_generator.reset(all_ids)
 
     def _setup_scene(self):
         """シーンにアセット（ロボット、ドラム、地面、ライト、センサ）をセットアップする"""
@@ -192,6 +233,11 @@ class PorcaroRLEnv(DirectRLEnv):
         # porcaro_rl_env.py の _apply_action メソッドの *末尾* に追加
 
         # (既存の robot.set_joint_effort_target(tau_full) などの後)
+        current_steps = self.episode_length_buf
+        # ターゲット力 (Tensorなので .item() でfloatにする)
+        tgt_val = self.rhythm_generator.get_current_target(current_steps)[0].item()
+        # 現在のBPM
+        tgt_bpm = self.rhythm_generator.current_bpms[0].item()
 
         # --- 変更: データロギング (マネージャに委譲) ---
         
@@ -205,104 +251,122 @@ class PorcaroRLEnv(DirectRLEnv):
             telemetry=self.action_controller.get_last_telemetry(),
             actions=self.actions,
             current_sim_time=self.sim.current_time, # ★ここを追加！(物理時間を渡す)
+            target_force=tgt_val, # ★ここ！
+            target_bpm=tgt_bpm
         )
 
     def _get_observations(self) -> dict:
         """環境の観測を取得する"""
         
-        # 全関節の「位置」を取得 (num_envs, num_total_dof)
-        q = self.robot.data.joint_pos
-        # 制御対象の関節の「位置」を抽出 (num_envs, 2)
-        joint_pos_obs = q[:, self.dof_idx]
+        # 1. 物理状態 (既存)
+        q = self.robot.data.joint_pos[:, self.dof_idx]   # [num_envs, 2]
+        qd = self.robot.data.joint_vel[:, self.dof_idx]  # [num_envs, 2]
         
-        # 全関節の「速度」を取得 (num_envs, num_total_dof)
-        qd = self.robot.data.joint_vel
-        # 制御対象の関節の「速度」を抽出 (num_envs, 2)
-        joint_vel_obs = qd[:, self.dof_idx]
+        # --- ▼▼▼ 変更項目: リズム情報の取得 ▼▼▼ ---
         
-        # --- ▼▼▼ リズム情報の計算 (詳細実装) ▼▼▼ ---
+        # (削除) 以前のサイン波やターゲット時刻の計算ロジックは削除します。
         
-        # 現在の環境内時刻 (resetで0に戻る)
-        t = self.logging_manager.current_time_s.reshape(-1) # [num_envs]
+        # (追加) 現在のステップ数
+        current_steps = self.episode_length_buf
         
-        # 1. 次の打撃タイミングまでの時間 (Countdown)
-        # target_time = ceil(t / interval) * interval
-        # time_left = target_time - t
-        # (直近の未来の拍をターゲットとする)
-        # ※ t=0.0 のとき ceil(0)=0 になるのを防ぐため少し足すか、
-        #    拍は t=interval, 2*interval... と仮定する
-        beat_index = torch.floor(t / self.beat_interval) + 1.0
-        next_beat_time = beat_index * self.beat_interval
-        time_to_next_hit = next_beat_time - t
+        # (A) 現在のBPM情報
+        # squeeze/unsqueeze周りで事故らないよう、形状を明示
+        bpm_obs = self.rhythm_generator.current_bpms.view(self.num_envs, 1) / 180.0
         
-        # 2. 目標強度 (Configから取得して固定値を入れる)
-        target_f = torch.full_like(t, self.cfg.rewards.target_force_fd)
+        # (B) 先読みバッファ [num_envs, lookahead_steps]
+        rhythm_buf = self.rhythm_generator.get_lookahead(current_steps, self.lookahead_steps)
         
-        # 3. 位相信号 (Phase: 0->1->0) または Sin波
-        # LSTMにとって周期性を掴みやすい Sin/Cos を入れるのが定石
-        phase_signal = torch.sin(2 * torch.pi * t / self.beat_interval)
-        
-        # 4. 前回の報酬 (今回はシンプルに0 or ヒットカウント等を入れる)
-        # ここでは「ヒット回数」を入れて、エージェントに「もう叩いたか？」を教える
-        hit_status = self.reward_manager.hit_count.float()
+        # 値の正規化: ターゲット力(例: 20N)で割って 0~1 にする
+        # ※ cfgから取るか、マジックナンバー回避で定数を使う
+        target_force = getattr(self.cfg.rewards, "target_force_fd", 20.0)
+        rhythm_buf = rhythm_buf / target_force
 
-        rhythm_info = torch.stack([
-            time_to_next_hit,
-            target_f,
-            phase_signal,
-            hit_status
-        ], dim=-1)
-        
-        # 結合: [Pos(2), Vel(2), Rhythm(4)] = 8次元
-        obs = torch.hstack((joint_pos_obs, joint_vel_obs, rhythm_info))
+        # 結合: [Pos(2), Vel(2), BPM(1), Buffer(N)]
+        obs = torch.cat((q, qd, bpm_obs, rhythm_buf), dim=-1)
+        # -----------------------------------------
         
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        """(変更) 報酬を計算し、ログを「書き込み確定」する"""
+        """報酬を計算する"""
 
-        # (A) センサーデータを取得
-        force_history_tensor = self.stick_sensor.data.net_forces_w_history  # (num_envs, 32, 3)
-        
-        # (B) このRLステップ (decimation=4回) の間の履歴を抽出
-        #    (num_envs, decimation, 3)
+        # (A) センサーデータ取得 (既存)
+        force_history_tensor = self.stick_sensor.data.net_forces_w_history
         current_rl_step_force_history = force_history_tensor[:, 0:self.cfg.decimation, :]
-        
-        # (C) このRLステップ間の「Z軸力」の履歴 (num_envs, decimation)
         force_z_raw = current_rl_step_force_history[..., 2]
-        force_z_history_in_step = force_z_raw.reshape(self.num_envs, self.cfg.decimation) # <--- ここで修正！
+        force_z_history_in_step = force_z_raw.reshape(self.num_envs, self.cfg.decimation)
 
-        # --- 追加: 現在時刻と物理dtを取得 ---
-        # logging_managerが管理している時刻を使用
-        # (reshape(-1) で [num_envs] にする)
+        # 時刻情報
         current_time = self.logging_manager.current_time_s.reshape(-1)
-        dt_sim = self.cfg.sim.dt # 物理ステップ (例: 1/200)
-        
-        
-        # 1. 報酬と終了判定を計算 (f1 が内部で更新される)
-        # (変更) RewardManager に (C) のZ軸力「履歴」を渡す
-        rewards = self.reward_manager.compute_reward_and_dones(
+        dt_sim = self.cfg.sim.dt
+
+        # --- 既存の RewardManager の呼び出し (ログ/Done判定用) ---
+        # 報酬(old_rewards)は使わないが、内部状態更新のために呼んでおく
+        _ = self.reward_manager.compute_reward_and_dones(
             force_z_history=force_z_history_in_step,
-            current_time_s=current_time,   # <--- 追加
-            dt_step=dt_sim,                # <--- 追加
-            episode_length_buf=self.episode_length_buf,    
+            current_time_s=current_time,
+            dt_step=dt_sim,
+            episode_length_buf=self.episode_length_buf,
             max_episode_length=(self.max_episode_length - 1) 
         )
         
-        # 2. (変更なし) 更新された f1 と reward を取得
-        f1_force_tensor = self.reward_manager.get_first_hit_force()
+        # --- ▼▼▼ 追加項目: 新しい報酬計算ロジック ▼▼▼ ---
         
-        # 3. (変更) バッファデータと最新データを組み合わせてログ書き込み
+        # 1. 現在のターゲット値を取得
+        current_steps = self.episode_length_buf
+        target_val = self.rhythm_generator.get_current_target(current_steps) # (num_envs,)
+        
+        # 2. 実測値 (このステップ内の最大打撃力)
+        # 負の値(ノイズ)を除外するため clamp(min=0)
+        current_force_max = torch.max(force_z_history_in_step, dim=1).values.clamp(min=0.0)
+        
+        # 3. マッチング報酬 (Timing & Force)
+        # ターゲットが 1.0N 以上のときだけ評価
+        is_hit_target = target_val > 1.0
+        
+        force_error = current_force_max - target_val
+        sigma_force = getattr(self.cfg.rewards, "sigma_force", 10.0)
+        
+        # ガウスカーネルで類似度計算 (差が0なら1.0, 離れると減る)
+        rew_match = torch.exp(- (force_error**2) / (sigma_force**2))
+        
+        # ターゲットが無い区間はマッチング報酬をゼロにする
+        rew_match = torch.where(is_hit_target, rew_match, torch.zeros_like(rew_match))
+        
+        # 4. 休符ペナルティ (Rest Violation)
+        # ターゲットが小さい(休符)のに、力が閾値を超えている場合
+        force_threshold_rest = getattr(self.cfg.rewards, "force_threshold_rest", 1.0)
+        is_rest_target = target_val <= 1.0
+        violation = (current_force_max > force_threshold_rest)
+        
+        rew_rest_penalty = torch.zeros_like(rew_match)
+        # 違反したら力の大きさに比例して減点
+        rew_rest_penalty = torch.where(
+            is_rest_target & violation,
+            -1.0 * current_force_max, 
+            torch.zeros_like(rew_match)
+        )
+
+        # 5. 合計報酬
+        weight_match = getattr(self.cfg.rewards, "weight_match", 20.0)
+        weight_rest = getattr(self.cfg.rewards, "weight_rest_penalty", 10.0)
+        
+        total_reward = (weight_match * rew_match) + (weight_rest * rew_rest_penalty)
+        
+        # ---------------------------------------------------
+        
+        # ログ書き込み (LoggingManager)
+        f1_force_tensor = self.reward_manager.get_first_hit_force() # 既存計算を利用
         self.logging_manager.finalize_log_step(
-            peak_force=force_history_tensor, # (A) 物理ステップのピーク力「履歴」バッファ
-            f1_force=f1_force_tensor,     # (RewardManagerが計算したF1)
-            step_reward=rewards           # (RewardManagerが計算した報酬)
+            peak_force=force_history_tensor,
+            f1_force=f1_force_tensor,
+            step_reward=total_reward # 新しい報酬をログに残す
         )
         
-        # 4. (変更なし) 終了フラグを親クラスに設定
+        # Done判定は RewardManager (または親クラス) のものを利用
         self.reset_terminated, self.reset_time_outs = self.reward_manager.get_dones()
         
-        return rewards
+        return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """報酬計算ステップで計算済みの終了判定を返す"""
@@ -311,26 +375,23 @@ class PorcaroRLEnv(DirectRLEnv):
         return self.reset_terminated, self.reset_time_outs
 
     def _reset_idx(self, env_ids: torch.Tensor) -> None:
-        """
-        指定された環境IDの内部状態をリセットします。
-        (DirectRLEnv のメソッドをオーバーライド)
-        """
+        """指定された環境IDの内部状態をリセットします。"""
         
-        # 1. 親クラスの標準リセット処理（ロボットの位置など）を実行
+        # 1. 親クラスのリセット (ロボット姿勢など)
         super()._reset_idx(env_ids)
-
-        # ▼▼▼ 追加: リセット時のランダム化(関節角度など)を実行 ▼▼▼
+        
+        # 2. 既存マネージャのリセット
         if hasattr(self, "event_manager") and self.event_manager is not None:
             self.event_manager.reset(env_ids)
-        
-        # 2. (重要) RewardManager の内部状態をリセット
-        # (これにより f1_force, hit_count などが 0 に戻る)
         if hasattr(self, "reward_manager"):
             self.reward_manager.reset_idx(env_ids)
-            
-        # 3. (重要) LoggingManager の内部状態（時刻）をリセット
         if hasattr(self, "logging_manager"):
             self.logging_manager.reset_idx(env_ids)
+            
+        # --- ▼▼▼ 追加項目: リズムパターンの再生成 ▼▼▼ ---
+        if hasattr(self, "rhythm_generator"):
+            self.rhythm_generator.reset(env_ids)
+        # -----------------------------------------------
 
     def close(self):
         """

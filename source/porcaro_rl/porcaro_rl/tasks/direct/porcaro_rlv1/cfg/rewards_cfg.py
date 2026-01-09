@@ -1,41 +1,35 @@
-# source/porcaro_rl/porcaro_rl/tasks/direct/porcaro_rlv1/cfg/rewards_cfg.py
-
+# rewards_cfg.py
 from __future__ import annotations
 from isaaclab.utils import configclass
 
 @configclass
 class RewardsCfg:
-    """報酬の重みを管理する設定"""
+    """報酬の重みを管理する設定 (Phase Matching Design)"""
     
-    # --- リズムタスク設定 ---
-    target_bpm: float = 120.0
-    
-    # --- 報酬重み ---
-    # r_F (打撃力) の重み
-    weight_force: float = 10.0
-    # r_T (タイミング) の重み <-- 追加
-    weight_timing: float = 10.0
+    # --- リズム生成設定 (RhythmGenerator用) ---
+    bpm_min: float = 60.0
+    bpm_max: float = 160.0 # 少し難易度を上げる
+    prob_rest: float = 0.3    # 30% 休符
+    prob_double: float = 0.2  # 20% ダブル (残り50%はシングル)
 
-    # --- ▼▼▼ 追加: 接触ペナルティ設定 ▼▼▼ ---
-    # リズム外で接触していた場合のペナルティ（ステップごと）
-    # ※ 50Hz駆動で1秒間触り続けると 50 * 0.5 = -25点 くらいの減点になるイメージ
-    weight_contact_penalty: float = 0.5
+    # --- 報酬重み (Total Reward Weights) ---
+    # 軌道マッチング報酬 (タイミングと力が合っているか)
+    weight_match: float = 50.0
+    
+    # 休符維持報酬 (休むべき時に休んでいるか / ペナルティの裏返し)
+    # ※ ペナルティとして実装する場合は負の値ではなく、正の項として「静止度」を評価する手もあるが
+    # ここでは「休符時の誤接触ペナルティ」の重みとする。
+    weight_rest_penalty: float = 1.0
 
-    # --- ▼▼▼ 追加: ダブルヒット（重複打撃）ペナルティ ▼▼▼ ---
-    # 同じビート区間内で2回以上叩いた場合の罰則
-    weight_double_hit_penalty: float = 5.0
+    # エネルギー効率 (無駄な力み抑制)
+    weight_efficiency: float = 0.01
+
+    # --- 評価基準パラメータ ---
+    target_force_fd: float = 20.0 # 目標打撃力 [N]
     
-    # ターゲット時刻の前後何秒間は「接触していてもペナルティなし」とするか
-    # (例: 0.1秒なら、正解時刻の前後0.1秒間は触れていても減点されない)
-    penalty_safe_window: float = 0.15
-    # ----------------------------------------
-    
-    # --- 評価基準 ---
-    target_force_fd: float = 20.0
-    # 力の許容誤差 (標準偏差)
-    sigma_f: float = 10.0
-    # タイミングの許容誤差 [秒] (この秒数ズレたら報酬が約6割に減る目安) <-- 追加
-    sigma_t: float = 0.05 
-    
-    # --- 打撃検出 ---
-    hit_threshold_force: float = 1.0
+    # マッチング報酬の許容誤差
+    sigma_force: float = 5.0  # 力の許容幅
+    sigma_time: float = 0.1   # 時間の許容幅 [s] (50msズレたら報酬激減)
+
+    # 休符判定
+    force_threshold_rest: float = 1.0 # これ以上の力が出たら休符失敗とみなす

@@ -30,6 +30,8 @@ class LoggingManager:
                 "q_wrist_deg", "q_grip_deg",
                 "qd_wrist_deg", "qd_grip_deg",
                 "force_z", "f1_score",
+                "target_force", # ターゲットの波形 (0~20N)
+                "target_bpm",   # 現在のBPM
                 "P_cmd_DF", "P_cmd_F", "P_cmd_G",
                 "P_out_DF", "P_out_F", "P_out_G",
                 "tau_wrist", "tau_grip"
@@ -51,15 +53,10 @@ class LoggingManager:
 
     def reset(self):
         self.reset_idx(None)
-        if self.logger:
-            # DataLogger側でファイルをリセットしたければここで
-            # self.logger.reset() # 既存の実装にはないのでコメントアウト
-            pass
 
     def save_on_exit(self):
         """終了時の処理"""
         print("[LoggingManager] Saving logs on exit...")
-        # ★重要修正: DataLoggerのバッファをファイルに書き出す
         if self.logger:
             self.logger.save()
         self.step_data_buffer = []
@@ -72,7 +69,10 @@ class LoggingManager:
                          qd_full: torch.Tensor, 
                          telemetry: dict | None, 
                          actions: torch.Tensor,
-                         current_sim_time: float):
+                         current_sim_time: float,
+                         target_force: float = 0.0,
+                         target_bpm: float = 0.0,
+                         ):
         """物理ステップごとに呼ばれ、データをリストに「追記」する"""
         if self.logger is None:
             return
@@ -100,7 +100,9 @@ class LoggingManager:
             else:
                 p_cmd = [0.0]*3; p_out = [0.0]*3; tau_w = 0.0; tau_g = 0.0
 
-            row = [t] + act + q_deg + qd_deg + p_cmd + p_out + [tau_w, tau_g]
+            # ★修正1: target_force, target_bpm をリストに追加
+            # 構成: Time(1) + Act(3) + Q(2) + Qd(2) + ForcePlaceholder(2) + Target(2) + P_cmd(3) + P_out(3) + Tau(2)
+            row = [t] + act + q_deg + qd_deg + [0.0, 0.0] + [target_force, target_bpm] + p_cmd + p_out + [tau_w, tau_g]
             self.step_data_buffer.append(row)
             
         except Exception as e:
@@ -113,7 +115,6 @@ class LoggingManager:
             self.step_data_buffer = []
             return
 
-        # バッファが空なら何もしない
         if not self.step_data_buffer:
             return
 
@@ -123,7 +124,6 @@ class LoggingManager:
             num_history = len(self.step_data_buffer)
             
             force_history = peak_force[env_idx].detach().cpu()
-            # 空テンソルチェック & Flip
             if force_history.numel() > 0:
                 if force_history.dim() > 0:
                     force_history = torch.flip(force_history, dims=[0])
@@ -131,9 +131,10 @@ class LoggingManager:
             f1_val = f1_force[env_idx].item()
 
             for i in range(num_history):
-                base_data = self.step_data_buffer[i]
+                # buffer_step_dataで作った行をコピー
+                final_row = list(self.step_data_buffer[i])
                 
-                # --- Forceのマージ (Flatten & Safe Access) ---
+                # --- Forceの取得 ---
                 f_val = 0.0
                 if force_history.numel() > 0 and i < force_history.shape[0]:
                     current_force = force_history[i]
@@ -141,23 +142,17 @@ class LoggingManager:
                     if flat_force.numel() >= 3:
                         f_val = flat_force[2].item() # Z軸
                     elif flat_force.numel() > 0:
-                        f_val = flat_force[0].item() # スカラー
+                        f_val = flat_force[0].item()
 
-                final_row = (
-                    [base_data[0]] +        # Time
-                    base_data[1:4] +        # Act
-                    base_data[4:6] +        # Q
-                    base_data[6:8] +        # Qd
-                    [f_val, f1_val] +       # Force, F1
-                    base_data[8:11] +       # P_cmd
-                    base_data[11:14] +      # P_out
-                    base_data[14:16]        # Tau
-                )
+                # ★修正: プレースホルダ (インデックス8, 9) を上書きするだけにする
+                # [0]:Time, [1-3]:Act, [4-5]:Q, [6-7]:Qd, [8]:Force, [9]:F1, [10]:TgtF, [11]:TgtBPM...
+                final_row[8] = f_val
+                final_row[9] = f1_val
+                
                 rows_to_write.append(final_row)
 
             if rows_to_write:
                 self.logger.add_data_batch(rows_to_write)
-                # ★重要修正: ここで毎回ファイルに書き込む (リアルタイム保存)
                 self.logger.save()
 
         except Exception as e:

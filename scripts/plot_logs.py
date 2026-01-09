@@ -118,17 +118,24 @@ def plot_simulation():
 
         if SAVE_PLOTS: fig3.savefig('sim_pressures.png')
 
-        # --- 4. Forces & Torques ---
+        # --- 4. Forces & Rhythm Matching (Crucial!) ---
         fig4, ax4 = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-        fig4.suptitle('Forces and Torques')
+        fig4.suptitle('Rhythm Tracking Performance')
 
-        # Stick Contact Force (Z-axis only)
-        ax4[0].plot(time, df['force_z'], label='Force Z', color='purple')
-        ax4[0].plot(time, df['f1_score'], label='F1 Score (Peak)', color='orange', linestyle='--', linewidth=2)
+        # Stick Contact Force vs Target
+        # ★ここが重要: ターゲット(赤点線)に合わせて実測(紫)が出ているか確認
+        ax4[0].plot(time, df['force_z'], label='Real Force', color='purple', alpha=0.8)
+        
+        if 'target_force' in df.columns:
+            ax4[0].plot(time, df['target_force'], label='Target Force (Score)', color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+        else:
+            print("[WARN] 'target_force' column not found. Skipping target plot.")
+
+        ax4[0].plot(time, df['f1_score'], label='F1 Score (Peak)', color='orange', linestyle=':', linewidth=2)
         ax4[0].set_ylabel('Force [N]')
-        ax4[0].legend()
+        ax4[0].legend(loc='upper right')
         ax4[0].grid(True)
-        ax4[0].set_title('Stick Contact Force & F1 Score')
+        ax4[0].set_title('Phase Matching: Real vs Target')
 
         # Joint Torques
         ax4[1].plot(time, df['tau_wrist'], label='Wrist Torque', color='blue', alpha=0.7)
@@ -140,8 +147,17 @@ def plot_simulation():
         ax4[1].set_title('Joint Torques')
 
         if SAVE_PLOTS: fig4.savefig('sim_forces.png')
-
         
+        # --- 5. BPM Monitor (Optional) ---
+        if 'target_bpm' in df.columns:
+            fig5, ax5 = plt.subplots(1, 1, figsize=(10, 4), sharex=True)
+            fig5.suptitle('Rhythm Difficulty')
+            ax5.plot(time, df['target_bpm'], label='Target BPM', color='magenta')
+            ax5.set_ylabel('BPM')
+            ax5.set_xlabel('Time [s]')
+            ax5.legend()
+            ax5.grid(True)
+            if SAVE_PLOTS: fig5.savefig('sim_bpm.png')
 
     except KeyError as e:
         print(f"[ERROR] Key not found in CSV: {e}")

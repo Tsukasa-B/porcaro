@@ -67,12 +67,16 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # --- 空間定義 (porcaro の仕様に合わせる) ---
     # アクション空間: (theta_eq, K_wrist, K_grip) の 3次元
     action_space: int = 3
-    # 観測空間: [関節位置(2), 関節速度(2)] + [リズム情報(4)] = 8次元に変更
-    observation_space: int = 8  # <-- 変更: 4 -> 8
+    # 観測空間
+    # Joint Pos (2) + Joint Vel (2) + Current BPM (1) + Rhythm Buffer (25) = 30
+    observation_space: int = 30
     state_space: int = 0
     
     # --- 関節名 (porcaro から移植) ---
     dof_names: list[str] = ["Base_link_Wrist_joint", "Hand_link_Grip_joint"]
+
+    # --- 追加設定: リズムバッファ ---
+    lookahead_horizon: float = 0.5 # 0.5秒先まで見る
 
     # --- モジュール別設定 (各 Cfg ファイルからインポート) ---
     controller: TorqueControllerCfg = TorqueControllerCfg()
