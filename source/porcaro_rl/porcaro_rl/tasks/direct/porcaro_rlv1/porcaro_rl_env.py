@@ -11,6 +11,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.sensors import ContactSensor, ContactSensorData # ドラムとセンサのために追加
+from isaaclab.managers import EventManager # <--- 追加
 
 # porcaro_rl_env.py のインポートセクション
 
@@ -121,6 +122,13 @@ class PorcaroRLEnv(DirectRLEnv):
         print(f"  - dt_ctrl (制御周期)   : {actual_dt_ctrl:.5f} 秒")
         print("=" * 80)
         # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+        if self.cfg.events is not None:
+            self.event_manager = EventManager(self.cfg.events, self)
+            print("[INFO] Event Manager initialized. Applying startup randomizations...")
+            self.event_manager.apply(mode="startup") # 質量などのランダム化を実行
+        else:
+            self.event_manager = None
 
     def _setup_scene(self):
         """シーンにアセット（ロボット、ドラム、地面、ライト、センサ）をセットアップする"""
@@ -310,6 +318,10 @@ class PorcaroRLEnv(DirectRLEnv):
         
         # 1. 親クラスの標準リセット処理（ロボットの位置など）を実行
         super()._reset_idx(env_ids)
+
+        # ▼▼▼ 追加: リセット時のランダム化(関節角度など)を実行 ▼▼▼
+        if hasattr(self, "event_manager") and self.event_manager is not None:
+            self.event_manager.reset(env_ids)
         
         # 2. (重要) RewardManager の内部状態をリセット
         # (これにより f1_force, hit_count などが 0 に戻る)

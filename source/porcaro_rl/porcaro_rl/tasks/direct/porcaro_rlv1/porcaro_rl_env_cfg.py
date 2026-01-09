@@ -17,7 +17,9 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
 import isaaclab.envs.mdp as mdp
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.utils import configclass
 
 from .cfg.assets import ROBOT_CFG, DRUM_CFG
 from .cfg.sensors import contact_forces_stick_at_drum_cfg, drum_vs_stick_cfg
@@ -77,3 +79,64 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     logging: LoggingCfg = LoggingCfg()
     rewards: RewardsCfg = RewardsCfg() 
     reward_logging: RewardLoggingCfg = RewardLoggingCfg()
+
+@configclass
+class PorcaroEventCfg:
+    """DR設定をまとめるクラス"""
+    pass
+
+
+@configclass
+class PorcaroRLEnvDRCfg(PorcaroRLEnvCfg):
+    """
+    [学習用] ドメインランダム化(DR)を追加した設定クラス。
+    PorcaroRLEnvCfg を継承しているため、基本的な設定はすべて同じです。
+    """
+    # 2. ここで初期化（空の箱を用意）
+    events: PorcaroEventCfg = PorcaroEventCfg()
+
+    def __init__(self):
+        super().__init__()
+
+        self.events = PorcaroEventCfg()
+        
+        # === A. 物理パラメータのランダム化 ===
+        
+        # 1. リンク質量のランダム化 (±20%)
+        # ロボットの製造誤差や配線重量の不確かさをカバーします
+        self.events.randomize_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot"), # ロボット全体
+                "mass_distribution_params": (0.8, 1.2),
+                "operation": "scale",
+            },
+        )
+
+        # 2. 物理マテリアル(摩擦・反発)のランダム化
+        # ドラムヘッドの跳ね返りやスティックの滑り具合の誤差をカバーします
+        self.events.randomize_material = EventTerm(
+            func=mdp.randomize_rigid_body_material,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "static_friction_range": (0.7, 1.3),  # 静止摩擦 ±30%
+                "dynamic_friction_range": (0.7, 1.3), # 動摩擦 ±30%
+                "restitution_range": (0.9, 1.1),      # 反発係数 ±10%
+                "num_buckets": 64,
+            },
+        )
+        
+        # === B. 初期状態のランダム化 (必要に応じて調整) ===
+        
+        # 関節角度にノイズを乗せてリセットする
+        self.events.reset_robot_joints = EventTerm(
+            func=mdp.reset_joints_by_scale,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "position_range": (0.9, 1.1), # デフォルト姿勢の90%~110%の範囲
+                "velocity_range": (-0.1, 0.1), # わずかな初速度
+            },
+        )
