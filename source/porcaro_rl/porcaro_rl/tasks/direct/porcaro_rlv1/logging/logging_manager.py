@@ -19,6 +19,7 @@ class LoggingManager:
         self.device = env.device
         self.dt = dt
         self.num_envs = env.num_envs
+        self.enable_logging = enable_logging
         self.current_time_s = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
 
         self.logger: DataLogger | None = None

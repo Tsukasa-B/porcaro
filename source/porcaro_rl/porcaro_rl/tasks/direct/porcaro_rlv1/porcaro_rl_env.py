@@ -229,8 +229,8 @@ class PorcaroRLEnv(DirectRLEnv):
             if hasattr(self, "rhythm_generator"):
                 self.rhythm_generator.set_difficulty(difficulty)
                 
-            # ログに残す
-            extras["Episode/difficulty"] = torch.tensor(difficulty)
+            # 修正: tensor作成時に device を指定し、CPU経由を回避
+            extras["Episode/difficulty"] = torch.tensor(difficulty, device=self.device)
 
         return obs, rew, terminated, truncated, extras
 
@@ -262,28 +262,26 @@ class PorcaroRLEnv(DirectRLEnv):
 
         # porcaro_rl_env.py の _apply_action メソッドの *末尾* に追加
 
-        # (既存の robot.set_joint_effort_target(tau_full) などの後)
-        current_steps = self.episode_length_buf
-        # ターゲット力 (Tensorなので .item() でfloatにする)
-        tgt_val = self.rhythm_generator.get_current_target(current_steps)[0].item()
-        # 現在のBPM
-        tgt_bpm = self.rhythm_generator.current_bpms[0].item()
+        # .item() はGPU同期が発生して遅いため、ログ有効時のみ実行する
+        if self.logging_manager.enable_logging:
+            current_steps = self.episode_length_buf
+            
+            # ここで同期が発生するが、ログが必要な時だけなので許容する
+            tgt_val = self.rhythm_generator.get_current_target(current_steps)[0].item()
+            tgt_bpm = self.rhythm_generator.current_bpms[0].item()
 
-        # --- 変更: データロギング (マネージャに委譲) ---
-        
-        # 内部時刻を更新
-        self.logging_manager.update_time(self.cfg.sim.dt)
-        
-        # (変更) f1 を渡さず、buffer_step_data を呼ぶ
-        self.logging_manager.buffer_step_data(
-            q_full=self.robot.data.joint_pos,
-            qd_full=self.robot.data.joint_vel,
-            telemetry=self.action_controller.get_last_telemetry(),
-            actions=self.actions,
-            current_sim_time=self.sim.current_time, # ★ここを追加！(物理時間を渡す)
-            target_force=tgt_val, # ★ここ！
-            target_bpm=tgt_bpm
-        )
+            # 内部時刻を更新
+            self.logging_manager.update_time(self.cfg.sim.dt)
+            
+            self.logging_manager.buffer_step_data(
+                q_full=self.robot.data.joint_pos,
+                qd_full=self.robot.data.joint_vel,
+                telemetry=self.action_controller.get_last_telemetry(),
+                actions=self.actions,
+                current_sim_time=self.sim.current_time,
+                target_force=tgt_val,
+                target_bpm=tgt_bpm
+            )
 
     def _get_observations(self) -> dict:
         """環境の観測を取得する"""
@@ -318,59 +316,52 @@ class PorcaroRLEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        """報酬を計算する"""
+        """報酬を計算する (最適化 & 形状バグ修正版)"""
 
-        # (A) センサーデータ取得 (既存)
+        # (A) センサーデータ取得
         force_history_tensor = self.stick_sensor.data.net_forces_w_history
         current_rl_step_force_history = force_history_tensor[:, 0:self.cfg.decimation, :]
-        force_z_raw = current_rl_step_force_history[..., 2]
-        force_z_history_in_step = force_z_raw.reshape(self.num_envs, self.cfg.decimation)
-
-        # 時刻情報
-        current_time = self.logging_manager.current_time_s.reshape(-1)
-        dt_sim = self.cfg.sim.dt
-
-        # --- 既存の RewardManager の呼び出し (ログ/Done判定用) ---
-        # 報酬(old_rewards)は使わないが、内部状態更新のために呼んでおく
-        _ = self.reward_manager.compute_reward_and_dones(
-            force_z_history=force_z_history_in_step,
-            current_time_s=current_time,
-            dt_step=dt_sim,
-            episode_length_buf=self.episode_length_buf,
-            max_episode_length=(self.max_episode_length - 1) 
-        )
         
-        # --- ▼▼▼ 追加項目: 新しい報酬計算ロジック ▼▼▼ ---
+        # Z軸力: [num_envs, decimation]
+        force_z_history_in_step = current_rl_step_force_history[..., 2]
+
+        # --- 最適化: 古い報酬マネージャの計算をスキップ ---
+        # 1. タイムアウト判定
+        self.reset_time_outs = self.episode_length_buf >= (self.max_episode_length - 1)
+        # 2. 終了判定 (必要なら追加)
+        self.reset_terminated = torch.zeros_like(self.reset_time_outs)
+        
+        # --- 新しい報酬計算ロジック (GPU並列) ---
         
         # 1. 現在のターゲット値を取得
         current_steps = self.episode_length_buf
         target_val = self.rhythm_generator.get_current_target(current_steps) # (num_envs,)
         
         # 2. 実測値 (このステップ内の最大打撃力)
-        # 負の値(ノイズ)を除外するため clamp(min=0)
+        # clamp(min=0) で負のノイズを除去
         current_force_max = torch.max(force_z_history_in_step, dim=1).values.clamp(min=0.0)
         
+        # ★★★ 修正ポイント: 形状を強制的に (num_envs,) に揃える ★★★
+        # これにより Broadcasting による (N, N) 行列の生成を確実に防ぐ
+        target_val = target_val.view(-1)
+        current_force_max = current_force_max.view(-1)
+        
         # 3. マッチング報酬 (Timing & Force)
-        # ターゲットが 1.0N 以上のときだけ評価
         is_hit_target = target_val > 1.0
         
+        # ここで形状が揃っていないと [4096, 4096] に爆発する
         force_error = current_force_max - target_val
         sigma_force = getattr(self.cfg.rewards, "sigma_force", 10.0)
         
-        # ガウスカーネルで類似度計算 (差が0なら1.0, 離れると減る)
         rew_match = torch.exp(- (force_error**2) / (sigma_force**2))
-        
-        # ターゲットが無い区間はマッチング報酬をゼロにする
         rew_match = torch.where(is_hit_target, rew_match, torch.zeros_like(rew_match))
         
         # 4. 休符ペナルティ (Rest Violation)
-        # ターゲットが小さい(休符)のに、力が閾値を超えている場合
         force_threshold_rest = getattr(self.cfg.rewards, "force_threshold_rest", 1.0)
         is_rest_target = target_val <= 1.0
         violation = (current_force_max > force_threshold_rest)
         
         rew_rest_penalty = torch.zeros_like(rew_match)
-        # 違反したら力の大きさに比例して減点
         rew_rest_penalty = torch.where(
             is_rest_target & violation,
             -1.0 * current_force_max, 
@@ -385,16 +376,15 @@ class PorcaroRLEnv(DirectRLEnv):
         
         # ---------------------------------------------------
         
-        # ログ書き込み (LoggingManager)
-        f1_force_tensor = self.reward_manager.get_first_hit_force() # 既存計算を利用
-        self.logging_manager.finalize_log_step(
-            peak_force=force_history_tensor,
-            f1_force=f1_force_tensor,
-            step_reward=total_reward # 新しい報酬をログに残す
-        )
-        
-        # Done判定は RewardManager (または親クラス) のものを利用
-        self.reset_terminated, self.reset_time_outs = self.reward_manager.get_dones()
+        # ログ書き込み
+        if self.logging_manager.enable_logging:
+            f1_force_tensor = torch.zeros_like(total_reward) # ダミー
+            
+            self.logging_manager.finalize_log_step(
+                peak_force=force_history_tensor,
+                f1_force=f1_force_tensor,
+                step_reward=total_reward
+            )
         
         return total_reward
 
