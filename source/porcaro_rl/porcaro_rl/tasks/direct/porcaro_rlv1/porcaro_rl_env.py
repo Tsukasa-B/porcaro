@@ -204,6 +204,36 @@ class PorcaroRLEnv(DirectRLEnv):
         
         # (チュートリアルにあったマーカー関連のコードは削除)
 
+    def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        """親クラスのstepを呼び出した後に、難易度調整の処理を挟む"""
+        
+        # 1. まず親クラス(DirectRLEnv)の本来の処理を行わせる
+        obs, rew, terminated, truncated, extras = super().step(actions)
+
+        # 2. ここに「割り込み」処理を書く (カリキュラム更新)
+        if hasattr(self, "common_step_counter"):
+            # 学習が進むにつれ difficulty を 0.0 -> 1.0 に上げる
+            # 例: 1億ステップ(全環境合計ではなくシム内時間)でMAXにする
+            # 50Hz * 2000秒 = 100,000 ステップくらいを目安にする
+            
+            # 簡易的に common_step_counter (物理ステップ数) を使う
+            # 1回のstep呼び出しで common_step_counter は decimation分進む
+            
+            # 難易度が1.0になるまでのステップ数 (調整してください)
+            # ここでは「学習完了の8割くらいの時間」を設定するのが一般的
+            TOTAL_TRAINING_STEPS = 100_000 # ※後述の計算に基づく目安
+            
+            difficulty = min(self.common_step_counter / TOTAL_TRAINING_STEPS, 1.0)
+            
+            # リズム生成器に反映
+            if hasattr(self, "rhythm_generator"):
+                self.rhythm_generator.set_difficulty(difficulty)
+                
+            # ログに残す
+            extras["Episode/difficulty"] = torch.tensor(difficulty)
+
+        return obs, rew, terminated, truncated, extras
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         """シミュレーションステップの前にアクションをバッファする"""
         if actions is None:

@@ -44,6 +44,7 @@ if args_cli.video:
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 
+
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -157,6 +158,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+
+    # ▼▼▼ 追加: 学習時は重くなるので強制的にログをOFFにする ▼▼▼
+    if hasattr(env_cfg, "logging"):
+        print("[INFO] Training mode: Forcing data logging OFF to improve performance.")
+        env_cfg.logging.enabled = False
+    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
