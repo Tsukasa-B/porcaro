@@ -72,3 +72,4 @@ tests/
 
 # Docker history
 .isaac-lab-docker-history
+external_data/jetson_project
