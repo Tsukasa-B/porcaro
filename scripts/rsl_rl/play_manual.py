@@ -1,9 +1,7 @@
 # scripts/rsl_rl/play_manual.py
 """
 Script to play a checkpoint with MANUAL rhythm injection.
-Fixed: 
-1. Completely synchronizes internal RhythmGenerator with Manual Sequencer.
-2. Ensures logs reflect the actual manual pattern being executed.
+Updated: Adds a 2.0s grace period (silence) at the start to prevent startup instability.
 """
 
 import argparse
@@ -24,7 +22,7 @@ import cli_args
 # --- Argument Parser Setup ---
 parser = argparse.ArgumentParser(description="Play RL agent with Manual Rhythm Input.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of video.")
+parser.add_argument("--video_length", type=int, default=400, help="Length of video.") # 少し長めに
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments.")
 parser.add_argument("--task", type=str, default="Isaac-Porcaro-Direct-v0", help="Task name.")
 parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point", help="Agent config.")
@@ -34,7 +32,8 @@ parser.add_argument("--real_time", action="store_true", default=False, help="Run
 
 # Manual Rhythm Args
 parser.add_argument("--bpm", type=float, default=120.0, help="Target BPM for manual pattern.")
-parser.add_argument("--pattern", type=str, default="1,0,1,0", help="Rhythm pattern (1=Hit, 0=Rest), separated by comma.")
+parser.add_argument("--pattern", type=str, default="1,1,1,1", help="Rhythm pattern (1=Hit, 0=Rest).")
+parser.add_argument("--grace_period", type=float, default=2.0, help="Silence duration at start [s].") # 新規追加
 
 # RSL-RL args
 cli_args.add_rsl_rl_args(parser)
@@ -60,31 +59,37 @@ import porcaro_rl.tasks
 
 # --- Helper Class for Manual Rhythm ---
 class ManualRhythmSequencer:
-    def __init__(self, pattern: list[int], bpm: float, dt: float, device: str, target_force: float = 20.0):
+    def __init__(self, pattern: list[int], bpm: float, dt: float, device: str, 
+                 target_force: float = 20.0, grace_period: float = 2.0):
         self.device = device
         self.dt = dt
         self.target_force = target_force
         
-        # 1. パターン全体の長さを計算
         self.sp_per_beat = int(60.0 / bpm / dt)
         
-        # パターンを十分に繰り返して長い軌道を作る (最低でも20秒分など)
+        # 1. Grace Period (開始猶予) のステップ数計算
+        grace_steps = int(grace_period / dt)
+        
+        # 2. パターン生成
+        # 最低でも20秒分は確保
         min_length_steps = int(20.0 / dt) 
         base_steps = len(pattern) * self.sp_per_beat
         repeat_count = int(np.ceil(min_length_steps / base_steps)) + 1
         
         full_pattern = pattern * repeat_count
-        total_steps = len(full_pattern) * self.sp_per_beat + 1000
+        total_steps = grace_steps + len(full_pattern) * self.sp_per_beat + 1000
         
-        # 2. スパイク生成
+        # 3. スパイク生成
         spikes = torch.zeros((1, 1, total_steps), device=device)
+        
+        # Grace Periodの分だけインデックスをずらす
         for i, beat_type in enumerate(full_pattern):
             if beat_type == 1:
-                idx = i * self.sp_per_beat
+                idx = grace_steps + (i * self.sp_per_beat) # ずらし適用
                 if idx < total_steps:
                     spikes[0, 0, idx] = 1.0
                 
-        # 3. 畳み込み
+        # 4. 畳み込み (波形生成)
         width_sec = 0.05
         sigma = width_sec / 2.0
         kernel_radius = int(width_sec / dt)
@@ -104,7 +109,6 @@ class ManualRhythmSequencer:
         indices = current_step_idx + offsets
         valid_mask = indices < self.max_idx
         safe_indices = indices.clamp(max=self.max_idx - 1)
-        # 生の値 (Newton) を返す
         vals = self.trajectory[safe_indices] * valid_mask.float()
         return vals.unsqueeze(0).repeat(num_envs, 1)
 
@@ -123,7 +127,6 @@ def main(env_cfg, agent_cfg):
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else "cuda:0"
     
-    # ログ有効化
     if hasattr(env_cfg, "logging"):
         env_cfg.logging.enabled = True 
 
@@ -155,7 +158,8 @@ def main(env_cfg, agent_cfg):
         pattern=pattern_list,
         bpm=args_cli.bpm,
         dt=dt_ctrl,
-        device=env.unwrapped.device
+        device=env.unwrapped.device,
+        grace_period=args_cli.grace_period # 猶予時間を渡す
     )
     
     obs_dim = env.unwrapped.cfg.observation_space
@@ -164,35 +168,25 @@ def main(env_cfg, agent_cfg):
     print("="*60)
     print(f"[INFO] Manual Rhythm Injection Ready.")
     print(f"  - Pattern: {pattern_list}")
-    print(f"  - BPM: {args_cli.bpm} (Interval: {60/args_cli.bpm:.2f}s)")
+    print(f"  - BPM: {args_cli.bpm}")
+    print(f"  - Grace Period: {args_cli.grace_period}s (Silence at start)")
     print("="*60)
 
-    # --- Simulation Loop ---
     obs, _ = env.reset()
     
-    # ★★★ 環境内部の波形データを手動データで完全に上書きする ★★★
+    # 内部バッファの同期
     try:
         if hasattr(env.unwrapped, "rhythm_generator"):
             print("[INFO] Overwriting internal RhythmGenerator for correct logging...")
             rg = env.unwrapped.rhythm_generator
-            
-            # 手動波形を環境のバッファサイズに合わせてカットまたはパディング
             env_len = rg.target_trajectories.shape[1]
             manual_len = sequencer.trajectory.shape[0]
-            
-            # 必要な長さを取得
             copy_len = min(env_len, manual_len)
-            
-            # 全環境のバッファを0クリアしてからコピー
             rg.target_trajectories[:] = 0.0
             rg.target_trajectories[:, :copy_len] = sequencer.trajectory[:copy_len]
-            
-            # BPMも上書き
             rg.current_bpms[:] = args_cli.bpm
-            
     except Exception as e:
         print(f"[WARNING] Failed to sync internal rhythm state: {e}")
-        traceback.print_exc()
 
     sim_step_counter = 0 
     timestep = 0
@@ -208,10 +202,8 @@ def main(env_cfg, agent_cfg):
                 else:
                     obs_tensor = obs
 
-                # 1. BPM Injection (Raw)
+                # Injection
                 obs_tensor[:, 4] = args_cli.bpm 
-                
-                # 2. Trajectory Injection (Raw)
                 manual_traj = sequencer.get_lookahead(
                     current_step_idx=sim_step_counter,
                     horizon=lookahead_steps,
@@ -219,10 +211,8 @@ def main(env_cfg, agent_cfg):
                 )
                 obs_tensor[:, 5:] = manual_traj
 
-                # 3. Policy Inference
+                # Inference
                 actions = policy(obs_tensor)
-                
-                # Step
                 obs, _, _, _ = env.step(actions)
             
             sim_step_counter += 1

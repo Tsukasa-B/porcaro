@@ -1,4 +1,4 @@
-# porcaro_env.py
+# source/porcaro_rl/porcaro_rl/tasks/direct/porcaro_rlv1/porcaro_rl_env.py
 from __future__ import annotations
 import argparse
 import torch
@@ -10,61 +10,61 @@ from isaaclab.app import AppLauncher
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.sensors import ContactSensor, ContactSensorData # ドラムとセンサのために追加
-from isaaclab.managers import EventManager # <--- 追加
+from isaaclab.sensors import ContactSensor
+from isaaclab.managers import EventManager
 
-# porcaro_rl_env.py のインポートセクション
-
-# パッケージ実行時
+# Porcaro RL imports
 from .porcaro_rl_env_cfg import PorcaroRLEnvCfg
-from .actions.base import ActionController # IF (型ヒント用)
+from .actions.base import ActionController
+from .cfg.actuator_cfg import PamDelayModelCfg, PamHysteresisModelCfg, ActuatorNetModelCfg
+from .actions.pam_dynamics import PamDelayModel, PamHysteresisModel, ActuatorNetModel
 from .actions.torque import TorqueActionController
-from .logging.logging_manager import LoggingManager # <-- 新規追加
-from .rewards.reward import RewardManager          # <-- 新規追加
-from .cfg.rewards_cfg import RewardsCfg # 明示的にインポート
-from .rhythm_generator import RhythmGenerator # <--- 新規追加
-
+from .logging.logging_manager import LoggingManager
+from .rewards.reward import RewardManager
+from .rhythm_generator import RhythmGenerator
 
 
 class PorcaroRLEnv(DirectRLEnv):
-    """Porcaro 環境クラス (チュートリアルベース)"""
+    """Porcaro 環境クラス (ActuatorNet & Sim-to-Real対応版)"""
 
-    # Cfg の型ヒントを PorcaroEnvCfg に変更
     cfg: PorcaroRLEnvCfg
 
     def __init__(self, cfg: PorcaroRLEnvCfg, render_mode: str | None = None, **kwargs):
-        
-        # アセット/センサ用の変数を初期化 (porcaro_rl_env.py を参考)
+        # アセット/センサ用の変数を初期化
         self.robot: Articulation = None
         self.drum: RigidObject = None
         self.stick_sensor: ContactSensor = None
         self.drum_sensor: ContactSensor = None
 
-        # --- 追加: アクションコントローラ ---
+        # コントローラ・マネージャ関連
         self.action_controller: ActionController = None
-        # --- 変更: ロガーと報酬マネージャの変数を初期化 ---
         self.logging_manager: LoggingManager = None
         self.reward_manager: RewardManager = None
         
+        # ActuatorNet / Dynamics モデル（Noneで初期化）
+        self.pam_delay: PamDelayModel | None = None
+        self.pam_hysteresis: PamHysteresisModel | None = None
+        self.actuator_net: ActuatorNetModel | None = None
+
         # 親クラスの __init__ を呼ぶ
         super().__init__(cfg, render_mode, **kwargs)
 
-        # cfg.dof_names に基づいて、制御対象の関節インデックスを取得
+        # ---------------------------------------------------------
+        # 1. 関節インデックスの特定
+        # ---------------------------------------------------------
         self.dof_idx, _ = self.robot.find_joints(self.cfg.dof_names)
         
-# --- 追加: dof_idx をタプル (wid, gid) に変換 ---
-        # TorqueActionController が (wid, gid) を要求するため
         if len(self.dof_idx) != 2:
             raise ValueError(f"Expected 2 DOFs (wrist, grip), but found {len(self.dof_idx)} based on {self.cfg.dof_names}")
         self.joint_ids_tuple: tuple[int, int] = (self.dof_idx[0], self.dof_idx[1])
         
-        # アクションバッファ
-        # (cfg.action_space は 3 になっているはず)
+        # アクションバッファの初期化
         self.actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
 
-        # --- 追加: コントローラの初期化 ---
-        # dt_ctrl = sim.dt
-        dt_ctrl = self.cfg.sim.dt # 物理エンジンのステップ数cfgで設定したものと同じ
+        # ---------------------------------------------------------
+        # 2. アクションコントローラの初期化
+        # ---------------------------------------------------------
+        dt_ctrl = self.cfg.sim.dt
         ctrl_cfg = self.cfg.controller
         
         self.action_controller = TorqueActionController(
@@ -83,196 +83,152 @@ class PorcaroRLEnv(DirectRLEnv):
             h0_map_csv=ctrl_cfg.h0_map_csv,
             use_pressure_dependent_tau=ctrl_cfg.use_pressure_dependent_tau,
         )
-        
-        # --- 追加: コントローラの状態をリセット ---
-        # (reset() は device と n_envs を要求するため __init__ の最後で呼ぶ)
         self.action_controller.reset(self.num_envs, self.device)
 
-        # 1. ロギングマネージャ
+        # ★★★ ActuatorNet / PAM Dynamics の初期化 ★★★
+        # ここではインスタンス化だけ行い、reset()は呼びません(forwardでの遅延初期化に任せます)
+        
+        # A. 遅れモデル
+        if hasattr(self.cfg, "pam_delay_cfg") and self.cfg.pam_delay_cfg is not None:
+             self.pam_delay = PamDelayModel(self.cfg.pam_delay_cfg, dt_ctrl, self.device)
+        
+        # B. ヒステリシスモデル
+        if hasattr(self.cfg, "pam_hysteresis_cfg") and self.cfg.pam_hysteresis_cfg is not None:
+             self.pam_hysteresis = PamHysteresisModel(self.cfg.pam_hysteresis_cfg, self.device)
+
+        # C. ActuatorNet
+        if hasattr(self.cfg, "actuator_net_cfg") and self.cfg.actuator_net_cfg is not None:
+             self.actuator_net = ActuatorNetModel(self.cfg.actuator_net_cfg, self.device)
+             
+        # ---------------------------------------------------------
+        # 3. 各種マネージャの初期化
+        # ---------------------------------------------------------
         self.logging_manager = LoggingManager(
-            env=self,                            # ★これが最重要！環境自体を渡す
-            dt=self.cfg.sim.dt,                  # 物理ステップ時間 (0.005s)
+            env=self,
+            dt=self.cfg.sim.dt,
             log_filepath=self.cfg.logging.filepath, 
             enable_logging=self.cfg.logging.enabled
         )
 
-        # print(f"[DEBUG] ロギングを強制的に有効化します (Config上: {self.cfg.logging.enabled})")
-        # self.logging_manager.force_enable()
-        # # (追加) 報酬ログも強制有効化
-        # print(f"[DEBUG] 報酬ログを強制的に有効化します (Config上: {self.cfg.reward_logging.enabled})")
-        # self.logging_manager.force_enable_reward_log()
-        
-        # 2. 報酬マネージャ
         self.reward_manager = RewardManager(
             cfg=self.cfg.rewards,
             num_envs=self.num_envs,
             device=self.device,
         )
 
-        # target_bpm が Config にない場合は、bpm_max またはデフォルト値(120)を使う
-        self.bpm = getattr(self.cfg.rewards, "target_bpm", getattr(self.cfg.rewards, "bpm_max", 120.0))
-        self.beat_interval = 60.0 / self.bpm if self.bpm > 0 else 0.5
-
-        # --- ▼▼▼ 追加項目: リズム生成器の初期化 ▼▼▼ ---
-        # エラー防止: cfg内に必要なパラメータがあるか確認し、無ければデフォルト値を使う安全策を入れる
+        # リズム生成器
         bpm_range = (
             getattr(self.cfg.rewards, "bpm_min", 60.0),
             getattr(self.cfg.rewards, "bpm_max", 160.0)
         )
         prob_rest = getattr(self.cfg.rewards, "prob_rest", 0.3)
         prob_double = getattr(self.cfg.rewards, "prob_double", 0.2)
-
-        # 制御周期の計算 (Sim dt * decimation)
-        self.dt_ctrl = self.cfg.sim.dt * self.cfg.decimation
+        self.dt_ctrl_step = self.cfg.sim.dt * self.cfg.decimation
 
         self.rhythm_generator = RhythmGenerator(
             num_envs=self.num_envs,
             device=self.device,
-            dt=self.dt_ctrl,
+            dt=self.dt_ctrl_step,
             max_episode_length=self.max_episode_length,
             bpm_range=bpm_range,
             prob_rest=prob_rest,
             prob_double=prob_double
         )
         
-        # 先読みステップ数の計算
-        lookahead_horizon = getattr(self.cfg, "lookahead_horizon", 0.5) # cfgに無い場合は0.5秒
-        self.lookahead_steps = int(lookahead_horizon / self.dt_ctrl)
+        lookahead_horizon = getattr(self.cfg, "lookahead_horizon", 0.5)
+        self.lookahead_steps = int(lookahead_horizon / self.dt_ctrl_step)
         
-        # [安全確認] 観測空間の次元チェック
-        # Joint Pos(2) + Vel(2) + BPM(1) + Buffer(lookahead_steps)
-        expected_dim = 2 + 2 + 1 + self.lookahead_steps
-        if self.cfg.observation_space != expected_dim:
-            print(f"[WARNING] 観測空間の次元不一致の可能性があります。")
-            print(f"  Config設定値: {self.cfg.observation_space}")
-            print(f"  計算上の必要数: {expected_dim}")
-            print("  -> porcaro_rl_env_cfg.py の observation_space を修正してください。")
-        # -----------------------------------------------
-
-        # ▼▼▼ 追加: 診断用プリント（ここを入れてください！） ▼▼▼
+        # ---------------------------------------------------------
+        # 4. 診断情報の表示
+        # ---------------------------------------------------------
         print("=" * 80)
         print(f"[DEBUG DIAGNOSTIC] 環境設定値の確認")
         print(f"  - sim.dt (物理ステップ): {self.cfg.sim.dt}")
         print(f"  - decimation (間引き数): {self.cfg.decimation}")
-        
-        actual_dt_ctrl = self.cfg.sim.dt * self.cfg.decimation
-        print(f"  - dt_ctrl (制御周期)   : {actual_dt_ctrl:.5f} 秒")
+        print(f"  - dt_ctrl (制御周期)   : {self.dt_ctrl_step:.5f} 秒")
         print("=" * 80)
-        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
         if self.cfg.events is not None:
             self.event_manager = EventManager(self.cfg.events, self)
-            print("[INFO] Event Manager initialized. Applying startup randomizations...")
-            self.event_manager.apply(mode="startup") # 質量などのランダム化を実行
+            self.event_manager.apply(mode="startup")
         else:
             self.event_manager = None
 
-        print("[INFO] Initializing rhythm patterns for all environments...")
         all_ids = torch.arange(self.num_envs, device=self.device)
         self.rhythm_generator.reset(all_ids)
 
     def _setup_scene(self):
-        """シーンにアセット（ロボット、ドラム、地面、ライト、センサ）をセットアップする"""
-        
-        # ロボット (Cfg に基づきインスタンス化)
         self.robot = Articulation(self.cfg.robot_cfg)
-        
-        # ドラム (Cfg に基づきインスタンス化)
         self.drum = RigidObject(self.cfg.drum_cfg)
-
-        # 地面
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         
-        # 環境の複製
         self.scene.clone_environments(copy_from_source=False)
-        
-        # シーンへのアセット登録
         self.scene.articulations["robot"] = self.robot
-        self.scene.rigid_objects["drum"] = self.drum # ドラムを登録
+        self.scene.rigid_objects["drum"] = self.drum
         
-        # ライト
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-        # センサ (Cfg に基づきインスタンス化)
         self.stick_sensor = ContactSensor(self.cfg.stick_contact_cfg)
         self.drum_sensor = ContactSensor(self.cfg.drum_contact_cfg)
-        
-        # シーンへのセンサ登録
         self.scene.sensors["stick_contact"] = self.stick_sensor
         self.scene.sensors["drum_contact"] = self.drum_sensor
-        
-        # (チュートリアルにあったマーカー関連のコードは削除)
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        """親クラスのstepを呼び出した後に、難易度調整の処理を挟む"""
-        
-        # 1. まず親クラス(DirectRLEnv)の本来の処理を行わせる
         obs, rew, terminated, truncated, extras = super().step(actions)
 
-        # 2. ここに「割り込み」処理を書く (カリキュラム更新)
         if hasattr(self, "common_step_counter"):
-            # 学習が進むにつれ difficulty を 0.0 -> 1.0 に上げる
-            # 例: 1億ステップ(全環境合計ではなくシム内時間)でMAXにする
-            # 50Hz * 2000秒 = 100,000 ステップくらいを目安にする
-            
-            # 簡易的に common_step_counter (物理ステップ数) を使う
-            # 1回のstep呼び出しで common_step_counter は decimation分進む
-            
-            # 難易度が1.0になるまでのステップ数 (調整してください)
-            # ここでは「学習完了の8割くらいの時間」を設定するのが一般的
-            TOTAL_TRAINING_STEPS = 100_000 # ※後述の計算に基づく目安
-            
+            TOTAL_TRAINING_STEPS = 100_000
             difficulty = min(self.common_step_counter / TOTAL_TRAINING_STEPS, 1.0)
-            
-            # リズム生成器に反映
             if hasattr(self, "rhythm_generator"):
                 self.rhythm_generator.set_difficulty(difficulty)
-                
-            # 修正: tensor作成時に device を指定し、CPU経由を回避
             extras["Episode/difficulty"] = torch.tensor(difficulty, device=self.device)
 
         return obs, rew, terminated, truncated, extras
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """シミュレーションステップの前にアクションをバッファする"""
-        if actions is None:
-            return
-        
-        # アクションを [-1, 1] にクリップして保存
-        # (TorqueActionController が内部で [0, Pmax] にスケーリングする)
-        self.actions = torch.clamp(actions, -1.0, 1.0)
+        if actions is not None:
+            self.actions = torch.clamp(actions, -1.0, 1.0)
 
     def _apply_action(self) -> None:
-        """バッファされたアクション（空気圧）をコントローラ経由でトルクとして適用する"""
+        """アクションの適用 (モデルの切り替えロジックを含む)"""
         
-        # --- 変更: TorqueActionController を使用 ---
+        # 1. 基本のアクション (Neural Networkの出力: -1 ~ 1)
+        raw_cmd = (self.actions + 1.0) / 2.0
         
-        # 1. 現在の全関節位置 q を取得 (num_envs, num_total_dof)
+        # 2. ActuatorNet (Model C)
+        if self.actuator_net is not None:
+             # ※ 現在は枠組みのみ。入力は要調整
+             pass 
+
+        # 3. 簡易ヒステリシスモデル (Model B)
+        if self.pam_hysteresis is not None:
+            raw_cmd = self.pam_hysteresis(raw_cmd)
+        
+        # 4. 遅れモデル (Model A/B)
+        if self.pam_delay is not None:
+            raw_cmd = self.pam_delay(raw_cmd)
+
+        # 5. 指令値をコントローラ用に戻す
+        processed_actions = (raw_cmd * 2.0) - 1.0
+        processed_actions = torch.clamp(processed_actions, -1.0, 1.0)
+
+        # 6. トルク計算・適用
         q_full = self.robot.data.joint_pos 
-        
-        # 2. TorqueActionController の apply を呼ぶ
-        #    (コントローラが内部で robot.set_joint_effort_target を呼びます)
         self.action_controller.apply(
-            actions=self.actions,
+            actions=processed_actions,
             q=q_full,
             joint_ids=self.joint_ids_tuple,
             robot=self.robot
         )
 
-        # porcaro_rl_env.py の _apply_action メソッドの *末尾* に追加
-
-        # .item() はGPU同期が発生して遅いため、ログ有効時のみ実行する
+        # 7. ログ収集
         if self.logging_manager.enable_logging:
             current_steps = self.episode_length_buf
-            
-            # ここで同期が発生するが、ログが必要な時だけなので許容する
             tgt_val = self.rhythm_generator.get_current_target(current_steps)[0].item()
             tgt_bpm = self.rhythm_generator.current_bpms[0].item()
 
-            # 内部時刻を更新
             self.logging_manager.update_time(self.cfg.sim.dt)
-            
             self.logging_manager.buffer_step_data(
                 q_full=self.robot.data.joint_pos,
                 qd_full=self.robot.data.joint_vel,
@@ -284,211 +240,119 @@ class PorcaroRLEnv(DirectRLEnv):
             )
 
     def _get_observations(self) -> dict:
-        """環境の観測を取得する"""
+        q = self.robot.data.joint_pos[:, self.dof_idx]
+        qd = self.robot.data.joint_vel[:, self.dof_idx]
         
-        # 1. 物理状態 (既存)
-        q = self.robot.data.joint_pos[:, self.dof_idx]   # [num_envs, 2]
-        qd = self.robot.data.joint_vel[:, self.dof_idx]  # [num_envs, 2]
-        
-        # --- ▼▼▼ 変更項目: リズム情報の取得 ▼▼▼ ---
-        
-        # (削除) 以前のサイン波やターゲット時刻の計算ロジックは削除します。
-        
-        # (追加) 現在のステップ数
         current_steps = self.episode_length_buf
-        
-        # (A) 現在のBPM情報
-        # squeeze/unsqueeze周りで事故らないよう、形状を明示
         bpm_obs = self.rhythm_generator.current_bpms.view(self.num_envs, 1) / 180.0
-        
-        # (B) 先読みバッファ [num_envs, lookahead_steps]
         rhythm_buf = self.rhythm_generator.get_lookahead(current_steps, self.lookahead_steps)
-        
-        # 値の正規化: ターゲット力(例: 20N)で割って 0~1 にする
-        # ※ cfgから取るか、マジックナンバー回避で定数を使う
         target_force = getattr(self.cfg.rewards, "target_force_fd", 20.0)
         rhythm_buf = rhythm_buf / target_force
 
-        # 結合: [Pos(2), Vel(2), BPM(1), Buffer(N)]
         obs = torch.cat((q, qd, bpm_obs, rhythm_buf), dim=-1)
-        # -----------------------------------------
-        
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        """報酬を計算する (最適化 & 形状バグ修正版)"""
-
-        # (A) センサーデータ取得
         force_history_tensor = self.stick_sensor.data.net_forces_w_history
         current_rl_step_force_history = force_history_tensor[:, 0:self.cfg.decimation, :]
-        
-        # Z軸力: [num_envs, decimation]
         force_z_history_in_step = current_rl_step_force_history[..., 2]
-
-        # --- 最適化: 古い報酬マネージャの計算をスキップ ---
-        # 1. タイムアウト判定
-        self.reset_time_outs = self.episode_length_buf >= (self.max_episode_length - 1)
-        # 2. 終了判定 (必要なら追加)
-        self.reset_terminated = torch.zeros_like(self.reset_time_outs)
-        
-        # --- 新しい報酬計算ロジック (GPU並列) ---
-        
-        # 1. 現在のターゲット値を取得
-        current_steps = self.episode_length_buf
-        target_val = self.rhythm_generator.get_current_target(current_steps) # (num_envs,)
-        
-        # 2. 実測値 (このステップ内の最大打撃力)
-        # clamp(min=0) で負のノイズを除去
         current_force_max = torch.max(force_z_history_in_step, dim=1).values.clamp(min=0.0)
         
-        # ★★★ 修正ポイント: 形状を強制的に (num_envs,) に揃える ★★★
-        # これにより Broadcasting による (N, N) 行列の生成を確実に防ぐ
+        current_steps = self.episode_length_buf
+        target_val = self.rhythm_generator.get_current_target(current_steps)
+        
         target_val = target_val.view(-1)
         current_force_max = current_force_max.view(-1)
         
-        # 3. マッチング報酬 (Timing & Force)
         is_hit_target = target_val > 1.0
-        
-        # ここで形状が揃っていないと [4096, 4096] に爆発する
         force_error = current_force_max - target_val
         sigma_force = getattr(self.cfg.rewards, "sigma_force", 10.0)
         
         rew_match = torch.exp(- (force_error**2) / (sigma_force**2))
         rew_match = torch.where(is_hit_target, rew_match, torch.zeros_like(rew_match))
         
-        # 4. 休符ペナルティ (Rest Violation)
         force_threshold_rest = getattr(self.cfg.rewards, "force_threshold_rest", 1.0)
         is_rest_target = target_val <= 1.0
         violation = (current_force_max > force_threshold_rest)
         
-        rew_rest_penalty = torch.zeros_like(rew_match)
         rew_rest_penalty = torch.where(
             is_rest_target & violation,
             -1.0 * current_force_max, 
             torch.zeros_like(rew_match)
         )
 
-        # 5. 合計報酬
         weight_match = getattr(self.cfg.rewards, "weight_match", 20.0)
         weight_rest = getattr(self.cfg.rewards, "weight_rest_penalty", 10.0)
-        
         total_reward = (weight_match * rew_match) + (weight_rest * rew_rest_penalty)
+
+        self.reset_time_outs = self.episode_length_buf >= (self.max_episode_length - 1)
+        self.reset_terminated = torch.zeros_like(self.reset_time_outs)
         
-        # ---------------------------------------------------
-        
-        # ログ書き込み
         if self.logging_manager.enable_logging:
-            f1_force_tensor = torch.zeros_like(total_reward) # ダミー
-            
+            f1_dummy = torch.zeros_like(total_reward)
             self.logging_manager.finalize_log_step(
                 peak_force=force_history_tensor,
-                f1_force=f1_force_tensor,
+                f1_force=f1_dummy,
                 step_reward=total_reward
             )
-        
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """報酬計算ステップで計算済みの終了判定を返す"""
-        
-        # --- 変更: RewardManager が計算した値を返す ---
         return self.reset_terminated, self.reset_time_outs
 
     def _reset_idx(self, env_ids: torch.Tensor) -> None:
-        """指定された環境IDの内部状態をリセットします。"""
-        
-        # 1. 親クラスのリセット (ロボット姿勢など)
         super()._reset_idx(env_ids)
-        
-        # 2. 既存マネージャのリセット
         if hasattr(self, "event_manager") and self.event_manager is not None:
             self.event_manager.reset(env_ids)
         if hasattr(self, "reward_manager"):
             self.reward_manager.reset_idx(env_ids)
         if hasattr(self, "logging_manager"):
             self.logging_manager.reset_idx(env_ids)
-            
-        # --- ▼▼▼ 追加項目: リズムパターンの再生成 ▼▼▼ ---
         if hasattr(self, "rhythm_generator"):
             self.rhythm_generator.reset(env_ids)
-        # -----------------------------------------------
+            
+        # ★★★ ActuatorNet/PAMモデルのリセット (reset_idxを使用) ★★★
+        if self.pam_delay is not None:
+            self.pam_delay.reset_idx(env_ids)
+        if self.pam_hysteresis is not None:
+            self.pam_hysteresis.reset_idx(env_ids)
 
     def close(self):
-        """
-        環境が閉じられるときに呼ばれ、ログを保存する。
-        (BaseEnv のメソッドをオーバーライド)
-        """
-        
-        # 1. (重要) ログマネージャにログの保存を指示
         if hasattr(self, "logging_manager") and self.logging_manager is not None:
-            print("[PorcaroRLEnv] close() が呼ばれました。ログを保存します...")
             self.logging_manager.save_on_exit()
-        
-        # 2. 親クラスの close() を呼ぶ (必須)
         super().close()
 
 
-# --- 実行用 main 関数 (porcaro_rl_env.py から移植・調整) ---
-
+# 実行用 main 関数
 def _parse_args():
-    """コマンドライン引数をパースする"""
     p = argparse.ArgumentParser()
     p.add_argument("--headless", action="store_true", help="UI なしで実行")
-    p.add_argument("--num_envs", type=int, default=128, help="並列環境数") # デフォルトを少し増やす
+    p.add_argument("--num_envs", type=int, default=128, help="並列環境数")
     p.add_argument("--max_steps", type=int, default=1000, help="実行ステップ数")
     return p.parse_args()
 
-
 def main():
-    """メイン関数: 環境を起動し、ゼロアクションで実行する"""
     args = _parse_args()
-
-    # Kit/PhysX の起動
     app = AppLauncher(headless=args.headless).app
     try:
-        # Cfg の生成 (num_envs を引数で上書き)
-        cfg = PorcaroRLEnvCfg() # クラス名を変更
+        cfg = PorcaroRLEnvCfg()
         cfg.scene.num_envs = args.num_envs
-
-        # 環境の生成
-        env = PorcaroRLEnv(cfg) # クラス名を変更
-
-        # リセット
+        env = PorcaroRLEnv(cfg)
         print("[INFO] 環境をリセットします...")
         _ = env.reset()
-        print("[INFO] リセット完了。")
-
-        # ゼロアクションで回す（スポーン確認＆動作確認）
-        print(f"[INFO] {args.max_steps} ステップのシミュレーションを開始します (ゼロアクション)。")
+        print(f"[INFO] {args.max_steps} ステップのシミュレーションを実行します。")
         for i in range(args.max_steps):
-            # アクション空間の次元 (cfg.action_space) に基づいてゼロテンソルを作成
             actions = torch.zeros((env.num_envs, env.cfg.action_space), device=env.device)
-            
-            # ステップ実行
             obs, rew, terminated, truncated, info = env.step(actions)
-            
-            # もし終了/タイムアウトした環境があればリセット
             if (terminated | truncated).any():
                 env.reset_done(terminated | truncated)
-                
-            if i % 100 == 0:
-                print(f"  ステップ {i}/{args.max_steps} 実行中...")
-
-
     except Exception as e:
-        print(f"[ERROR] シミュレーション中にエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        
-        # --- 変更: ログマネージャ経由で保存 ---
-        # 'env' がローカル変数に存在し、logging_manager を持っているか確認
-        if 'env' in locals() and hasattr(env, 'logging_manager') and env.logging_manager is not None:
-            print("[INFO] シミュレーション終了。ログをファイルに保存します...")
-            # env.logger.save() # <-- 古いコード (コメントアウトまたは削除)
-            env.logging_manager.save_on_exit() # <-- こちらを使用
-        
-        print("[INFO] シミュレーション終了。アプリケーションを閉じます。")
+        if 'env' in locals() and hasattr(env, 'logging_manager') and env.logging_manager:
+            env.logging_manager.save_on_exit()
         app.close()
-
 
 if __name__ == "__main__":
     main()
