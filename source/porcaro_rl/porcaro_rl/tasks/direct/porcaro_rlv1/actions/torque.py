@@ -1,4 +1,4 @@
-# porcaro_rl/actions/torque.py
+# source/porcaro_rl/porcaro_rl/tasks/direct/porcaro_rlv1/actions/torque.py
 from __future__ import annotations
 import torch
 from .base import ActionController, RobotLike
@@ -42,19 +42,24 @@ class TorqueActionController(ActionController):
         self.ch_DF = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut)
         self.ch_F  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut)
         self.ch_G  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut)
-
-        # printなどのI/O処理も極力排除
-        # print(f"[TorqueActionController] Initialized with Mode: {self.control_mode}")
+        
+        # 変更箇所: テレメトリ保存用変数の初期化
+        self._last_telemetry: dict | None = None
 
     def reset(self, n_envs: int, device: str | torch.device):
         self.ch_DF.reset(n_envs, device)
         self.ch_F.reset(n_envs, device)
         self.ch_G.reset(n_envs, device)
+        self._last_telemetry = None
 
     def reset_idx(self, env_ids: torch.Tensor):
         self.ch_DF.reset_idx(env_ids)
         self.ch_F.reset_idx(env_ids)
         self.ch_G.reset_idx(env_ids)
+
+    # 変更箇所: 外部から P_cmd を計算するためのヘルパーメソッドを追加
+    def compute_pressure(self, actions: torch.Tensor) -> torch.Tensor:
+        return self._compute_command_pressure(actions)
 
     def _compute_command_pressure(self, actions: torch.Tensor) -> torch.Tensor:
         if self.control_mode == "pressure":
@@ -71,7 +76,6 @@ class TorqueActionController(ActionController):
             P_cmd_G = self.Pmax * (a[:, 2] + 1.0) * 0.5
             P_cmd_stack = torch.stack([P_cmd_DF, P_cmd_F, P_cmd_G], dim=-1)
         else:
-            # エラーチェックすらコストになるので、開発が終わっていればassertのみにするか削除
             P_cmd_stack = torch.zeros_like(actions) 
         
         return torch.clamp(P_cmd_stack, 0.0, self.Pmax)
@@ -83,6 +87,8 @@ class TorqueActionController(ActionController):
         n_envs = int(q.shape[0])
 
         # 1) 指令値計算
+        # ここでの actions は遅れやヒステリシス適用後の値が入ってくるため、
+        # 計算される圧力は「実際にモデルに入力される圧力 (P_out)」に相当します。
         P_cmd_stack = self._compute_command_pressure(actions)
 
         # 2) 遅れ計算
@@ -107,7 +113,7 @@ class TorqueActionController(ActionController):
             F_F  = Fpam_quasi_static(P_F,  h_F,  N=self.N, Pmax=self.Pmax)
             F_G  = Fpam_quasi_static(P_G,  h_G,  N=self.N, Pmax=self.Pmax)
 
-        # 4.5) 弛み判定 (h0_mapがある場合のみ計算)
+        # 4.5) 弛み判定
         if self.h0_map is not None:
             h0_DF = self.h0_map(P_DF)
             h0_F  = self.h0_map(P_F)
@@ -126,9 +132,14 @@ class TorqueActionController(ActionController):
         tau_full[:, gid] = tau_g
         robot.set_joint_effort_target(tau_full)
 
-        # テレメトリ保存 (必要な場合のみ)
-        # self._last_telemetry = ... (学習速度優先ならコメントアウト推奨)
+        # 変更箇所: テレメトリ保存
+        # ここでの P_cmd_stack は、ダイナミクス適用後のActionから計算されたものなので P_out として扱います
+        self._last_telemetry = {
+            "P_out": P_cmd_stack.clone(),
+            "tau_w": tau_w.clone(),
+            "tau_g": tau_g.clone()
+        }
     
-    # ログ用メソッドが必要なら残すが、学習ループで呼ばないこと
     def get_last_telemetry(self):
-        return None
+        # 変更箇所: 辞書を返すように変更
+        return self._last_telemetry

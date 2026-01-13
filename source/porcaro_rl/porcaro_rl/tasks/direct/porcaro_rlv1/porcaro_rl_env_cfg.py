@@ -38,7 +38,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
         dt=1 / 200,     # 5ms
         render_interval=4,
         physics_material=sim_utils.RigidBodyMaterialCfg(
-            static_friction=1.0, dynamic_friction=1.0, restitution=0.5
+            static_friction=0.4, dynamic_friction=0.4, restitution=0.5
         ),
     )
 

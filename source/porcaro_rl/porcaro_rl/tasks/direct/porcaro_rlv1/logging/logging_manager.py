@@ -93,15 +93,23 @@ class LoggingManager:
             q_deg = torch.rad2deg(q_full[env_idx, dof_ids]).detach().cpu().tolist()
             qd_deg = torch.rad2deg(qd_full[env_idx, dof_ids]).detach().cpu().tolist()
             
-            if telemetry:
-                p_cmd = telemetry["P_cmd"][env_idx].detach().cpu().tolist()
-                p_out = telemetry["P_out"][env_idx].detach().cpu().tolist()
-                tau_w = telemetry["tau_w"][env_idx].item()
-                tau_g = telemetry["tau_g"][env_idx].item()
-            else:
-                p_cmd = [0.0]*3; p_out = [0.0]*3; tau_w = 0.0; tau_g = 0.0
+            # 変更箇所: テレメトリ取得のロバスト化
+            # 値がない場合やActuatorNet使用時は 0.0 (またはNaN) で埋める
+            p_cmd = [0.0] * 3
+            p_out = [0.0] * 3
+            tau_w = 0.0
+            tau_g = 0.0
 
-            # ★修正1: target_force, target_bpm をリストに追加
+            if telemetry:
+                if "P_cmd" in telemetry:
+                    p_cmd = telemetry["P_cmd"][env_idx].detach().cpu().tolist()
+                if "P_out" in telemetry:
+                    p_out = telemetry["P_out"][env_idx].detach().cpu().tolist()
+                if "tau_w" in telemetry:
+                    tau_w = telemetry["tau_w"][env_idx].item()
+                if "tau_g" in telemetry:
+                    tau_g = telemetry["tau_g"][env_idx].item()
+
             # 構成: Time(1) + Act(3) + Q(2) + Qd(2) + ForcePlaceholder(2) + Target(2) + P_cmd(3) + P_out(3) + Tau(2)
             row = [t] + act + q_deg + qd_deg + [0.0, 0.0] + [target_force, target_bpm] + p_cmd + p_out + [tau_w, tau_g]
             self.step_data_buffer.append(row)

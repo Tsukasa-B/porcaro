@@ -158,6 +158,7 @@ class PorcaroRLEnv(DirectRLEnv):
         self.rhythm_generator.reset(all_ids)
 
     def _setup_scene(self):
+        
         self.robot = Articulation(self.cfg.robot_cfg)
         self.drum = RigidObject(self.cfg.drum_cfg)
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
@@ -196,9 +197,18 @@ class PorcaroRLEnv(DirectRLEnv):
         # 1. 基本のアクション (Neural Networkの出力: -1 ~ 1)
         raw_cmd = (self.actions + 1.0) / 2.0
         
+        # 変更箇所: P_cmd (ダイナミクス適用前の指令圧力) を計算して保持
+        # NNの出力(self.actions)が意図している圧力を計算します
+        p_cmd_log = None
+        if hasattr(self.action_controller, "compute_pressure"):
+            with torch.no_grad():
+                p_cmd_log = self.action_controller.compute_pressure(self.actions)
+        
         # 2. ActuatorNet (Model C)
         if self.actuator_net is not None:
-             # ※ 現在は枠組みのみ。入力は要調整
+             # ※ ActuatorNetの場合、アクション自体がトルクや別次元になる可能性があるため
+             # 従来のP_cmd/P_outはNaNにすべきかもしれません。
+             # ここでは既存ロジックを維持しつつ、後続の処理に委ねます
              pass 
 
         # 3. 簡易ヒステリシスモデル (Model B)
@@ -215,6 +225,8 @@ class PorcaroRLEnv(DirectRLEnv):
 
         # 6. トルク計算・適用
         q_full = self.robot.data.joint_pos 
+        
+        # この apply 内で P_out (processed_actionsに基づく圧力) と tau が計算・保存されます
         self.action_controller.apply(
             actions=processed_actions,
             q=q_full,
@@ -229,10 +241,25 @@ class PorcaroRLEnv(DirectRLEnv):
             tgt_bpm = self.rhythm_generator.current_bpms[0].item()
 
             self.logging_manager.update_time(self.cfg.sim.dt)
+            
+            # 変更箇所: コントローラから取得したテレメトリに P_cmd を注入
+            telemetry = self.action_controller.get_last_telemetry()
+            if telemetry is None:
+                telemetry = {}
+            
+            # P_cmd を辞書に追加
+            if p_cmd_log is not None:
+                telemetry["P_cmd"] = p_cmd_log
+            elif self.actuator_net is not None:
+                # Model Cで圧力が定義できない場合はNaN埋め
+                nan_tensor = torch.full((self.num_envs, 3), float('nan'), device=self.device)
+                telemetry["P_cmd"] = nan_tensor
+                telemetry["P_out"] = nan_tensor # Controllerが出すP_outも無効化
+            
             self.logging_manager.buffer_step_data(
                 q_full=self.robot.data.joint_pos,
                 qd_full=self.robot.data.joint_vel,
-                telemetry=self.action_controller.get_last_telemetry(),
+                telemetry=telemetry,
                 actions=self.actions,
                 current_sim_time=self.sim.current_time,
                 target_force=tgt_val,
