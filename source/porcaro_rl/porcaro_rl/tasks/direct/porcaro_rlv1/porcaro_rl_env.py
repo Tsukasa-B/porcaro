@@ -280,48 +280,57 @@ class PorcaroRLEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        force_history_tensor = self.stick_sensor.data.net_forces_w_history
-        current_rl_step_force_history = force_history_tensor[:, 0:self.cfg.decimation, :]
-        force_z_history_in_step = current_rl_step_force_history[..., 2]
-        current_force_max = torch.max(force_z_history_in_step, dim=1).values.clamp(min=0.0)
+        # --- 1. センサデータの取得と整形 ---
+        # 取得元: (num_envs, history_length, 3)
+        force_history = self.stick_sensor.data.net_forces_w_history
         
+        # 今ステップ分の履歴を切り出し: (num_envs, decimation, 3)
+        step_force_history = force_history[:, 0:self.cfg.decimation, :]
+        
+        # Z軸のみ抽出: (num_envs, decimation)
+        force_z_history = step_force_history[..., 2]
+        
+        # ステップ内の最大値を取得し、確実に1次元 (num_envs,) に整形する
+        # ★修正点: flatten() を追加して、余分な次元や履歴形状によるブロードキャストエラーを防ぐ
+        current_force_max = torch.max(force_z_history, dim=1).values.clamp(min=0.0).flatten()
+
+        # --- 2. ターゲット情報の取得 ---
         current_steps = self.episode_length_buf
-        target_val = self.rhythm_generator.get_current_target(current_steps)
+        # これも確実に1次元 (num_envs,) に整形
+        target_val = self.rhythm_generator.get_current_target(current_steps).view(-1)
         
-        target_val = target_val.view(-1)
-        current_force_max = current_force_max.view(-1)
-        
-        is_hit_target = target_val > 1.0
-        force_error = current_force_max - target_val
-        sigma_force = getattr(self.cfg.rewards, "sigma_force", 10.0)
-        
-        rew_match = torch.exp(- (force_error**2) / (sigma_force**2))
-        rew_match = torch.where(is_hit_target, rew_match, torch.zeros_like(rew_match))
-        
-        force_threshold_rest = getattr(self.cfg.rewards, "force_threshold_rest", 1.0)
-        is_rest_target = target_val <= 1.0
-        violation = (current_force_max > force_threshold_rest)
-        
-        rew_rest_penalty = torch.where(
-            is_rest_target & violation,
-            -1.0 * current_force_max, 
-            torch.zeros_like(rew_match)
+        # --- 3. 時間刻み (dt) ---
+        dt_step = self.cfg.sim.dt * self.cfg.decimation
+
+        # --- 4. 報酬計算 (Managerへ委譲) ---
+        # force_z と target_force_trace が共に (num_envs,) の1次元Tensorであることを保証して渡す
+        total_reward, reward_terms = self.reward_manager.compute_rewards(
+            actions=self.actions,
+            joint_pos=self.robot.data.joint_pos[:, self.dof_idx],
+            force_z=current_force_max, 
+            target_force_trace=target_val,
+            dt=dt_step
         )
+        
+        # --- 5. ログ記録 (WandB / Tensorboard用) ---
+        if hasattr(self, "extras"):
+            for key, val in reward_terms.items():
+                # 平均値を記録
+                self.extras[f"Reward/{key}"] = torch.mean(val)
 
-        weight_match = getattr(self.cfg.rewards, "weight_match", 20.0)
-        weight_rest = getattr(self.cfg.rewards, "weight_rest_penalty", 10.0)
-        total_reward = (weight_match * rew_match) + (weight_rest * rew_rest_penalty)
-
+        # --- 6. エピソード終了判定 ---
         self.reset_time_outs = self.episode_length_buf >= (self.max_episode_length - 1)
         self.reset_terminated = torch.zeros_like(self.reset_time_outs)
         
+        # --- 7. 詳細ロガーへの記録 ---
         if self.logging_manager.enable_logging:
-            f1_dummy = torch.zeros_like(total_reward)
+            dummy_f1 = torch.zeros_like(total_reward)
             self.logging_manager.finalize_log_step(
-                peak_force=force_history_tensor,
-                f1_force=f1_dummy,
+                peak_force=force_history,
+                f1_force=dummy_f1,
                 step_reward=total_reward
             )
+            
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:

@@ -4,45 +4,36 @@ from isaaclab.utils import configclass
 
 @configclass
 class RewardsCfg:
-    """報酬の重みを管理する設定 (Phase Matching Design)"""
+    """報酬の重みと正規化オプション"""
     
-    # --- リズム生成設定 ---
-    bpm_min: float = 60.0
-    bpm_max: float = 160.0
-    prob_rest: float = 0.3
-    prob_double: float = 0.2
+    # --- 正規化オプション（★重要: これで最大値を一致させる） ---
+    # Trueなら「ターゲット強度(20Nなど)」に比例して報酬が増える（フォルテシモ重視）
+    # Falseなら「どんな強さでも」一致すれば満点は1.0（正確性重視）
+    scale_reward_by_force_magnitude: bool = False 
 
-    # --- 報酬重み (Total Reward Weights) ---
+    # --- 報酬重み (各項の r_i に掛かる係数 w_i) ---
+    # 不要な項は 0.0 にすれば計算自体が無効化される設計にします
     
-    # 1. マッチング報酬（強化）
-    # 逃げるより叩いた方が遥かにお得だと思わせるため、50 -> 100 に倍増
+    # 1. 打撃の一致度 (Hit Match)
     weight_match: float = 100.0
     
-    # 2. 休符維持報酬（緩和）
-    # 「絶対触るな」という圧を下げて、次の音の準備をしやすくする。1.0 -> 0.1
-    weight_rest_penalty: float = 0.1
+    # 2. 休符の遵守 (Rest Compliance) - 以前はPenaltyでしたが「守れば報酬」の方が安定する場合も
+    weight_rest: float = 1.0   # 休符を守っている間、毎ステップ入る報酬
+    weight_rest_penalty: float = -5.0 # 休符なのに触ってしまった時の罰
 
-    # 以下の項目を RewardsCfg クラス内に追加してください
-    # 1ステップあたりの常時接触ペナルティ (0.01sあたり)
+    # 3. 接触継続ペナルティ (Anti-Pushing)
     weight_contact_continuous: float = -2.0 
-    # 許容される最大接触時間 (これを超えるとペナルティが激増する)
     max_contact_duration_s: float = 0.1
 
-    # 3. 関節制限ペナルティ（★新規追加★）
-    # 手首が-90度（天井）や+45度（床下）に行こうとしたら罰を与える
-    weight_joint_limits: float = -10.0  # 強い負の報酬
+    # 4. 関節制限 (Joint Limits)
+    weight_joint_limits: float = -1.0
 
-    # エネルギー効率
-    weight_efficiency: float = 0.01
+    # 5. アクションの滑らかさ/省エネ
+    weight_action_rate: float = 0.0
+    weight_energy: float = 0.0
 
     # --- 評価基準パラメータ ---
-    target_force_fd: float = 20.0
-    sigma_force: float = 5.0
-    sigma_time: float = 0.1
+    target_force_fd: float = 20.0 # 基準となる力
+    sigma_force: float = 5.0      # 許容誤差の幅
     
-    # ★新規追加: 関節角度のソフトリミット (deg)
-    # この範囲を超えたら罰則発動
-    # 手首(Wrist): -80度(上) 〜 +30度(下) 
     limit_wrist_range: tuple[float, float] = (-80.0, 30.0)
-    # グリップ(Grip): 0度(開) 〜 60度(閉)
-    limit_grip_range: tuple[float, float] = (0.0, 60.0)
