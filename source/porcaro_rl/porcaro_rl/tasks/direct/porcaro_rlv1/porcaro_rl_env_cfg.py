@@ -75,6 +75,13 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     
     dof_names: list[str] = ["Base_link_Wrist_joint", "Hand_link_Grip_joint"]
 
+    # ===================================================
+    # ★ 追加箇所: シンプルリズム生成設定
+    # ===================================================
+    use_simple_rhythm: bool = True   # TrueにするとSimpleRhythmGeneratorを使用
+    simple_rhythm_mode: str = "single" # "single", "double", "steady"
+    simple_rhythm_bpm: float = 60.0    # steadyモード時のBPM
+
     # --- 追加設定 ---
     lookahead_horizon: float = 0.5
 

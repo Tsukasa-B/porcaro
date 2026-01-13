@@ -22,6 +22,7 @@ from .actions.torque import TorqueActionController
 from .logging.logging_manager import LoggingManager
 from .rewards.reward import RewardManager
 from .rhythm_generator import RhythmGenerator
+from .simple_rhythm_generator import SimpleRhythmGenerator
 
 
 class PorcaroRLEnv(DirectRLEnv):
@@ -116,24 +117,46 @@ class PorcaroRLEnv(DirectRLEnv):
             device=self.device,
         )
 
-        # リズム生成器
-        bpm_range = (
-            getattr(self.cfg.rewards, "bpm_min", 60.0),
-            getattr(self.cfg.rewards, "bpm_max", 160.0)
-        )
-        prob_rest = getattr(self.cfg.rewards, "prob_rest", 0.3)
-        prob_double = getattr(self.cfg.rewards, "prob_double", 0.2)
+        # =========================================================
+        # ★ 変更箇所: リズム生成器の切り替えロジック
+        # =========================================================
         self.dt_ctrl_step = self.cfg.sim.dt * self.cfg.decimation
+        
+        # Configに追加したフラグを確認 (デフォルトFalseとして安全に取得)
+        use_simple = getattr(self.cfg, "use_simple_rhythm", False)
 
-        self.rhythm_generator = RhythmGenerator(
-            num_envs=self.num_envs,
-            device=self.device,
-            dt=self.dt_ctrl_step,
-            max_episode_length=self.max_episode_length,
-            bpm_range=bpm_range,
-            prob_rest=prob_rest,
-            prob_double=prob_double
-        )
+        if use_simple:
+            # デバッグ用の単純生成器を使用
+            mode = getattr(self.cfg, "simple_rhythm_mode", "single")
+            bpm = getattr(self.cfg, "simple_rhythm_bpm", 60.0)
+            
+            print(f"[INFO] SimpleRhythmGeneratorを使用します (Mode: {mode}, BPM: {bpm})")
+            self.rhythm_generator = SimpleRhythmGenerator(
+                num_envs=self.num_envs,
+                device=self.device,
+                dt=self.dt_ctrl_step,
+                max_episode_length=self.max_episode_length,
+                mode=mode,
+                bpm=bpm
+            )
+        else:
+            # 本番学習用のランダム生成器を使用
+            bpm_range = (
+                getattr(self.cfg.rewards, "bpm_min", 60.0),
+                getattr(self.cfg.rewards, "bpm_max", 160.0)
+            )
+            prob_rest = getattr(self.cfg.rewards, "prob_rest", 0.3)
+            prob_double = getattr(self.cfg.rewards, "prob_double", 0.2)
+            
+            self.rhythm_generator = RhythmGenerator(
+                num_envs=self.num_envs,
+                device=self.device,
+                dt=self.dt_ctrl_step,
+                max_episode_length=self.max_episode_length,
+                bpm_range=bpm_range,
+                prob_rest=prob_rest,
+                prob_double=prob_double
+            )
         
         lookahead_horizon = getattr(self.cfg, "lookahead_horizon", 0.5)
         self.lookahead_steps = int(lookahead_horizon / self.dt_ctrl_step)
