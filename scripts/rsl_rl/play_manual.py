@@ -1,7 +1,11 @@
 # scripts/rsl_rl/play_manual.py
 """
 Script to play a checkpoint with MANUAL rhythm injection.
-Updated: Adds a 2.0s grace period (silence) at the start to prevent startup instability.
+Updated: 
+1. Fixes ValueError: not enough values to unpack (expected 5, got 4) -> Changed to 4-tuple unpacking.
+2. Fixes AttributeError: 'int' object has no attribute 'shape'
+3. Adds normalization to match training environment.
+4. Removed 'states' keyword argument for rsl_rl compatibility.
 """
 
 import argparse
@@ -22,7 +26,7 @@ import cli_args
 # --- Argument Parser Setup ---
 parser = argparse.ArgumentParser(description="Play RL agent with Manual Rhythm Input.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos.")
-parser.add_argument("--video_length", type=int, default=400, help="Length of video.") # 少し長めに
+parser.add_argument("--video_length", type=int, default=400, help="Length of video.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments.")
 parser.add_argument("--task", type=str, default="Isaac-Porcaro-Direct-v0", help="Task name.")
 parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point", help="Agent config.")
@@ -33,7 +37,7 @@ parser.add_argument("--real_time", action="store_true", default=False, help="Run
 # Manual Rhythm Args
 parser.add_argument("--bpm", type=float, default=120.0, help="Target BPM for manual pattern.")
 parser.add_argument("--pattern", type=str, default="1,1,1,1", help="Rhythm pattern (1=Hit, 0=Rest).")
-parser.add_argument("--grace_period", type=float, default=2.0, help="Silence duration at start [s].") # 新規追加
+parser.add_argument("--grace_period", type=float, default=2.0, help="Silence duration at start [s].")
 
 # RSL-RL args
 cli_args.add_rsl_rl_args(parser)
@@ -82,10 +86,9 @@ class ManualRhythmSequencer:
         # 3. スパイク生成
         spikes = torch.zeros((1, 1, total_steps), device=device)
         
-        # Grace Periodの分だけインデックスをずらす
         for i, beat_type in enumerate(full_pattern):
             if beat_type == 1:
-                idx = grace_steps + (i * self.sp_per_beat) # ずらし適用
+                idx = grace_steps + (i * self.sp_per_beat)
                 if idx < total_steps:
                     spikes[0, 0, idx] = 1.0
                 
@@ -127,6 +130,7 @@ def main(env_cfg, agent_cfg):
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else "cuda:0"
     
+    # プレイ時は強制的にログを有効化
     if hasattr(env_cfg, "logging"):
         env_cfg.logging.enabled = True 
 
@@ -159,9 +163,10 @@ def main(env_cfg, agent_cfg):
         bpm=args_cli.bpm,
         dt=dt_ctrl,
         device=env.unwrapped.device,
-        grace_period=args_cli.grace_period # 猶予時間を渡す
+        grace_period=args_cli.grace_period
     )
     
+    # 修正: .shape[0] を削除して直接 int として取得
     obs_dim = env.unwrapped.cfg.observation_space
     lookahead_steps = obs_dim - 5
     
@@ -172,9 +177,24 @@ def main(env_cfg, agent_cfg):
     print(f"  - Grace Period: {args_cli.grace_period}s (Silence at start)")
     print("="*60)
 
+    # --- Simulation Loop ---
     obs, _ = env.reset()
     
-    # 内部バッファの同期
+    # RNNの状態をリセット
+    if hasattr(policy, "reset_memory"):
+        print("[INFO] Resetting policy RNN memory...")
+        policy.reset_memory()
+    elif hasattr(policy, "reset"):
+        try:
+             policy.reset(torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+        except:
+             pass
+
+    # 環境設定に合わせた正規化定数
+    BPM_NORMALIZATION = 180.0
+    FORCE_NORMALIZATION = 20.0
+
+    # 内部バッファの同期（ログ用）
     try:
         if hasattr(env.unwrapped, "rhythm_generator"):
             print("[INFO] Overwriting internal RhythmGenerator for correct logging...")
@@ -202,18 +222,26 @@ def main(env_cfg, agent_cfg):
                 else:
                     obs_tensor = obs
 
-                # Injection
-                obs_tensor[:, 4] = args_cli.bpm 
+                # --- データの正規化 ---
+                obs_tensor[:, 4] = args_cli.bpm / BPM_NORMALIZATION 
+                
                 manual_traj = sequencer.get_lookahead(
                     current_step_idx=sim_step_counter,
                     horizon=lookahead_steps,
                     num_envs=env.unwrapped.num_envs
                 )
-                obs_tensor[:, 5:] = manual_traj
+                obs_tensor[:, 5:] = manual_traj / FORCE_NORMALIZATION
 
-                # Inference
+                # 推論実行 (states引数なし)
                 actions = policy(obs_tensor)
-                obs, _, _, _ = env.step(actions)
+                
+                # ★修正箇所: 5変数ではなく4変数で受け取る
+                obs, _, dones, _ = env.step(actions)
+
+                # エピソード終了時にRNNリセット (donesを使用)
+                if dones.any():
+                     if hasattr(policy, "reset"):
+                         policy.reset(dones)
             
             sim_step_counter += 1
             
