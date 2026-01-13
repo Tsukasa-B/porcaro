@@ -1,7 +1,7 @@
 """
 Porcaro Robot: Multi-Model Manual Verification Script (Sim-to-Real Ready)
 Modified for Replay Verification with Auto-Path Resolution & No-Drum Option
-(Fixed Import Order for Isaac Sim 4.x / Isaac Lab)
+(Fixed: Disabling BOTH Terminations and Timeouts)
 """
 import argparse
 import sys
@@ -208,6 +208,19 @@ def main():
         env_cfg.scene.num_envs = args.num_envs
         env_cfg.controller.control_mode = "pressure" 
         
+        # -------------------------------------------------------------
+        # [修正箇所1] 時間切れリセットの無効化 (今回の問題の主原因)
+        # -------------------------------------------------------------
+        print("[System] Extending episode length to avoid timeout reset.")
+        env_cfg.episode_length_s = 1000.0  # デフォルト8秒(1600ステップ)を1000秒に延長
+        
+        # -------------------------------------------------------------
+        # [修正箇所2] 失敗リセット(Termination)の無効化 (念の為維持)
+        # -------------------------------------------------------------
+        if hasattr(env_cfg, "terminations"):
+            print("[System] Disabling 'terminations' for stable verification.")
+            env_cfg.terminations = None
+            
         # --- ドラム退避 (No Drum) ---
         if args.no_drum:
             print("[System] Option --no_drum detected: Moving drum to z = -10.0m")
@@ -250,8 +263,6 @@ def main():
 
             obs, rew, terminated, truncated, info = env.step(actions)
             
-            # 手動リセットコードは削除済み (自動リセットに任せる)
-                
     except KeyboardInterrupt:
         print("\n[Info] Interrupted by user.")
     except Exception as e:
