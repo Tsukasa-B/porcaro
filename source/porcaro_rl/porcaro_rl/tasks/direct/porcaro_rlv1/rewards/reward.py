@@ -12,6 +12,9 @@ class RewardManager:
         # 閾値や制限値のプリロード
         self.hit_threshold = getattr(cfg, "hit_threshold_force", 1.0)
         self.target_force_ref = float(cfg.target_force_fd)
+
+        # 新規パラメータのロード
+        self.impact_window = getattr(cfg, "impact_window_s", 0.05)
         
         # 状態管理用バッファ
         self.hit_state = torch.zeros(num_envs, dtype=torch.long, device=self.device) 
@@ -60,8 +63,6 @@ class RewardManager:
         # ============================================================
         # r_1: イベント駆動マッチング報酬 (Event-Driven Hit Reward)
         # ============================================================
-        # 計算ロジック:
-        # 叩き終わって離れた瞬間(Falling Edge)に、その打撃のピーク力とターゲットを比較する
         hit_reward = torch.zeros(self.num_envs, device=self.device)
         
         # 1. Rising Edge (接触開始) -> 計測開始
@@ -71,26 +72,38 @@ class RewardManager:
             self.hit_state[ids] = 1
             self.current_peak_force[ids] = force_z[ids]
         
-        # 2. Sustain (接触中) -> ピーク更新
+        # 2. Sustain (接触中) -> ピーク更新 【★ここを修正】
         sustain = (self.hit_state == 1) & is_touching
         if sustain.any():
             ids = torch.where(sustain)[0]
-            curr = force_z[ids]
-            peak = self.current_peak_force[ids]
-            self.current_peak_force[ids] = torch.max(curr, peak)
+            
+            # 【変更点】
+            # 「現在の接触時間」が「インパクト判定ウィンドウ」以内のエージェントのみ抽出
+            # contact_duration[ids] < self.impact_window の場合のみ更新
+            in_window_mask = (self.contact_duration[ids] <= self.impact_window)
+            
+            if in_window_mask.any():
+                # ウィンドウ内のIDだけを取り出す
+                update_ids = ids[in_window_mask]
+                
+                curr = force_z[update_ids]
+                peak = self.current_peak_force[update_ids]
+                self.current_peak_force[update_ids] = torch.max(curr, peak)
+            
+            # ※ ウィンドウを超えた場合 (Pushing状態) は更新しない。
+            #    これにより、後からグッと押し込んでもピーク値は低いまま(初期の接触時の値)となり、
+            #    ターゲット(例: 20N)との誤差が大きくなるため報酬が下がる。
             
         # 3. Falling Edge (離脱) -> 報酬確定
         falling = (self.hit_state == 1) & (~is_touching)
         if falling.any():
             ids = torch.where(falling)[0]
-            self.hit_state[ids] = 0 # IDLEへ
+            self.hit_state[ids] = 0 
             
-            # ここで打撃の評価を行う
             hit_reward[ids] = self._evaluate_hit(
                 peak_force=self.current_peak_force[ids],
                 target_val=target_force_trace[ids]
             )
-            # 次回用にリセット
             self.current_peak_force[ids] = 0.0
 
         terms["match"] = hit_reward

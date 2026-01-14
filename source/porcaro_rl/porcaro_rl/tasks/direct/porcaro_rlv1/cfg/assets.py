@@ -81,20 +81,20 @@ ROBOT_CFG = ArticulationCfg(
         pos=(0.11348, -0.34041, 0.0),
         rot=quat_from_euler_zyx(yaw_deg=30, pitch_deg=0, roll_deg=0),
         joint_pos={
-            "Base_link_Wrist_joint": WRIST_J0,
-            "Hand_link_Grip_joint":  GRIP_J0,
+            ".*Base_link_Wrist_joint": WRIST_J0,
+            ".*Hand_link_Grip_joint":  GRIP_J0,
         },
     ),
     actuators={
         "wrist": ImplicitActuatorCfg(
-            joint_names_expr=["Base_link_Wrist_joint"],
+            joint_names_expr=[".*Base_link_Wrist_joint"],
             stiffness=0.0,
-            damping=0.2,
+            damping=0.1,
             effort_limit_sim=500.0,
-            friction=1,
+            friction=1.5,
         ),
         "grip": ImplicitActuatorCfg(
-            joint_names_expr=["Hand_link_Grip_joint"],
+            joint_names_expr=[".*Hand_link_Grip_joint"],
             stiffness=0.0,
             damping=0.0,
             effort_limit_sim=500.0,

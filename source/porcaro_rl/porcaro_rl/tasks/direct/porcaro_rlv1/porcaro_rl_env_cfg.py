@@ -79,8 +79,8 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # ★ 追加箇所: シンプルリズム生成設定
     # ===================================================
     use_simple_rhythm: bool = True   # TrueにするとSimpleRhythmGeneratorを使用
-    simple_rhythm_mode: str = "single" # "single", "double", "steady"
-    simple_rhythm_bpm: float = 60.0    # steadyモード時のBPM
+    simple_rhythm_mode: str = "steady" # "single", "double", "steady"
+    simple_rhythm_bpm: float = 120.0    # steadyモード時のBPM
 
     # --- 追加設定 ---
     lookahead_horizon: float = 0.5
@@ -172,8 +172,20 @@ class PorcaroRLEnvCfg_ModelA_DR(PorcaroRLEnvCfg_ModelA):
 class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
-        self.pam_delay_cfg = PamDelayModelCfg(delay_time=0.02, time_constant=0.05)
-        self.pam_hysteresis_cfg = PamHysteresisModelCfg(hysteresis_width=0.15, curve_shape_param=2.0)
+        
+        # 実機データに基づく遅れパラメータの微調整
+        # cmdとmeasの乖離から、時定数を少し大きめ(0.05 -> 0.08)に見積もり
+        self.pam_delay_cfg = PamDelayModelCfg(
+            delay_time=0.02,      # むだ時間 (約20ms)
+            time_constant=0.08    # 一次遅れ時定数 (実機の応答波形より調整)
+        )
+        
+        # 分析に基づくヒステリシス設定
+        self.pam_hysteresis_cfg = PamHysteresisModelCfg(
+            hysteresis_width=0.18, # Unloading時に18%の出力低下
+            curve_shape_param=2.0  # (現在の実装では未使用)
+        )
+        
         self.actuator_net_cfg = None
 
 @configclass

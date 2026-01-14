@@ -23,6 +23,7 @@ from .logging.logging_manager import LoggingManager
 from .rewards.reward import RewardManager
 from .rhythm_generator import RhythmGenerator
 from .simple_rhythm_generator import SimpleRhythmGenerator
+from .cfg.assets import WRIST_J0, GRIP_J0
 
 
 class PorcaroRLEnv(DirectRLEnv):
@@ -363,6 +364,37 @@ class PorcaroRLEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
         if hasattr(self, "event_manager") and self.event_manager is not None:
             self.event_manager.reset(env_ids)
+
+        # =========================================================
+        # ★ 修正箇所: 正しいAPIを使用した初期姿勢の強制オーバーライド ★
+        # =========================================================
+        
+        # 1. 現在の関節位置バッファを複製（ベースとして使用）
+        #    (num_envs, num_dof) の形状
+        q_target = self.robot.data.joint_pos[env_ids].clone()
+        qd_target = self.robot.data.joint_vel[env_ids].clone()
+        
+        # 1. assets.py から読み込んだ定数 (すでにラジアン) を Tensor化
+        val_wrist = torch.tensor(WRIST_J0, device=self.device)
+        val_grip  = torch.tensor(GRIP_J0,  device=self.device)
+        
+        # 2. インデックスを使って書き換え
+        wrist_idx = self.dof_idx[0]
+        grip_idx  = self.dof_idx[1]
+        
+        q_target[:, wrist_idx] = val_wrist
+        q_target[:, grip_idx]  = val_grip
+        
+        qd_target[:] = 0.0
+        
+        # 3. 物理エンジンへの書き込み
+        self.robot.write_joint_state_to_sim(
+            position=q_target, 
+            velocity=qd_target, 
+            env_ids=env_ids
+        )
+        # =========================================================
+
         if hasattr(self, "reward_manager"):
             self.reward_manager.reset_idx(env_ids)
         if hasattr(self, "logging_manager"):
