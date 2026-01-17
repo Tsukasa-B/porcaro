@@ -17,7 +17,7 @@ class RewardsCfg:
     # --- 打撃判定用パラメータ (新規追加) ---
     # 接触開始からこの時間(秒)以内のピークのみを「打撃」として評価する
     # これを超えてから力を込めても、ピーク値は更新されない（Pushing対策）
-    impact_window_s: float = 0.05
+    impact_window_s: float = 0.04
     
     # 1. 打撃の一致度 (Hit Match)
     weight_match: float = 100.0
@@ -27,8 +27,8 @@ class RewardsCfg:
     weight_rest_penalty: float = -5.0 # 休符なのに触ってしまった時の罰
 
     # 3. 接触継続ペナルティ (Anti-Pushing)
-    weight_contact_continuous: float = -2.0 
-    max_contact_duration_s: float = 0.1
+    weight_contact_continuous: float = -1 
+    max_contact_duration_s: float = 0.06
 
     # 4. 関節制限 (Joint Limits)
     weight_joint_limits: float = -1.0
@@ -39,6 +39,6 @@ class RewardsCfg:
 
     # --- 評価基準パラメータ ---
     target_force_fd: float = 20.0 # 基準となる力
-    sigma_force: float = 5.0      # 許容誤差の幅
+    sigma_force: float = 15.0      # 許容誤差の幅
     
     limit_wrist_range: tuple[float, float] = (-80.0, 30.0)

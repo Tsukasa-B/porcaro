@@ -111,6 +111,20 @@ class PorcaroRLEnv(DirectRLEnv):
         # ---------------------------------------------------------
         # 3. 各種マネージャの初期化
         # ---------------------------------------------------------
+        # =========================================================
+        # ★ 修正 1: LoggingManager の初期化を堅牢にする
+        # =========================================================
+        
+        # play.py など外部からの実行時に Config が予期せず False になっている場合を防ぐ
+        # 強制的に True にしたい場合はここをコメントアウト解除
+        # self.cfg.logging.enabled = True 
+        
+        print("=" * 80)
+        print(f"[INFO] Logging Configuration Check:")
+        print(f"  - Enabled : {self.cfg.logging.enabled}")
+        print(f"  - Filepath: {self.cfg.logging.filepath}")
+        print("=" * 80)
+
         self.logging_manager = LoggingManager(
             env=self,
             dt=self.cfg.sim.dt,
@@ -208,99 +222,124 @@ class PorcaroRLEnv(DirectRLEnv):
         self.scene.sensors["drum_contact"] = self.drum_sensor
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        """
-        DirectRLEnvのstepをオーバーライドし、物理サブステップごとのセンサ更新と
-        力の最大値取得(Max Pooling)、およびロギング処理を行う。
-        """
-        # 1. アクションの前処理
+        # -- (1) Pre-physics --
         self._pre_physics_step(actions)
-
-        # Max Pooling用バッファのリセット
+        
+        # Max Force Bufferの初期化
         self.max_force_z_buffer[:] = 0.0
         
-        # ログ用の力履歴バッファ (Decimation中の全データを記録するため)
+        # ★追加: 力の履歴用リスト (物理ステップごとのデータを保存)
         force_history_list = []
         
-        # ターゲット力の取得
-        target_force_val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
-        target_force_tensor = torch.full((self.num_envs,), target_force_val, device=self.device)
-
-        # ---------------------------------------------------------
-        # 物理サブステップループ (200Hz)
-        # ---------------------------------------------------------
+        # -- (2) Physics Step (Decimation) --
         for _ in range(self.cfg.decimation):
-            # (a) アクション適用 & ログ収集 (buffer_step_dataはここで呼ばれる)
+            # アクション適用 & ログデータのバッファリング (LoggingManager.buffer_step_data はここで呼ばれる)
             self._apply_action()
             
-            # (b) 物理計算
             self.scene.write_data_to_sim()
             self.sim.step()
-            
-            # (c) センサ更新 (必須)
             self.scene.update(dt=self.cfg.sim.dt)
-
-            # (d) データの取得
-            # フィルタありの場合 (num_envs, num_filters, 3) なので [:, 0, :] を指定
+            
+            # 物理サブステップ間のピーク力を取得 (Max Pooling)
             if self.stick_sensor.data.net_forces_w.dim() == 3:
                 current_force_vec = self.stick_sensor.data.net_forces_w[:, 0, :] # (N, 3)
             else:
                 current_force_vec = self.stick_sensor.data.net_forces_w # (N, 3)
-
-            # ログ用に履歴を保存 (.clone() が重要)
+            
+            # ★追加: 力の履歴を保存
             force_history_list.append(current_force_vec.clone())
-
-            # Max Pooling (Z軸)
+            
+            # Max Pooling (報酬計算用)
             current_force_z = current_force_vec[:, 2].clamp(min=0.0)
             self.max_force_z_buffer = torch.max(self.max_force_z_buffer, current_force_z)
 
-        # ---------------------------------------------------------
-        # ポスト処理 (50Hz)
-        # ---------------------------------------------------------
+        # -- (3) Post-processing --
         self.episode_length_buf += 1
         
+        # 観測の取得
         obs = self._get_observations()
         
-        # 報酬計算
-        rew = self._get_rewards(force_max=self.max_force_z_buffer, target_ref=target_force_tensor)
+        # 報酬の計算
+        target_force_val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
+        target_force_tensor = torch.full((self.num_envs,), target_force_val, device=self.device)
         
+        rew, reward_terms = self._get_rewards(force_max=self.max_force_z_buffer, target_ref=target_force_tensor)
+        
+        # 終了判定
+        self.reset_time_outs = self.episode_length_buf >= self.max_episode_length
+        self.reset_terminated[:] = False
         terminated, time_outs = self._get_dones()
-        
-        # 環境リセット
         reset_mask = terminated | time_outs
-        if reset_mask.any():
-            reset_env_ids = reset_mask.nonzero(as_tuple=False).flatten()
-            self._reset_idx(reset_env_ids)
         
         # =========================================================
-        # ★ [修正箇所] ログのファイナライズ (ここが抜けていました)
+        # ★ 重要修正: ログデータのコミット (これがないとバッファが空のままです)
         # =========================================================
         if self.logging_manager.enable_logging:
             # 履歴をテンソル化: (N, T, 3)
+            # LoggingManager内で時間反転(flip)される仕様に合わせ、ここで逆順(Newest First)にして渡します
             force_history_tensor = torch.stack(force_history_list, dim=1)
-            
-            # Isaac Labの慣習に合わせて「最新が先頭」になるように時間を反転させる
-            # (LoggingManager内で flip される場合、ここで chrono順 だと逆になるため調整)
-            # もし LoggingManager が flip するなら、ここでは Chrono順 (stackしたまま) で渡すと
-            # Reverse-Chrono (Newest First) に変換される。
-            # 通常、センサー履歴は Newest First なので、それに合わせるため反転しておくのが無難。
             force_history_tensor = torch.flip(force_history_tensor, dims=[1])
             
             self.logging_manager.finalize_log_step(
                 peak_force=force_history_tensor,
-                f1_force=torch.zeros_like(rew), # 現状F1スコア計算がなければダミー
+                f1_force=torch.zeros_like(rew), # F1スコア計算がない場合は0埋め
                 step_reward=rew
             )
-            
-        # Extrasの作成
-        extras = {
-            "time_outs": time_outs,
-            "force/max_force_pooled": self.max_force_z_buffer.mean()
-        }
-        
-        if hasattr(self, "extras"):
-            extras.update(self.extras)
 
-        return obs, rew, terminated, time_outs, extras
+        # =========================================================
+        # rsl_rl 対応: エピソード報酬の集計と報告
+        # =========================================================
+        if not hasattr(self, "extras"): self.extras = {}
+        self.extras["log"] = {}
+
+        if not hasattr(self, "episode_sums"):
+            self.episode_sums = {
+                k: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+                for k in reward_terms.keys()
+            }
+            self.episode_sums["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        self.episode_sums["total"] += rew
+        for key, value in reward_terms.items():
+            self.episode_sums[key] += value
+
+        if reset_mask.any():
+            env_ids = reset_mask.nonzero(as_tuple=False).flatten()
+            episode_info = {}
+            episode_info["reward"] = self.episode_sums["total"][env_ids]
+            for key, count in self.episode_sums.items():
+                if key != "total":
+                    episode_info[key] = count[env_ids]
+
+            self.extras["episode"] = episode_info
+
+            self.episode_sums["total"][env_ids] = 0.0
+            for key in self.episode_sums.keys():
+                self.episode_sums[key][env_ids] = 0.0
+
+            self._reset_idx(env_ids)
+        else:
+            if "episode" in self.extras:
+                self.extras.pop("episode")
+        
+        # ステップ報酬のログ
+        for k, v in reward_terms.items():
+             self.extras["log"][f"Step_Reward/{k}"] = torch.mean(v)
+
+        self.extras["time_outs"] = time_outs
+        self.extras["force/max_force_pooled"] = self.max_force_z_buffer.mean()
+
+        # =========================================================
+        # 定期的な保存 (Flush)
+        # =========================================================
+        current_len = self.episode_length_buf[0].item() if isinstance(self.episode_length_buf, torch.Tensor) else self.episode_length_buf
+        should_save = (current_len % 50 == 0) or (reset_mask.any().item())
+
+        if self.logging_manager.enable_logging and should_save:
+             if self.logging_manager.logger is not None:
+                 self.logging_manager.logger.save()
+
+        return obs, rew, terminated, time_outs, self.extras
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         if actions is not None:
@@ -421,10 +460,8 @@ class PorcaroRLEnv(DirectRLEnv):
         
         # ログ用Extras
         if not hasattr(self, "extras"): self.extras = {}
-        for key, val in reward_terms.items():
-            self.extras[f"Reward/{key}"] = torch.mean(val)
-            
-        return total_reward
+
+        return total_reward, reward_terms
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.reset_terminated, self.reset_time_outs

@@ -100,13 +100,13 @@ class RewardManager:
                     t_scale = (target_force_trace[peak_ids] / self.target_ref_val).clamp(0.0, 1.0)
                     self.peak_timing_scale[peak_ids] = t_scale
             
-            # 押し付け判定
-            is_pushing = (self.contact_duration[ids] > self.max_contact_duration)
-            if is_pushing.any():
-                push_ids = ids[is_pushing]
-                self.hit_state[push_ids] = 2 
-                self.current_peak_force[push_ids] = 0.0
-                self.peak_timing_scale[push_ids] = 0.0
+            # # 押し付け判定
+            # is_pushing = (self.contact_duration[ids] > self.max_contact_duration)
+            # if is_pushing.any():
+            #     push_ids = ids[is_pushing]
+            #     self.hit_state[push_ids] = 2 
+            #     self.current_peak_force[push_ids] = 0.0
+            #     self.peak_timing_scale[push_ids] = 0.0
 
         # C. Falling Edge (報酬確定)
         falling = (self.hit_state != 0) & (~is_touching)
@@ -120,18 +120,28 @@ class RewardManager:
                 valid_ids = ids[valid_hits]
                 
                 # 1. 力の一致度スコア (0.0 ~ 1.0)
+                # 力のピーク値と目標値の誤差を評価
                 force_score = self._evaluate_hit(
                     peak_force=self.current_peak_force[valid_ids],
                     target_val=target_force_ref[valid_ids] 
                 )
                 
-                # 2. タイミング係数 (0.0 ~ 1.0)
-                # ピーク発生時にターゲットが盛り上がっていたか？
-                timing_factor = self.peak_timing_scale[valid_ids]
+                # 2. [変更] タイミング係数の緩和
+                # 元のコード: timing_factor = self.peak_timing_scale[valid_ids]
+                # 修正案: 「ターゲット波形が少しでも立ち上がっていれば(>1.0N) OK」とする
+                # これにより、山の頂上ドンピシャでなくても満点が取れるようになります
                 
-                # 最終報酬 = 力スコア × タイミング係数
-                hit_reward[valid_ids] = force_score * timing_factor
+                # 保存しておいたタイミングスコア(波形の高さ)を取り出す
+                recorded_scale = self.peak_timing_scale[valid_ids]
+                
+                # 閾値 (例: 最大値の 5% 以上なら打撃意図ありとみなす)
+                valid_timing_mask = (recorded_scale > 0.05).float()
+                
+                # 最終報酬 = 力スコア × (0 or 1)
+                # 波形の形に依存せず、タイミングさえ合っていれば力スコアがそのまま入る
+                hit_reward[valid_ids] = force_score * valid_timing_mask
 
+            # 状態のリセット
             self.hit_state[ids] = 0
             self.current_peak_force[ids] = 0.0
             self.peak_timing_scale[ids] = 0.0
