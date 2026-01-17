@@ -23,7 +23,7 @@ class RewardsCfg:
     weight_match: float = 100.0
     
     # 2. 休符の遵守 (Rest Compliance) - 以前はPenaltyでしたが「守れば報酬」の方が安定する場合も
-    weight_rest: float = 1.0   # 休符を守っている間、毎ステップ入る報酬
+    weight_rest: float = 0.1   # 休符を守っている間、毎ステップ入る報酬
     weight_rest_penalty: float = -5.0 # 休符なのに触ってしまった時の罰
 
     # 3. 接触継続ペナルティ (Anti-Pushing)

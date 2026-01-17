@@ -11,19 +11,24 @@ class RewardManager:
         
         # 閾値や制限値のプリロード
         self.hit_threshold = getattr(cfg, "hit_threshold_force", 1.0)
-        self.target_force_ref = float(cfg.target_force_fd)
-
-        # 新規パラメータのロード
+        self.max_contact_duration = getattr(cfg, "max_contact_duration_s", 0.1)
         self.impact_window = getattr(cfg, "impact_window_s", 0.05)
         
+        # ターゲット参照値（分母用）
+        self.target_ref_val = float(cfg.target_force_fd)
+
         # 状態管理用バッファ
         self.hit_state = torch.zeros(num_envs, dtype=torch.long, device=self.device) 
         self.current_peak_force = torch.zeros(num_envs, device=self.device)
         self.contact_duration = torch.zeros(num_envs, device=self.device)
+        
+        # ★追加: ピーク発生時のタイミング適合度 (0.0 ~ 1.0)
+        self.peak_timing_scale = torch.zeros(num_envs, device=self.device)
 
-        # ログ用に各項の値を保持する辞書
+        # ログ用
         self.episode_sums = {
             "match": torch.zeros(num_envs, device=self.device),
+            "rest_reward": torch.zeros(num_envs, device=self.device),
             "rest_penalty": torch.zeros(num_envs, device=self.device),
             "contact_limit": torch.zeros(num_envs, device=self.device),
             "joint_limit": torch.zeros(num_envs, device=self.device)
@@ -33,6 +38,7 @@ class RewardManager:
         self.hit_state[env_ids] = 0
         self.current_peak_force[env_ids] = 0.0
         self.contact_duration[env_ids] = 0.0
+        self.peak_timing_scale[env_ids] = 0.0 # リセット
         
         for key in self.episode_sums:
             self.episode_sums[key][env_ids] = 0.0
@@ -41,99 +47,130 @@ class RewardManager:
                         actions: torch.Tensor, 
                         joint_pos: torch.Tensor, 
                         force_z: torch.Tensor, 
-                        target_force_trace: torch.Tensor, # これは休符判定に使う
-                        target_force_ref: torch.Tensor,   # ★追加: これを打撃評価に使う
+                        target_force_trace: torch.Tensor,
+                        target_force_ref: torch.Tensor,
                         dt: float) -> dict[str, torch.Tensor]:
         
         terms = {}
 
-        # 1. 接触判定
+        # 共通項目の計算
         is_touching = (force_z > self.hit_threshold)
-        
-        # 2. 休符判定 (波形が小さい時は休符とみなす)
         is_rest_period = (target_force_trace < 1.0) 
 
-        # 接触時間の更新
         self.contact_duration = torch.where(
             is_touching,
             self.contact_duration + dt,
             torch.zeros_like(self.contact_duration)
         )
 
-        # ============================================================
-        # r_1: イベント駆動マッチング報酬
-        # ============================================================
-        hit_reward = torch.zeros(self.num_envs, device=self.device)
+        # ----------------------------------------------------
+        # 1. 打撃 (Match) & タイミング評価
+        # ----------------------------------------------------
         
-        # Rising Edge
+        # A. Rising Edge
         rising = (self.hit_state == 0) & is_touching
         if rising.any():
             ids = torch.where(rising)[0]
-            self.hit_state[ids] = 1
+            self.hit_state[ids] = 1 
             self.current_peak_force[ids] = force_z[ids]
+            # 初期値として現在のタイミング評価を保存
+            current_scale = (target_force_trace[ids] / self.target_ref_val).clamp(0.0, 1.0)
+            self.peak_timing_scale[ids] = current_scale
         
-        # Sustain (ウィンドウ内のみピーク更新)
+        # B. Sustain (接触継続)
         sustain = (self.hit_state == 1) & is_touching
         if sustain.any():
             ids = torch.where(sustain)[0]
-            in_window_mask = (self.contact_duration[ids] <= self.impact_window)
-            if in_window_mask.any():
-                update_ids = ids[in_window_mask]
-                curr = force_z[update_ids]
-                peak = self.current_peak_force[update_ids]
-                self.current_peak_force[update_ids] = torch.max(curr, peak)
             
-        # Falling Edge (離脱 -> 評価)
-        falling = (self.hit_state == 1) & (~is_touching)
+            in_window = (self.contact_duration[ids] <= self.impact_window)
+            if in_window.any():
+                upd_ids = ids[in_window]
+                
+                curr_force = force_z[upd_ids]
+                prev_peak = self.current_peak_force[upd_ids]
+                
+                # ★重要変更: 力が更新されたら、その瞬間の「タイミング評価」も更新する
+                # これにより「最大の力が出た瞬間」のターゲット値が採用される
+                is_new_peak = (curr_force > prev_peak)
+                if is_new_peak.any():
+                    peak_ids = upd_ids[is_new_peak]
+                    self.current_peak_force[peak_ids] = curr_force[is_new_peak]
+                    
+                    # その瞬間のターゲット波形の高さを取得 (Timing Score)
+                    t_scale = (target_force_trace[peak_ids] / self.target_ref_val).clamp(0.0, 1.0)
+                    self.peak_timing_scale[peak_ids] = t_scale
+            
+            # 押し付け判定
+            is_pushing = (self.contact_duration[ids] > self.max_contact_duration)
+            if is_pushing.any():
+                push_ids = ids[is_pushing]
+                self.hit_state[push_ids] = 2 
+                self.current_peak_force[push_ids] = 0.0
+                self.peak_timing_scale[push_ids] = 0.0
+
+        # C. Falling Edge (報酬確定)
+        falling = (self.hit_state != 0) & (~is_touching)
+        hit_reward = torch.zeros(self.num_envs, device=self.device)
+        
         if falling.any():
             ids = torch.where(falling)[0]
-            self.hit_state[ids] = 0 
+            valid_hits = (self.hit_state[ids] == 1)
             
-            # ★修正: ここで target_force_ref (固定値) と比較する
-            hit_reward[ids] = self._evaluate_hit(
-                peak_force=self.current_peak_force[ids],
-                target_val=target_force_ref[ids] 
-            )
+            if valid_hits.any():
+                valid_ids = ids[valid_hits]
+                
+                # 1. 力の一致度スコア (0.0 ~ 1.0)
+                force_score = self._evaluate_hit(
+                    peak_force=self.current_peak_force[valid_ids],
+                    target_val=target_force_ref[valid_ids] 
+                )
+                
+                # 2. タイミング係数 (0.0 ~ 1.0)
+                # ピーク発生時にターゲットが盛り上がっていたか？
+                timing_factor = self.peak_timing_scale[valid_ids]
+                
+                # 最終報酬 = 力スコア × タイミング係数
+                hit_reward[valid_ids] = force_score * timing_factor
+
+            self.hit_state[ids] = 0
             self.current_peak_force[ids] = 0.0
+            self.peak_timing_scale[ids] = 0.0
 
         terms["match"] = hit_reward
 
-        # ============================================================
-        # r_2: 休符ペナルティ
-        # ============================================================
-        violation = is_rest_period & is_touching
-        terms["rest_penalty"] = torch.where(
-            violation,
-            -1.0 * (force_z / 10.0), 
+        # ----------------------------------------------------
+        # 他の項 (変更なし)
+        # ----------------------------------------------------
+        compliance = is_rest_period & (~is_touching)
+        terms["rest_reward"] = torch.where(
+            compliance,
+            torch.ones(self.num_envs, device=self.device),
             torch.zeros(self.num_envs, device=self.device)
         )
 
-        # ============================================================
-        # r_3: 連続接触ペナルティ
-        # ============================================================
-        # 一定時間以上触り続けている場合、超過時間に応じてペナルティ
-        over_time = (self.contact_duration - self.cfg.max_contact_duration_s).clamp(min=0.0)
-        terms["contact_limit"] = -1.0 * over_time
+        violation = is_rest_period & is_touching
+        terms["rest_penalty"] = torch.where(
+            violation,
+            (force_z / 10.0), 
+            torch.zeros(self.num_envs, device=self.device)
+        )
 
-        # ============================================================
-        # r_4: 関節制限 (Joint Limits)
-        # ============================================================
-        # 必要な場合のみ計算
+        over_time = (self.contact_duration - self.max_contact_duration).clamp(min=0.0)
+        terms["contact_limit"] = over_time
+
         if self.cfg.weight_joint_limits != 0.0:
             wrist_pos = joint_pos[:, 0]
             wrist_min = torch.tensor(self.cfg.limit_wrist_range[0], device=self.device).deg2rad()
             wrist_max = torch.tensor(self.cfg.limit_wrist_range[1], device=self.device).deg2rad()
-            
             v_min = (wrist_min - wrist_pos).clamp(min=0.0)
             v_max = (wrist_pos - wrist_max).clamp(min=0.0)
             terms["joint_limit"] = (v_min + v_max)
         else:
             terms["joint_limit"] = torch.zeros(self.num_envs, device=self.device)
 
-        # --- 総報酬の計算 ---
-        # 重み付け和 (R = w1*r1 + w2*r2 + ...)
         total_reward = (
             terms["match"] * self.cfg.weight_match +
+            terms["rest_reward"] * self.cfg.weight_rest +
             terms["rest_penalty"] * self.cfg.weight_rest_penalty +
             terms["contact_limit"] * self.cfg.weight_contact_continuous +
             terms["joint_limit"] * self.cfg.weight_joint_limits
@@ -142,13 +179,11 @@ class RewardManager:
         return total_reward, terms
 
     def _evaluate_hit(self, peak_force, target_val):
-        """指定されたターゲット値との誤差に基づいてスコアを計算"""
         force_error = torch.abs(peak_force - target_val)
         score = torch.exp(-force_error / self.cfg.sigma_force)
         
-        # 正規化オプション
         if self.cfg.scale_reward_by_force_magnitude:
-            magnitude_factor = (target_val / self.target_force_ref).clamp(max=1.5)
+            magnitude_factor = (target_val / self.target_ref_val).clamp(max=1.5)
             return score * magnitude_factor
         else:
             return score

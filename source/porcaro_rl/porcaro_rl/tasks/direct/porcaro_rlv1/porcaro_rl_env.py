@@ -208,13 +208,20 @@ class PorcaroRLEnv(DirectRLEnv):
         self.scene.sensors["drum_contact"] = self.drum_sensor
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        """
+        DirectRLEnvのstepをオーバーライドし、物理サブステップごとのセンサ更新と
+        力の最大値取得(Max Pooling)、およびロギング処理を行う。
+        """
+        # 1. アクションの前処理
         self._pre_physics_step(actions)
 
         # Max Pooling用バッファのリセット
         self.max_force_z_buffer[:] = 0.0
         
-        # ★ターゲット力の取得 (報酬計算用にスカラー値を用意)
-        # Configから取った値を使うことで「指定した力」との比較を保証
+        # ログ用の力履歴バッファ (Decimation中の全データを記録するため)
+        force_history_list = []
+        
+        # ターゲット力の取得
         target_force_val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
         target_force_tensor = torch.full((self.num_envs,), target_force_val, device=self.device)
 
@@ -222,31 +229,28 @@ class PorcaroRLEnv(DirectRLEnv):
         # 物理サブステップループ (200Hz)
         # ---------------------------------------------------------
         for _ in range(self.cfg.decimation):
-            # 1. アクション適用 & ログ収集
-            #    _apply_action内で logging_manager.buffer_step_data が呼ばれる
+            # (a) アクション適用 & ログ収集 (buffer_step_dataはここで呼ばれる)
             self._apply_action()
             
-            # 2. 物理計算
+            # (b) 物理計算
             self.scene.write_data_to_sim()
             self.sim.step()
             
-            # 3. センサ更新 (必須)
+            # (c) センサ更新 (必須)
             self.scene.update(dt=self.cfg.sim.dt)
 
-            # 4. 力の取得 (Max Pooling)
-            # ★修正: フィルタありの場合 (N, 1, 3) なので [:, 0, 2] を指定
-            #         念のため形状を確認して分岐させるロジックも可だが、sensors.pyがある前提で固定
-            force_data = self.stick_sensor.data.net_forces_w
-            
-            if force_data.dim() == 3: # (num_envs, num_filters, 3)
-                current_force_z = force_data[:, 0, 2]
-            else: # (num_envs, 3)
-                current_force_z = force_data[:, 2]
+            # (d) データの取得
+            # フィルタありの場合 (num_envs, num_filters, 3) なので [:, 0, :] を指定
+            if self.stick_sensor.data.net_forces_w.dim() == 3:
+                current_force_vec = self.stick_sensor.data.net_forces_w[:, 0, :] # (N, 3)
+            else:
+                current_force_vec = self.stick_sensor.data.net_forces_w # (N, 3)
 
-            # 負の値(引く力)は除外
-            current_force_z = current_force_z.clamp(min=0.0)
-            
-            # バッファ更新
+            # ログ用に履歴を保存 (.clone() が重要)
+            force_history_list.append(current_force_vec.clone())
+
+            # Max Pooling (Z軸)
+            current_force_z = current_force_vec[:, 2].clamp(min=0.0)
             self.max_force_z_buffer = torch.max(self.max_force_z_buffer, current_force_z)
 
         # ---------------------------------------------------------
@@ -256,7 +260,7 @@ class PorcaroRLEnv(DirectRLEnv):
         
         obs = self._get_observations()
         
-        # 報酬計算: Max Poolingした力と、ターゲット値(スカラー)を渡す
+        # 報酬計算
         rew = self._get_rewards(force_max=self.max_force_z_buffer, target_ref=target_force_tensor)
         
         terminated, time_outs = self._get_dones()
@@ -266,7 +270,28 @@ class PorcaroRLEnv(DirectRLEnv):
         if reset_mask.any():
             reset_env_ids = reset_mask.nonzero(as_tuple=False).flatten()
             self._reset_idx(reset_env_ids)
+        
+        # =========================================================
+        # ★ [修正箇所] ログのファイナライズ (ここが抜けていました)
+        # =========================================================
+        if self.logging_manager.enable_logging:
+            # 履歴をテンソル化: (N, T, 3)
+            force_history_tensor = torch.stack(force_history_list, dim=1)
             
+            # Isaac Labの慣習に合わせて「最新が先頭」になるように時間を反転させる
+            # (LoggingManager内で flip される場合、ここで chrono順 だと逆になるため調整)
+            # もし LoggingManager が flip するなら、ここでは Chrono順 (stackしたまま) で渡すと
+            # Reverse-Chrono (Newest First) に変換される。
+            # 通常、センサー履歴は Newest First なので、それに合わせるため反転しておくのが無難。
+            force_history_tensor = torch.flip(force_history_tensor, dims=[1])
+            
+            self.logging_manager.finalize_log_step(
+                peak_force=force_history_tensor,
+                f1_force=torch.zeros_like(rew), # 現状F1スコア計算がなければダミー
+                step_reward=rew
+            )
+            
+        # Extrasの作成
         extras = {
             "time_outs": time_outs,
             "force/max_force_pooled": self.max_force_z_buffer.mean()
