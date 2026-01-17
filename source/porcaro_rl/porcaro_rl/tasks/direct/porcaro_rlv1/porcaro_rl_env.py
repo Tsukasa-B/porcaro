@@ -63,6 +63,12 @@ class PorcaroRLEnv(DirectRLEnv):
         # アクションバッファの初期化
         self.actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
 
+        # =========================================================
+        # ★ [修正 1] サブステップ間の最大力を保持するバッファの追加
+        # =========================================================
+        # 物理ステップ間(5ms)に発生したスパイクを逃さないためのMax Pooling用バッファ
+        self.max_force_z_buffer = torch.zeros(self.num_envs, device=self.device)
+
         # ---------------------------------------------------------
         # 2. アクションコントローラの初期化
         # ---------------------------------------------------------
@@ -126,19 +132,21 @@ class PorcaroRLEnv(DirectRLEnv):
         # Configに追加したフラグを確認 (デフォルトFalseとして安全に取得)
         use_simple = getattr(self.cfg, "use_simple_rhythm", False)
 
+        target_force_val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
+
         if use_simple:
-            # デバッグ用の単純生成器を使用
             mode = getattr(self.cfg, "simple_rhythm_mode", "single")
             bpm = getattr(self.cfg, "simple_rhythm_bpm", 60.0)
             
-            print(f"[INFO] SimpleRhythmGeneratorを使用します (Mode: {mode}, BPM: {bpm})")
+            print(f"[INFO] SimpleRhythmGenerator (Mode: {mode}, BPM: {bpm}, Force: {target_force_val})")
             self.rhythm_generator = SimpleRhythmGenerator(
                 num_envs=self.num_envs,
                 device=self.device,
                 dt=self.dt_ctrl_step,
                 max_episode_length=self.max_episode_length,
                 mode=mode,
-                bpm=bpm
+                bpm=bpm,
+                target_force=target_force_val # ★引数追加
             )
         else:
             # 本番学習用のランダム生成器を使用
@@ -200,16 +208,74 @@ class PorcaroRLEnv(DirectRLEnv):
         self.scene.sensors["drum_contact"] = self.drum_sensor
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        obs, rew, terminated, truncated, extras = super().step(actions)
+        self._pre_physics_step(actions)
 
-        if hasattr(self, "common_step_counter"):
-            TOTAL_TRAINING_STEPS = 100_000
-            difficulty = min(self.common_step_counter / TOTAL_TRAINING_STEPS, 1.0)
-            if hasattr(self, "rhythm_generator"):
-                self.rhythm_generator.set_difficulty(difficulty)
-            extras["Episode/difficulty"] = torch.tensor(difficulty, device=self.device)
+        # Max Pooling用バッファのリセット
+        self.max_force_z_buffer[:] = 0.0
+        
+        # ★ターゲット力の取得 (報酬計算用にスカラー値を用意)
+        # Configから取った値を使うことで「指定した力」との比較を保証
+        target_force_val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
+        target_force_tensor = torch.full((self.num_envs,), target_force_val, device=self.device)
 
-        return obs, rew, terminated, truncated, extras
+        # ---------------------------------------------------------
+        # 物理サブステップループ (200Hz)
+        # ---------------------------------------------------------
+        for _ in range(self.cfg.decimation):
+            # 1. アクション適用 & ログ収集
+            #    _apply_action内で logging_manager.buffer_step_data が呼ばれる
+            self._apply_action()
+            
+            # 2. 物理計算
+            self.scene.write_data_to_sim()
+            self.sim.step()
+            
+            # 3. センサ更新 (必須)
+            self.scene.update(dt=self.cfg.sim.dt)
+
+            # 4. 力の取得 (Max Pooling)
+            # ★修正: フィルタありの場合 (N, 1, 3) なので [:, 0, 2] を指定
+            #         念のため形状を確認して分岐させるロジックも可だが、sensors.pyがある前提で固定
+            force_data = self.stick_sensor.data.net_forces_w
+            
+            if force_data.dim() == 3: # (num_envs, num_filters, 3)
+                current_force_z = force_data[:, 0, 2]
+            else: # (num_envs, 3)
+                current_force_z = force_data[:, 2]
+
+            # 負の値(引く力)は除外
+            current_force_z = current_force_z.clamp(min=0.0)
+            
+            # バッファ更新
+            self.max_force_z_buffer = torch.max(self.max_force_z_buffer, current_force_z)
+
+        # ---------------------------------------------------------
+        # ポスト処理 (50Hz)
+        # ---------------------------------------------------------
+        self.episode_length_buf += 1
+        
+        obs = self._get_observations()
+        
+        # 報酬計算: Max Poolingした力と、ターゲット値(スカラー)を渡す
+        rew = self._get_rewards(force_max=self.max_force_z_buffer, target_ref=target_force_tensor)
+        
+        terminated, time_outs = self._get_dones()
+        
+        # 環境リセット
+        reset_mask = terminated | time_outs
+        if reset_mask.any():
+            reset_env_ids = reset_mask.nonzero(as_tuple=False).flatten()
+            self._reset_idx(reset_env_ids)
+            
+        extras = {
+            "time_outs": time_outs,
+            "force/max_force_pooled": self.max_force_z_buffer.mean()
+        }
+        
+        if hasattr(self, "extras"):
+            extras.update(self.extras)
+
+        return obs, rew, terminated, time_outs, extras
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         if actions is not None:
@@ -303,57 +369,35 @@ class PorcaroRLEnv(DirectRLEnv):
         obs = torch.cat((q, qd, bpm_obs, rhythm_buf), dim=-1)
         return {"policy": obs}
 
-    def _get_rewards(self) -> torch.Tensor:
-        # --- 1. センサデータの取得と整形 ---
-        # 取得元: (num_envs, history_length, 3)
-        force_history = self.stick_sensor.data.net_forces_w_history
+    def _get_rewards(self, force_max: torch.Tensor = None, target_ref: torch.Tensor = None) -> torch.Tensor:
+        # 引数が無い場合のフォールバック (基本はstepから渡される)
+        if force_max is None: force_max = self.max_force_z_buffer
         
-        # 今ステップ分の履歴を切り出し: (num_envs, decimation, 3)
-        step_force_history = force_history[:, 0:self.cfg.decimation, :]
-        
-        # Z軸のみ抽出: (num_envs, decimation)
-        force_z_history = step_force_history[..., 2]
-        
-        # ステップ内の最大値を取得し、確実に1次元 (num_envs,) に整形する
-        # ★修正点: flatten() を追加して、余分な次元や履歴形状によるブロードキャストエラーを防ぐ
-        current_force_max = torch.max(force_z_history, dim=1).values.clamp(min=0.0).flatten()
-
-        # --- 2. ターゲット情報の取得 ---
-        current_steps = self.episode_length_buf
-        # これも確実に1次元 (num_envs,) に整形
-        target_val = self.rhythm_generator.get_current_target(current_steps).view(-1)
-        
-        # --- 3. 時間刻み (dt) ---
         dt_step = self.cfg.sim.dt * self.cfg.decimation
+        
+        # 波形データ (休符判定などに使用)
+        current_steps = self.episode_length_buf
+        target_trace = self.rhythm_generator.get_current_target(current_steps).view(-1)
+        
+        # もしstepから渡されていなければConfigから作る
+        if target_ref is None:
+            val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
+            target_ref = torch.full((self.num_envs,), val, device=self.device)
 
-        # --- 4. 報酬計算 (Managerへ委譲) ---
-        # force_z と target_force_trace が共に (num_envs,) の1次元Tensorであることを保証して渡す
+        # Managerへ委譲
         total_reward, reward_terms = self.reward_manager.compute_rewards(
             actions=self.actions,
             joint_pos=self.robot.data.joint_pos[:, self.dof_idx],
-            force_z=current_force_max, 
-            target_force_trace=target_val,
+            force_z=force_max, 
+            target_force_trace=target_trace, # 休符判定用
+            target_force_ref=target_ref,     # ★打撃評価用 (新規追加引数)
             dt=dt_step
         )
         
-        # --- 5. ログ記録 (WandB / Tensorboard用) ---
-        if hasattr(self, "extras"):
-            for key, val in reward_terms.items():
-                # 平均値を記録
-                self.extras[f"Reward/{key}"] = torch.mean(val)
-
-        # --- 6. エピソード終了判定 ---
-        self.reset_time_outs = self.episode_length_buf >= (self.max_episode_length - 1)
-        self.reset_terminated = torch.zeros_like(self.reset_time_outs)
-        
-        # --- 7. 詳細ロガーへの記録 ---
-        if self.logging_manager.enable_logging:
-            dummy_f1 = torch.zeros_like(total_reward)
-            self.logging_manager.finalize_log_step(
-                peak_force=force_history,
-                f1_force=dummy_f1,
-                step_reward=total_reward
-            )
+        # ログ用Extras
+        if not hasattr(self, "extras"): self.extras = {}
+        for key, val in reward_terms.items():
+            self.extras[f"Reward/{key}"] = torch.mean(val)
             
         return total_reward
 

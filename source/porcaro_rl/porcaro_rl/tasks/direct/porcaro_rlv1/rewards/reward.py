@@ -41,17 +41,17 @@ class RewardManager:
                         actions: torch.Tensor, 
                         joint_pos: torch.Tensor, 
                         force_z: torch.Tensor, 
-                        target_force_trace: torch.Tensor,
+                        target_force_trace: torch.Tensor, # これは休符判定に使う
+                        target_force_ref: torch.Tensor,   # ★追加: これを打撃評価に使う
                         dt: float) -> dict[str, torch.Tensor]:
-        """
-        各項 (r_1, r_2...) を個別に計算して返す
-        """
-        # 報酬項を格納する辞書
+        
         terms = {}
 
-        # --- 共通の状況判定 ---
+        # 1. 接触判定
         is_touching = (force_z > self.hit_threshold)
-        is_rest_period = (target_force_trace < 1.0) # ターゲットがほぼ0なら休符
+        
+        # 2. 休符判定 (波形が小さい時は休符とみなす)
+        is_rest_period = (target_force_trace < 1.0) 
 
         # 接触時間の更新
         self.contact_duration = torch.where(
@@ -61,72 +61,59 @@ class RewardManager:
         )
 
         # ============================================================
-        # r_1: イベント駆動マッチング報酬 (Event-Driven Hit Reward)
+        # r_1: イベント駆動マッチング報酬
         # ============================================================
         hit_reward = torch.zeros(self.num_envs, device=self.device)
         
-        # 1. Rising Edge (接触開始) -> 計測開始
+        # Rising Edge
         rising = (self.hit_state == 0) & is_touching
         if rising.any():
             ids = torch.where(rising)[0]
             self.hit_state[ids] = 1
             self.current_peak_force[ids] = force_z[ids]
         
-        # 2. Sustain (接触中) -> ピーク更新 【★ここを修正】
+        # Sustain (ウィンドウ内のみピーク更新)
         sustain = (self.hit_state == 1) & is_touching
         if sustain.any():
             ids = torch.where(sustain)[0]
-            
-            # 【変更点】
-            # 「現在の接触時間」が「インパクト判定ウィンドウ」以内のエージェントのみ抽出
-            # contact_duration[ids] < self.impact_window の場合のみ更新
             in_window_mask = (self.contact_duration[ids] <= self.impact_window)
-            
             if in_window_mask.any():
-                # ウィンドウ内のIDだけを取り出す
                 update_ids = ids[in_window_mask]
-                
                 curr = force_z[update_ids]
                 peak = self.current_peak_force[update_ids]
                 self.current_peak_force[update_ids] = torch.max(curr, peak)
             
-            # ※ ウィンドウを超えた場合 (Pushing状態) は更新しない。
-            #    これにより、後からグッと押し込んでもピーク値は低いまま(初期の接触時の値)となり、
-            #    ターゲット(例: 20N)との誤差が大きくなるため報酬が下がる。
-            
-        # 3. Falling Edge (離脱) -> 報酬確定
+        # Falling Edge (離脱 -> 評価)
         falling = (self.hit_state == 1) & (~is_touching)
         if falling.any():
             ids = torch.where(falling)[0]
             self.hit_state[ids] = 0 
             
+            # ★修正: ここで target_force_ref (固定値) と比較する
             hit_reward[ids] = self._evaluate_hit(
                 peak_force=self.current_peak_force[ids],
-                target_val=target_force_trace[ids]
+                target_val=target_force_ref[ids] 
             )
             self.current_peak_force[ids] = 0.0
 
         terms["match"] = hit_reward
 
         # ============================================================
-        # r_2: 休符ペナルティ (Rest Violation)
+        # r_2: 休符ペナルティ
         # ============================================================
-        # 休符指示なのに触っている場合
-        # 強度(force_z)に比例させるか、単に定数ペナルティにするか
-        # ここでは「触ってしまった強さ」に比例させて、軽く触れただけなら許す設計
         violation = is_rest_period & is_touching
         terms["rest_penalty"] = torch.where(
             violation,
-            -1.0 * (force_z / 10.0), # 10Nで -1.0 (正規化の一環)
+            -1.0 * (force_z / 10.0), 
             torch.zeros(self.num_envs, device=self.device)
         )
 
         # ============================================================
-        # r_3: 連続接触(押し付け)ペナルティ (Contact Duration)
+        # r_3: 連続接触ペナルティ
         # ============================================================
-        is_over = (self.contact_duration > self.cfg.max_contact_duration_s)
+        # 一定時間以上触り続けている場合、超過時間に応じてペナルティ
         over_time = (self.contact_duration - self.cfg.max_contact_duration_s).clamp(min=0.0)
-        terms["contact_limit"] = -1.0 * over_time # 秒数そのものをペナルティ係数に
+        terms["contact_limit"] = -1.0 * over_time
 
         # ============================================================
         # r_4: 関節制限 (Joint Limits)
@@ -155,25 +142,13 @@ class RewardManager:
         return total_reward, terms
 
     def _evaluate_hit(self, peak_force, target_val):
-        """
-        1回の打撃イベントを評価し、0.0〜1.0の正規化されたスコアを返す。
-        """
-        # 誤差の絶対値
-        force_error = torch.abs(peak_force - self.target_force_ref)
-        
-        # ガウス分布スコア (誤差0で1.0)
-        # exp(-error / sigma)
+        """指定されたターゲット値との誤差に基づいてスコアを計算"""
+        force_error = torch.abs(peak_force - target_val)
         score = torch.exp(-force_error / self.cfg.sigma_force)
         
-        # ★ここがポイント: 正規化の工夫★
+        # 正規化オプション
         if self.cfg.scale_reward_by_force_magnitude:
-            # 従来: ターゲットが大きいほど報酬もデカくなる (20N指示なら満点、5N指示なら0.25点など)
-            # これだと「強い音」ばかり学習したがる
             magnitude_factor = (target_val / self.target_force_ref).clamp(max=1.5)
             return score * magnitude_factor
         else:
-            # 推奨: ターゲットが何Nであれ、その通りに叩けたら満点(1.0)
-            # これにより、弱奏(5N)も強奏(20N)も等しく価値があることになる
-            # ただし「休符(target<1.0)」の誤検知を防ぐため、ターゲットが極端に小さい時はマスクする
-            is_valid_note = (target_val >= 1.0).float()
-            return score * is_valid_note
+            return score

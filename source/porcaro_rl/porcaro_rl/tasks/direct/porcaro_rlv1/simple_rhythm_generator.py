@@ -9,7 +9,7 @@ class SimpleRhythmGenerator:
     固定パターン（Rudiments）を繰り返し生成し、基礎動作の習得を確認する。
     """
     def __init__(self, num_envs, device, dt, max_episode_length, 
-                 mode="single", bpm=60.0):
+                 mode="single", bpm=60.0, target_force=20.0):
         
         self.num_envs = num_envs
         self.device = device
@@ -19,6 +19,7 @@ class SimpleRhythmGenerator:
         # --- 設定 ---
         self.mode = mode  # "single", "double", "steady"
         self.target_bpm = bpm
+        self.target_peak_force = target_force
         
         # --- データバッファ ---
         self.target_trajectories = torch.zeros(
@@ -27,13 +28,16 @@ class SimpleRhythmGenerator:
         # 固定BPMで埋めておく
         self.current_bpms = torch.full((num_envs,), bpm, device=device, dtype=torch.float32)
         
-        # --- 波形生成用カーネル (RhythmGeneratorと共通仕様) ---
+        # --- 波形生成用カーネル ---
         width_sec = 0.05
         sigma = width_sec / 2.0
         kernel_radius = int(width_sec / dt) 
         t_vals = torch.arange(-kernel_radius, kernel_radius + 1, device=device, dtype=torch.float32) * dt
-        kernel = 20.0 * torch.exp(-0.5 * (t_vals / sigma) ** 2)
-        self.kernel = kernel.view(1, 1, -1)
+        
+        # ★修正: Configから受け取った力を使う (ガウスの頂点が target_force になる)
+        # kernel = 20.0 * ... (削除)
+        self.kernel = self.target_peak_force * torch.exp(-0.5 * (t_vals / sigma) ** 2)
+        self.kernel = self.kernel.view(1, 1, -1)
         self.kernel_padding = kernel_radius
 
     def set_difficulty(self, level: float):
