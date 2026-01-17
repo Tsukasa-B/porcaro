@@ -67,43 +67,40 @@ class PamDelayModel(nn.Module):
 
 class PamHysteresisModel(nn.Module):
     """
-    PAMのヒステリシス特性モデル (マルチチャンネル対応版)
+    [Modified] Additive Hysteresis Model (Play Operator)
+    圧力に対する「摩擦（一定の圧力幅）」を再現するモデル。
     """
     def __init__(self, cfg: PamHysteresisModelCfg, device: str):
         super().__init__()
         self.cfg = cfg
         self.device = device
-        self.last_input = None
+        # 状態変数: 「摩擦引きずり後」の圧力
         self.last_output = None
 
-    def _init_state(self, num_envs: int, num_channels: int):
-        self.last_input = torch.zeros((num_envs, num_channels), device=self.device)
+    def reset(self, num_envs: int, num_channels: int):
         self.last_output = torch.zeros((num_envs, num_channels), device=self.device)
 
-    def reset_idx(self, env_ids: torch.Tensor):
-        if self.last_input is not None:
-            self.last_input[env_ids] = 0.0
-            self.last_output[env_ids] = 0.0
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        num_envs, num_channels = x.shape
+        """
+        Play Operator:
+        y(t) = max( x(t) - r, min( x(t) + r, y(t-1) ) )
+        Input x: 空気圧 (Delay後のP_air)
+        Output y: 有効圧力 (P_effective)
+        """
+        if self.last_output is None or self.last_output.shape != x.shape:
+            self.last_output = x.clone()
+
+        # 摩擦の半幅 (r)
+        r = self.cfg.hysteresis_width / 2.0
         
-        if (self.last_input is None or 
-            self.last_input.shape[0] != num_envs or
-            self.last_input.shape[1] != num_channels):
-            self._init_state(num_envs, num_channels)
-            
-        delta = x - self.last_input
+        # 摩擦帯域の計算
+        upper = x + r
+        lower = x - r
         
-        # ヒステリシス係数の適用 (増圧時: 1.0, 減圧時: 1.0 - width)
-        hysteresis_factor = torch.where(
-            delta > 0, 
-            torch.tensor(1.0, device=self.device), 
-            torch.tensor(1.0 - self.cfg.hysteresis_width, device=self.device)
-        )
+        # 前回の値を、現在の入力の±rの範囲内に強制的に収める（引きずる）
+        output = torch.min(upper, torch.max(lower, self.last_output))
         
-        output = x * hysteresis_factor
-        self.last_input = x.clone()
+        self.last_output = output.clone()
         return output
 
 

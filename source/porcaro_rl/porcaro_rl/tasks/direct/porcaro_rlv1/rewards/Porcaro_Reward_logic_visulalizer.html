@@ -3,344 +3,352 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Porcaro Reward Logic Visualization</title>
+    <title>Porcaro RL: Detailed Reward Architecture</title>
+    
+    <!-- ★追加: MathJaxによる数式レンダリング -->
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']]
+            }
+        };
+    </script>
+
     <style>
         :root {
-            --bg-color: #0f172a;
+            --bg-dark: #0f172a;
             --card-bg: #1e293b;
-            --text-main: #f1f5f9;
+            --accent-primary: #3b82f6; /* Blue */
+            --accent-success: #10b981; /* Green */
+            --accent-danger: #ef4444;  /* Red */
+            --accent-warn: #f59e0b;    /* Amber */
+            --text-main: #f8fafc;
             --text-sub: #94a3b8;
-            --accent-gold: #fbbf24;  /* Match Reward */
-            --accent-green: #34d399; /* Rest Reward */
-            --accent-red: #f87171;   /* Penalty */
-            --accent-blue: #38bdf8;  /* Target Wave */
-            --font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            --border-color: #334155;
         }
 
         body {
-            background-color: var(--bg-color);
+            background-color: var(--bg-dark);
             color: var(--text-main);
-            font-family: var(--font-family);
+            font-family: 'Segoe UI', system-ui, sans-serif;
             margin: 0;
             padding: 40px;
             line-height: 1.6;
         }
 
         .container {
-            max-width: 1000px;
+            max-width: 1400px;
             margin: 0 auto;
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            grid-template-rows: auto auto;
+            gap: 30px;
         }
 
-        /* Header Section */
         header {
-            text-align: center;
-            margin-bottom: 60px;
-            border-bottom: 1px solid #334155;
+            grid-column: 1 / -1;
+            margin-bottom: 20px;
+            border-bottom: 2px solid var(--border-color);
             padding-bottom: 20px;
         }
 
-        h1 {
-            font-size: 2.5rem;
-            margin: 0;
-            background: linear-gradient(90deg, var(--accent-blue), var(--accent-gold));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        .subtitle {
-            color: var(--text-sub);
-            font-size: 1.1rem;
-        }
-
-        /* Formula Section */
-        .formula-box {
-            background: rgba(30, 41, 59, 0.8);
-            border: 1px solid #475569;
-            border-radius: 12px;
-            padding: 20px;
-            text-align: center;
-            font-family: 'Courier New', monospace;
-            font-size: 1.2rem;
-            margin-bottom: 40px;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-        }
-
-        .term { display: inline-block; padding: 5px 10px; border-radius: 6px; margin: 2px; transition: transform 0.2s; cursor: default; }
-        .term:hover { transform: scale(1.05); }
-        .t-match { color: var(--accent-gold); border: 1px solid var(--accent-gold); }
-        .t-rest { color: var(--accent-green); border: 1px solid var(--accent-green); }
-        .t-bad { color: var(--accent-red); border: 1px solid var(--accent-red); }
-
-        /* Scenarios Section */
-        .section-title {
-            font-size: 1.5rem;
-            border-left: 5px solid var(--accent-blue);
-            padding-left: 15px;
-            margin-bottom: 20px;
-            margin-top: 50px;
-        }
-
-        .scenario-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 40px;
-        }
+        h1 { margin: 0; font-size: 2.2rem; color: var(--accent-primary); }
+        .subtitle { color: var(--text-sub); font-size: 1.1rem; margin-top: 5px; }
 
         .card {
             background-color: var(--card-bg);
-            border-radius: 12px;
-            padding: 20px;
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .card h3 { margin-top: 0; color: var(--text-main); display: flex; align-items: center; justify-content: space-between;}
-        .card-badge { font-size: 0.8rem; padding: 2px 8px; border-radius: 4px; color: #000; font-weight: bold; }
-        .badge-gold { background-color: var(--accent-gold); }
-        .badge-red { background-color: var(--accent-red); }
-
-        /* SVG Graph Styles */
-        svg { width: 100%; height: 150px; }
-        .axis { stroke: #475569; stroke-width: 1; }
-        .target-line { stroke: var(--accent-blue); stroke-width: 2; fill: none; stroke-dasharray: 4; }
-        .robot-line { stroke-width: 3; fill: none; }
-        .robot-good { stroke: var(--accent-gold); }
-        .robot-bad { stroke: var(--accent-red); }
-        .label-text { fill: var(--text-sub); font-size: 10px; }
-
-        /* Logic Explanation Grid */
-        .logic-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-        }
-
-        .logic-card {
-            background-color: var(--card-bg);
-            padding: 20px;
-            border-radius: 12px;
-            border-top: 4px solid #fff;
-        }
-        .lc-match { border-color: var(--accent-gold); }
-        .lc-rest { border-color: var(--accent-green); }
-        .lc-penalty { border-color: var(--accent-red); }
-
-        .logic-desc { font-size: 0.9rem; color: var(--text-sub); margin-top: 10px; }
-        .math-snippet {
-            background: #0f172a;
-            padding: 10px;
-            border-radius: 6px;
-            font-family: monospace;
-            font-size: 0.85rem;
-            margin-top: 10px;
-            color: #e2e8f0;
-        }
-
-        /* Impact Balance Chart */
-        .balance-container {
-            background-color: var(--card-bg);
+            border-radius: 16px;
             padding: 30px;
-            border-radius: 12px;
-            margin-top: 20px;
+            border: 1px solid var(--border-color);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.3);
         }
 
-        .bar-group {
+        .section-title {
             display: flex;
             align-items: center;
-            margin-bottom: 15px;
+            justify-content: space-between;
+            margin-bottom: 25px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
         }
-        .bar-label { width: 150px; font-weight: bold; font-size: 0.9rem; }
-        .bar-area { flex-grow: 1; background: #334155; height: 24px; border-radius: 4px; overflow: hidden; position: relative;}
-        .bar-fill { height: 100%; display: flex; align-items: center; justify-content: flex-end; padding-right: 10px; font-size: 0.8rem; color: #000; font-weight: bold; width: 0; transition: width 1s ease-out; }
+
+        .section-title h2 { margin: 0; font-size: 1.5rem; }
+        .badge {
+            background: rgba(255,255,255,0.1);
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: bold;
+        }
+
+        /* --- Match Reward Details --- */
+        .match-card { grid-row: span 2; }
+        .match-badge { background: var(--accent-primary); color: white; }
+
+        .viz-container {
+            background: rgba(0,0,0,0.2);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        /* SVG Graph Styles */
+        .graph-line {
+            fill: none;
+            stroke: var(--accent-success);
+            stroke-width: 3;
+            filter: drop-shadow(0 0 8px rgba(16, 185, 129, 0.4));
+        }
+        .graph-axis { stroke: var(--text-sub); stroke-width: 1; }
+        .graph-label { fill: var(--text-sub); font-size: 12px; }
+        .graph-target-line {
+            stroke: var(--accent-warn);
+            stroke-width: 2;
+            stroke-dasharray: 5,5;
+        }
+
+        .logic-flow {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .logic-step {
+            display: flex;
+            background: rgba(255,255,255,0.03);
+            border-radius: 8px;
+            overflow: hidden;
+            border-left: 4px solid var(--border-color);
+        }
+
+        .logic-step.primary { border-color: var(--accent-primary); }
+        .logic-step.success { border-color: var(--accent-success); }
+
+        .step-icon {
+            width: 60px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0,0,0,0.1);
+            font-size: 1.5rem;
+        }
+
+        .step-content { padding: 15px; flex: 1; }
+        .step-title { font-weight: bold; color: var(--text-main); display: block; margin-bottom: 5px; }
+        .step-desc { font-size: 0.9rem; color: var(--text-sub); margin: 0; }
         
-        .fill-gold { background-color: var(--accent-gold); }
-        .fill-green { background-color: var(--accent-green); }
-        .fill-red { background-color: var(--accent-red); }
+        /* MathJax adjustments */
+        mjx-container { font-size: 110% !important; color: #e2e8f0; }
 
-        /* Animation Keyframes */
-        @keyframes pulse {
-            0% { r: 3; opacity: 0.5; }
-            50% { r: 6; opacity: 1; }
-            100% { r: 3; opacity: 0.5; }
+        .param-tag {
+            display: inline-block;
+            background: #334155;
+            color: #cbd5e1;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.85rem;
+            margin-top: 8px;
         }
-        .point-marker { animation: pulse 2s infinite; }
 
-        @media (max-width: 768px) {
-            .scenario-grid { grid-template-columns: 1fr; }
+        /* --- Rest Reward --- */
+        .rest-badge { background: var(--text-sub); color: #1e293b; }
+        
+        .equation-box {
+            background: #0f172a;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            color: var(--accent-success);
+            margin: 15px 0;
+            border-left: 3px solid var(--accent-success);
+        }
+
+        /* --- Penalties --- */
+        .penalty-card { align-self: start; }
+        .penalty-badge { background: var(--accent-danger); color: white; }
+
+        .penalty-item {
+            margin-bottom: 20px;
+            padding-bottom: 20px;
+            border-bottom: 1px dashed var(--border-color);
+        }
+        .penalty-item:last-child { border-bottom: none; margin-bottom: 0; }
+
+        .penalty-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        .penalty-name { font-weight: bold; color: var(--accent-danger); }
+        .penalty-weight { font-weight: bold; background: rgba(239,68,68,0.1); color: var(--accent-danger); padding: 2px 8px; border-radius: 4px; }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .container { grid-template-columns: 1fr; }
+            .match-card { grid-row: auto; }
         }
     </style>
 </head>
 <body>
 
-<div class="container">
-    <header>
-        <h1>Sim-to-Real 報酬設計ビジュアライザー</h1>
-        <p class="subtitle">打撃・休符・押し付けを判別する新ロジックの全貌</p>
-    </header>
+    <div class="container">
+        <header>
+            <h1>Porcaro RL: Reward System Architecture v1.2</h1>
+            <div class="subtitle">初期学習フェーズ（Active Exploration）向け：緩和パラメータ設定仕様書</div>
+        </header>
 
-    <!-- Formula Summary -->
-    <div class="formula-box">
-        <span style="color:#64748b">Total Reward = </span><br><br>
-        <span class="term t-match" title="100点: 強さとタイミングが完璧な時">Match (打撃)</span> + 
-        <span class="term t-rest" title="0.1点×ステップ数: 待機できている時">Rest (休符)</span> - 
-        <span class="term t-bad" title="-5.0点×違反量: 休符で触った時">Viol (違反)</span> - 
-        <span class="term t-bad" title="-2.0点×時間: 押し付けた時">Push (押し付け)</span>
-    </div>
+        <!-- 左カラム: Match Reward (メイン) -->
+        <div class="card match-card">
+            <div class="section-title">
+                <h2>🔥 Match Reward (打撃報酬)</h2>
+                <span class="badge match-badge">Weight: 100.0</span>
+            </div>
 
-    <!-- Scenarios -->
-    <div class="section-title">1. 打撃判定の比較 (Snap vs Push)</div>
-    <div class="scenario-grid">
-        
-        <!-- Scenario A: Ideal Hit -->
+            <p style="color: var(--text-sub); margin-bottom: 20px;">
+                ロボットが最も優先すべき目標。ドラムへの接触終了時（Falling Edge）に1回だけ計算されるスパース報酬。
+                現在は学習初期のため、「強い力」よりも「接触すること」を優先して評価する設定になっている。
+            </p>
+
+            <!-- グラフによる可視化 -->
+            <div class="viz-container">
+                <div style="margin-bottom: 10px; font-weight:bold; color:var(--accent-success);">Force Score Distribution (力の評価関数)</div>
+                <svg width="100%" height="200" viewBox="0 0 600 200">
+                    <!-- Grid -->
+                    <line x1="50" y1="180" x2="550" y2="180" class="graph-axis" />
+                    <line x1="300" y1="20" x2="300" y2="180" class="graph-target-line" />
+                    
+                    <!-- Curve: exp(-|x - 20| / 15) -->
+                    <!-- Points approximated for visual representation -->
+                    <path d="M 50 178 Q 150 170 200 120 T 300 20 T 400 120 T 550 178" class="graph-line" fill="none" />
+                    
+                    <!-- Labels -->
+                    <text x="300" y="195" text-anchor="middle" class="graph-label">Target Force (20N)</text>
+                    <text x="50" y="195" text-anchor="middle" class="graph-label">0N</text>
+                    <text x="550" y="195" text-anchor="middle" class="graph-label">40N</text>
+                    
+                    <!-- Annotations -->
+                    <text x="310" y="40" fill="#f59e0b" font-size="14">Perfect (1.0)</text>
+                    <text x="420" y="110" fill="#94a3b8" font-size="12">Acceptable Range</text>
+                    <text x="420" y="125" fill="#10b981" font-weight="bold" font-size="14">Sigma = 15.0</text>
+                </svg>
+                <div style="font-size: 0.85rem; color: var(--text-sub); margin-top: 10px;">
+                    許容誤差(Sigma)を <b>15.0</b> に設定しているため、ターゲット(20N)に対して 5N〜35N の広範囲で高得点が得られる（釣鐘が横に広い）。
+                </div>
+            </div>
+
+            <!-- 計算ロジック -->
+            <h3>Calculation Logic Step-by-Step</h3>
+            <div class="logic-flow">
+                
+                <div class="logic-step primary">
+                    <div class="step-icon">💪</div>
+                    <div class="step-content">
+                        <span class="step-title">1. Force Accuracy (力の正確性)</span>
+                        <div class="step-desc">
+                            ピーク力 $F_{peak}$ と目標力 $F_{target}$ の誤差を評価。<br>
+                            誤差が大きくても点数がゼロにならないよう、指数関数 $\exp$ を使用。
+                            $$ S_{force} = \exp \left( - \frac{|F_{peak} - F_{target}|}{\sigma_{force}} \right) $$
+                        </div>
+                        <span class="param-tag">Sigma = 15.0</span>
+                        <span class="param-tag">Target = 20.0N</span>
+                    </div>
+                </div>
+
+                <div class="logic-step primary">
+                    <div class="step-icon">⏱️</div>
+                    <div class="step-content">
+                        <span class="step-title">2. Timing Check (タイミング判定)</span>
+                        <div class="step-desc">
+                            <strong>【現在：緩和モード】</strong><br>
+                            波形の形状一致ではなく、「リズム区間内かどうか」の二値判定を採用。<br>
+                            ターゲット波形が 0.05 以上なら、どのタイミングでも満点とする。
+                            $$ M_{timing} = \begin{cases} 1.0 & (\text{if } T_{wave} > 0.05) \\ 0.0 & (\text{otherwise}) \end{cases} $$
+                        </div>
+                        <span class="param-tag">Logic: Binary (0 or 1)</span>
+                        <span class="param-tag">Threshold > 0.05</span>
+                    </div>
+                </div>
+
+                <div class="logic-step success">
+                    <div class="step-icon">🏆</div>
+                    <div class="step-content">
+                        <span class="step-title">3. Final Score</span>
+                        <div class="step-desc">
+                            上記2つの値を掛け合わせ、重みを乗算。<br>
+                            $$R = 100.0 \times S_{force} \times M_{timing}$$
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- 右カラム上: Rest Reward -->
         <div class="card">
-            <h3>理想的な打撃 (Virtuoso) <span class="card-badge badge-gold">+100 pts</span></h3>
-            <svg viewBox="0 0 300 150">
-                <!-- Axes -->
-                <line x1="20" y1="130" x2="280" y2="130" class="axis" />
-                <line x1="20" y1="10" x2="20" y2="130" class="axis" />
-                
-                <!-- Target Wave (Gaussian) -->
-                <path d="M20,130 Q100,130 130,130 Q150,10 170,130 Q200,130 280,130" class="target-line" />
-                
-                <!-- Robot Force (Sharp Spike) -->
-                <path d="M20,130 L130,130 L150,15 L170,130 L280,130" class="robot-line robot-good" />
-                
-                <!-- Annotations -->
-                <circle cx="150" cy="15" r="5" fill="var(--accent-gold)" class="point-marker"/>
-                <text x="160" y="20" fill="var(--accent-gold)" font-weight="bold">HIT!</text>
-                <text x="160" y="35" class="label-text">Peak matches Target</text>
-                <text x="50" y="145" class="label-text">Time (s)</text>
-            </svg>
-            <div class="logic-desc">
-                <ul>
-                    <li>ターゲットの<strong>ピーク(頂点)</strong>で力を発揮。</li>
-                    <li>接触時間は 0.1秒未満。</li>
-                    <li><strong>Timing Score = 1.0 (満点)</strong></li>
-                </ul>
+            <div class="section-title">
+                <h2>💤 Rest Reward</h2>
+                <span class="badge rest-badge">Weight: 0.005</span>
+            </div>
+            <p style="font-size: 0.9rem; color: var(--text-sub);">
+                「休符」を守る（触れない）行動への報酬。
+                打撃報酬(100.0)に対して圧倒的に小さく設定し、<strong>「休んで点数を稼ぐ」戦略を無効化</strong>している。
+            </p>
+            <div class="equation-box">
+                IF (Target < 1.0) AND (Force ≈ 0)<br>
+                THEN Reward += 0.005
+            </div>
+            <p style="font-size: 0.85rem; color: #64748b;">
+                ※エピソード全休しても、最大で約1.6点にしかならない設計。
+            </p>
+        </div>
+
+        <!-- 右カラム下: Penalties -->
+        <div class="card penalty-card">
+            <div class="section-title">
+                <h2>⚠️ Penalties</h2>
+                <span class="badge penalty-badge">Violations</span>
+            </div>
+
+            <div class="penalty-item">
+                <div class="penalty-header">
+                    <span class="penalty-name">1. Rest Violation (休符無視)</span>
+                    <span class="penalty-weight">-5.0 × Force</span>
+                </div>
+                <p style="font-size: 0.9rem; color: var(--text-sub); margin: 0;">
+                    休符区間に誤って接触した場合、その<strong>力の強さに比例</strong>して罰を与える。
+                    軽く触れただけなら減点は小さい。
+                    $$ p_{viol} = \frac{F_{current}}{10.0} $$
+                </p>
+            </div>
+
+            <div class="penalty-item">
+                <div class="penalty-header">
+                    <span class="penalty-name">2. Pushing (押し付け)</span>
+                    <span class="penalty-weight">-1.0 / step</span>
+                </div>
+                <p style="font-size: 0.9rem; color: var(--text-sub); margin: 0;">
+                    連続接触時間が閾値を超えた場合に発動。<br>
+                    <span class="param-tag" style="background:#451a1a; color:#fca5a5;">Limit: 0.06 sec</span>
+                </p>
+            </div>
+
+            <div class="penalty-item">
+                <div class="penalty-header">
+                    <span class="penalty-name">3. Joint Limits (可動域)</span>
+                    <span class="penalty-weight">-1.0 / deg</span>
+                </div>
+                <p style="font-size: 0.9rem; color: var(--text-sub); margin: 0;">
+                    手首・グリップが設計可動域を超えた角度に対して線形に罰則。
+                </p>
             </div>
         </div>
 
-        <!-- Scenario B: Pushing/Early Hit -->
-        <div class="card">
-            <h3>悪い例: フライング & 押し付け <span class="card-badge badge-red">0 pts & Penalty</span></h3>
-            <svg viewBox="0 0 300 150">
-                <!-- Axes -->
-                <line x1="20" y1="130" x2="280" y2="130" class="axis" />
-                <line x1="20" y1="10" x2="20" y2="130" class="axis" />
-                
-                <!-- Target Wave (Gaussian) -->
-                <path d="M20,130 Q100,130 130,130 Q150,10 170,130 Q200,130 280,130" class="target-line" />
-                
-                <!-- Robot Force (Early & Flat) -->
-                <path d="M20,130 L100,130 L110,40 L200,40 L210,130" class="robot-line robot-bad" />
-                
-                <!-- Annotations -->
-                <rect x="110" y="40" width="90" height="90" fill="rgba(248, 113, 113, 0.2)" />
-                <text x="115" y="60" fill="var(--accent-red)" font-weight="bold">Timing Mismatch</text>
-                <text x="115" y="80" fill="var(--accent-red)" font-size="10">Target is low here</text>
-                <text x="115" y="120" fill="var(--accent-red)" font-weight="bold">PUSH DETECTED</text>
-            </svg>
-            <div class="logic-desc">
-                <ul>
-                    <li>波形の立ち上がり(Target=低い)で叩いている。</li>
-                    <li><strong>Timing Score ≈ 0.05 (ほぼ0点)</strong></li>
-                    <li>接触が長く続き、Match報酬が無効化される。</li>
-                </ul>
-            </div>
-        </div>
     </div>
-
-    <!-- Logic Details -->
-    <div class="section-title">2. 報酬ロジックの詳細</div>
-    <div class="logic-grid">
-        <!-- Match Logic -->
-        <div class="logic-card lc-match">
-            <h4 style="color:var(--accent-gold)">Match Reward (打撃)</h4>
-            <div class="logic-desc">
-                「力の一致度」と「タイミングの一致度」を掛け合わせることで、ピーク狙いを強制します。
-            </div>
-            <div class="math-snippet">
-                R = Exp(ForceError) × TimingScale<br>
-                TimingScale = Target[t] / TargetMax
-            </div>
-        </div>
-
-        <!-- Rest Logic -->
-        <div class="logic-card lc-rest">
-            <h4 style="color:var(--accent-green)">Rest Reward (休符)</h4>
-            <div class="logic-desc">
-                休符の区間（Target < 1.0）で触れていなければ、毎ステップ少しずつ報酬が入ります。
-            </div>
-            <div class="math-snippet">
-                if (Target < 1.0 and NotTouching):<br>
-                &nbsp;&nbsp;R += 0.1 (per step)
-            </div>
-        </div>
-
-        <!-- Penalty Logic -->
-        <div class="logic-card lc-penalty">
-            <h4 style="color:var(--accent-red)">Penalties (罰)</h4>
-            <div class="logic-desc">
-                休符中に触れる、または長時間押し付けると大きなペナルティが発生します。
-            </div>
-            <div class="math-snippet">
-                Viol = -5.0 × Force (休符違反)<br>
-                Push = -2.0 × TimeOver (押し付け)
-            </div>
-        </div>
-    </div>
-
-    <!-- Impact Analysis -->
-    <div class="section-title">3. 報酬バランスの影響度 (1エピソードあたり)</div>
-    <div class="balance-container">
-        <p style="margin-bottom:20px; color:var(--text-sub);">
-            「理想的な1回の打撃」と「ずっと休んでいる場合」のスコア比較。
-            エージェントは<strong>「何もしない(40点)」よりも「リスクを冒して叩く(140点)」</strong>を選びます。
-        </p>
-
-        <!-- Bar 1: Match Hit -->
-        <div class="bar-group">
-            <div class="bar-label">1回の打撃成功</div>
-            <div class="bar-area">
-                <div class="bar-fill fill-gold" style="width: 70%">100 pts (Weight: 100)</div>
-            </div>
-        </div>
-
-        <!-- Bar 2: Rest Accumulation -->
-        <div class="bar-group">
-            <div class="bar-label">休符の積算(全編)</div>
-            <div class="bar-area">
-                <div class="bar-fill fill-green" style="width: 28%">~40 pts (Weight: 0.1 × 400steps)</div>
-            </div>
-        </div>
-
-        <!-- Bar 3: Penalty Risk -->
-        <div class="bar-group">
-            <div class="bar-label">強い押し付け(1秒)</div>
-            <div class="bar-area">
-                <div class="bar-fill fill-red" style="width: 90%">-100 pts Over (Catastrophic)</div>
-            </div>
-        </div>
-    </div>
-
-</div>
-
-<script>
-    // Simple animation trigger on load
-    window.onload = function() {
-        const bars = document.querySelectorAll('.bar-fill');
-        const widths = ['70%', '28%', '90%']; // Original target widths
-        
-        bars.forEach((bar, index) => {
-            // Reset to 0 first (already in CSS)
-            setTimeout(() => {
-                bar.style.width = widths[index];
-            }, 300 + (index * 200));
-        });
-    };
-</script>
 
 </body>
 </html>
