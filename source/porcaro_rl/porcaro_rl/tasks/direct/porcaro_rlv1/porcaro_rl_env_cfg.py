@@ -79,8 +79,8 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # ★ 追加箇所: シンプルリズム生成設定
     # ===================================================
     use_simple_rhythm: bool = True   # TrueにするとSimpleRhythmGeneratorを使用
-    simple_rhythm_mode: str = "steady" # "single", "double", "steady"
-    simple_rhythm_bpm: float = 120.0    # steadyモード時のBPM
+    simple_rhythm_mode: str = "double" # "single", "double", "steady"
+    simple_rhythm_bpm: float = 160.0    # steadyモード時のBPM
 
     # --- 追加設定 ---
     lookahead_horizon: float = 0.5

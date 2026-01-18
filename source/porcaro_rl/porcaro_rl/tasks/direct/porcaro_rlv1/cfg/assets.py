@@ -91,7 +91,7 @@ ROBOT_CFG = ArticulationCfg(
             stiffness=0.0,
             damping=0.1,
             effort_limit_sim=500.0,
-            friction=1.5,
+            friction=2.5,
         ),
         "grip": ImplicitActuatorCfg(
             joint_names_expr=[".*Hand_link_Grip_joint"],
