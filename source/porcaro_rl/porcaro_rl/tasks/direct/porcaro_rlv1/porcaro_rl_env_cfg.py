@@ -182,7 +182,7 @@ class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
         
         # 分析に基づくヒステリシス設定
         self.pam_hysteresis_cfg = PamHysteresisModelCfg(
-            hysteresis_width=0.05, # Unloading時に18%の出力低下
+            hysteresis_width=0.2, # Unloading時に18%の出力低下
             curve_shape_param=2.0  # (現在の実装では未使用)
         )
         
