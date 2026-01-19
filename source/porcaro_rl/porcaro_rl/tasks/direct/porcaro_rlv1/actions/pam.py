@@ -105,6 +105,36 @@ def contraction_ratio_from_angle(theta: torch.Tensor, theta_t_deg: float, r: flo
     theta_t = math.radians(theta_t_deg)
     return (r / L) * torch.abs(theta - theta_t)
 
+def calculate_effective_contraction(
+    theta_deg: torch.Tensor,
+    theta_t_deg: float,
+    r: float,
+    L0: float,
+    slack_offset: float | torch.Tensor
+) -> torch.Tensor:
+    """有効収縮率 epsilon_eff を計算する (Slack補正あり)"""
+    
+    # 1. 幾何学的長さの計算 (L_geo)
+    theta_rad = torch.deg2rad(theta_deg)
+    theta_t_rad = math.radians(theta_t_deg)
+    
+    # 修正: 絶対値 (abs) をとる
+    # これにより、アンカー(theta_t)から「どちらに回転しても」ワイヤーが引き出される挙動を再現
+    delta_geo = r * torch.abs(theta_rad - theta_t_rad)
+    
+    # 現在の幾何学的長さ (アンカーから離れるほど、ワイヤー有効長は短くなる = 収縮扱い)
+    # ※元の contraction_ratio_from_angle と同じ幾何特性
+    L_geo = L0 - delta_geo
+    
+    # 2. 有効長の計算 (L_eff)
+    # Slackがある場合、実際の「張り」は弱くなる -> 長さが増える
+    L_eff = L_geo + slack_offset
+    
+    # 3. 収縮率の計算
+    epsilon = (L0 - L_eff) / L0
+    
+    return torch.clamp(epsilon, min=0.0)
+
 
 @torch.no_grad()
 def h0_of_P_linear(P: torch.Tensor, Pmax: float = 0.6, h0_max: float = 0.25) -> torch.Tensor:

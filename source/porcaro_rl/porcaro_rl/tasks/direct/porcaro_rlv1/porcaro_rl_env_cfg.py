@@ -26,7 +26,7 @@ from .cfg.sensors import contact_forces_stick_at_drum_cfg, drum_vs_stick_cfg
 from .cfg.controller_cfg import TorqueControllerCfg
 from .cfg.logging_cfg import LoggingCfg, RewardLoggingCfg
 from .cfg.rewards_cfg import RewardsCfg
-from .cfg.actuator_cfg import PamDelayModelCfg, PamHysteresisModelCfg, ActuatorNetModelCfg
+from .cfg.actuator_cfg import PamDelayModelCfg, PamHysteresisModelCfg, ActuatorNetModelCfg, PamGeometricCfg # <--- 追加
 
 
 @configclass
@@ -74,6 +74,15 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     state_space: int = 0
     
     dof_names: list[str] = ["Base_link_Wrist_joint", "Hand_link_Grip_joint"]
+
+    # --- 追加: 幾何学補正設定 ---
+    # デフォルトは True (有効収縮率を使用) とし、オフセットは 0 (影響なし) で初期化
+    pam_geometric_cfg: PamGeometricCfg = PamGeometricCfg(
+        enable_slack_compensation=True,
+        wire_slack_offsets=(0.001, 0.005, 0.005), # 後でキャリブレーション値をここに入れます 0.00xmmのワイヤーが正しく貼るまでの長さ
+        natural_length=0.150
+    )
+    # --------------------------
 
     # ===================================================
     # ★ 追加箇所: シンプルリズム生成設定

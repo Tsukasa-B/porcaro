@@ -89,6 +89,7 @@ class PorcaroRLEnv(DirectRLEnv):
             force_map_csv=ctrl_cfg.force_map_csv,
             h0_map_csv=ctrl_cfg.h0_map_csv,
             use_pressure_dependent_tau=ctrl_cfg.use_pressure_dependent_tau,
+            geometric_cfg=self.cfg.pam_geometric_cfg,
         )
         self.action_controller.reset(self.num_envs, self.device)
 

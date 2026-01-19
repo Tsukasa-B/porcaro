@@ -3,8 +3,11 @@ from __future__ import annotations
 import torch
 from .base import ActionController, RobotLike
 from .pam import (
-    PAMChannel, contraction_ratio_from_angle, Fpam_quasi_static, PamForceMap, H0Map
+    PAMChannel, contraction_ratio_from_angle, calculate_effective_contraction, # <--- 追加
+    Fpam_quasi_static, PamForceMap, H0Map
 )
+# 型ヒント用に Config を import (TYPE_CHECKING ブロック内または直接)
+from ..cfg.actuator_cfg import PamGeometricCfg # <--- 追加
 
 class TorqueActionController(ActionController):
     def __init__(self,
@@ -14,12 +17,13 @@ class TorqueActionController(ActionController):
                  theta_t_DF_deg: float = 0.0,
                  theta_t_F_deg:  float = -90.0,
                  theta_t_G_deg:  float = -45.0,
-                 Pmax: float = 0.8,
+                 Pmax: float = 0.6,
                  tau: float = 0.09, dead_time: float = 0.03,
                  N: float = 630.0,
                  force_map_csv: str | None = None,
                  h0_map_csv: str | None = None,
-                 use_pressure_dependent_tau: bool = True):
+                 use_pressure_dependent_tau: bool = True,
+                 geometric_cfg: PamGeometricCfg | None = None):
 
         self.dt_ctrl = float(dt_ctrl)
         self.control_mode = control_mode
@@ -32,6 +36,19 @@ class TorqueActionController(ActionController):
 
         self.force_map = PamForceMap.from_csv(force_map_csv) if force_map_csv else None
         self.h0_map    = H0Map.from_csv(h0_map_csv) if h0_map_csv else None
+
+        # --- 追加ブロック: 幾何学補正設定の読み込み ---
+        if geometric_cfg is not None:
+            self.use_effective_contraction = geometric_cfg.enable_slack_compensation
+            self.slack_offsets = torch.tensor(geometric_cfg.wire_slack_offsets)
+            # 新手法では Config の L0 を優先使用
+            self.L0_sim = geometric_cfg.natural_length 
+        else:
+            # Configがない場合（または旧動作）はデフォルト値
+            self.use_effective_contraction = False
+            self.slack_offsets = torch.zeros(3)
+            self.L0_sim = self.L # 引数の L を使用
+        # ---------------------------------------------
 
         tau_lut = None
         if use_pressure_dependent_tau:
@@ -86,6 +103,11 @@ class TorqueActionController(ActionController):
         wid, gid = joint_ids
         n_envs = int(q.shape[0])
 
+        # --- 追加: オフセットのデバイス同期 ---
+        if self.slack_offsets.device != q.device:
+            self.slack_offsets = self.slack_offsets.to(q.device)
+        # ----------------------------------
+
         # 1) 指令値計算
         # ここでの actions は遅れやヒステリシス適用後の値が入ってくるため、
         # 計算される圧力は「実際にモデルに入力される圧力 (P_out)」に相当します。
@@ -96,12 +118,27 @@ class TorqueActionController(ActionController):
         P_F  = self.ch_F.step(P_cmd_stack[:, 1])
         P_G  = self.ch_G.step(P_cmd_stack[:, 2])
 
-        # 3) 収縮率 h
-        theta_w = q[:, wid]
-        theta_g = q[:, gid]
-        h_DF = contraction_ratio_from_angle(theta_w, self.theta_t["DF"], self.r, self.L)
-        h_F  = contraction_ratio_from_angle(theta_w, self.theta_t["F"],  self.r, self.L)
-        h_G  = contraction_ratio_from_angle(theta_g, self.theta_t["G"],  self.r, self.L)
+        # 3) 収縮率 h (epsilon) の計算 --- ここを大幅変更 ---
+        q_wrist = torch.rad2deg(q[:, joint_ids[0]])
+        q_grip  = torch.rad2deg(q[:, joint_ids[1]])
+
+        if self.use_effective_contraction:
+            # [Mode B: 新手法] 有効収縮率 (Slack考慮)
+            eps_DF = calculate_effective_contraction(
+                q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0])
+            eps_F = calculate_effective_contraction(
+                q_wrist, self.theta_t["F"], self.r, self.L0_sim, self.slack_offsets[1])
+            eps_G = calculate_effective_contraction(
+                q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2])
+            
+            # 変数名を既存コード(h_DFなど)に合わせる
+            h_DF, h_F, h_G = eps_DF, eps_F, eps_G
+        else:
+            # [Mode A: 既存手法] 幾何学的収縮率 (Slack無視)
+            h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L)
+            h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"], self.r, self.L)
+            h_G  = contraction_ratio_from_angle(q_grip, self.theta_t["G"], self.r, self.L)
+        # ---------------------------------------------------
 
         # 4) 力 F
         if self.force_map is not None:
