@@ -194,7 +194,7 @@ class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
         
         # ヒステリシス設定
         self.pam_hysteresis_cfg = PamHysteresisModelCfg(
-            hysteresis_width=0.2, 
+            hysteresis_width=0.02, 
             curve_shape_param=2.0
         )
         
