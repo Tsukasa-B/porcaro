@@ -79,7 +79,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # デフォルトは True (有効収縮率を使用) とし、オフセットは 0 (影響なし) で初期化
     pam_geometric_cfg: PamGeometricCfg = PamGeometricCfg(
         enable_slack_compensation=True,
-        wire_slack_offsets=(0.0, 0.005, 0.003), # 後でキャリブレーション値をここに入れます 0.00x mのワイヤーが正しく貼るまでの長さ
+        wire_slack_offsets=(0.001, 0.005, 0.005), # 後でキャリブレーション値をここに入れます 0.00x mのワイヤーが正しく貼るまでの長さ
         natural_length=0.150
     )
     # --------------------------
@@ -164,7 +164,11 @@ def apply_domain_randomization(cfg: PorcaroRLEnvCfg):
 class PorcaroRLEnvCfg_ModelA(PorcaroRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
-        self.pam_delay_cfg = PamDelayModelCfg(delay_time=0.04, time_constant=0.15)
+        # [変更] time_constant などの古い引数を削除し、バッファ確保用の max_delay_time を指定
+        # デフォルトで pneumatic.py の Table I (可変Tau, 可変Deadtime) が使用されます
+        self.pam_delay_cfg = PamDelayModelCfg(
+            max_delay_time=0.1  # 0.1秒分のバッファを確保 (deadtimeの最大値0.04sに対して十分な余裕)
+        )
         self.pam_hysteresis_cfg = None
         self.actuator_net_cfg = None
 
@@ -182,17 +186,16 @@ class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         
-        # 実機データに基づく遅れパラメータの微調整
-        # cmdとmeasの乖離から、時定数を少し大きめ(0.05 -> 0.08)に見積もり
+        # [変更] Model Aと同様に max_delay_time を指定
+        # 必要であればここで tau_values や deadtime_values を上書き定義可能
         self.pam_delay_cfg = PamDelayModelCfg(
-            delay_time=0.02,      # むだ時間 (約20ms)
-            time_constant=0.08    # 一次遅れ時定数 (実機の応答波形より調整)
+            max_delay_time=0.1
         )
         
-        # 分析に基づくヒステリシス設定
+        # ヒステリシス設定
         self.pam_hysteresis_cfg = PamHysteresisModelCfg(
-            hysteresis_width=0.2, # Unloading時に18%の出力低下
-            curve_shape_param=2.0  # (現在の実装では未使用)
+            hysteresis_width=0.2, 
+            curve_shape_param=2.0
         )
         
         self.actuator_net_cfg = None
@@ -214,6 +217,7 @@ class PorcaroRLEnvCfg_ModelC(PorcaroRLEnvCfg):
             input_dim=4, output_dim=1, hidden_units=[64, 64],
             # model_path="models/actuator_net.pt" 
         )
+        # Model C は遅れモデルを使わないため None
         self.pam_delay_cfg = None
         self.pam_hysteresis_cfg = None
 
