@@ -21,6 +21,7 @@ class TorqueActionController(ActionController):
                  tau: float = 0.09, dead_time: float = 0.03,
                  N: float = 630.0,
                  force_map_csv: str | None = None,
+                 force_scale: float = 1.0,
                  h0_map_csv: str | None = None,
                  use_pressure_dependent_tau: bool = True,
                  geometric_cfg: PamGeometricCfg | None = None):
@@ -33,6 +34,29 @@ class TorqueActionController(ActionController):
                         "G":  float(theta_t_G_deg)}
         self.Pmax = float(Pmax)
         self.N = float(N)
+        self.force_scale = float(force_scale)
+
+        # === 変更箇所: ForceMap読み込みとデバッグ出力 ===
+        print("-" * 60)
+        print(f"[TorqueActionController] Initializing PAM Force Model...")
+        
+        if force_map_csv:
+            try:
+                self.force_map = PamForceMap.from_csv(force_map_csv)
+                print(f"  >>> SUCCESS: Loaded Real Force Map from: {force_map_csv}")
+                print(f"      Range: P=[{self.force_map.P[0]:.2f}, {self.force_map.P[-1]:.2f}] MPa, "
+                      f"h=[{self.force_map.h[0]:.2f}, {self.force_map.h[-1]:.2f}]")
+                print(f"  >>> INFO: Applying Force Scale: {self.force_scale:.2f} (Real/Catalog Ratio)")
+            except Exception as e:
+                print(f"  >>> ERROR: Failed to load Force Map: {e}")
+                raise e # 失敗時は止める
+        else:
+            self.force_map = None
+            print(f"  >>> WARNING: No CSV provided. Using Ideal Quasi-static Model (N={self.N})")
+            print("      This may cause Sim-to-Real mismatch!")
+        
+        print("-" * 60)
+        # ================================================
 
         self.force_map = PamForceMap.from_csv(force_map_csv) if force_map_csv else None
         self.h0_map    = H0Map.from_csv(h0_map_csv) if h0_map_csv else None
@@ -142,13 +166,14 @@ class TorqueActionController(ActionController):
 
         # 4) 力 F
         if self.force_map is not None:
-            F_DF = self.force_map(P_DF, h_DF)
-            F_F  = self.force_map(P_F,  h_F)
-            F_G  = self.force_map(P_G,  h_G)
+            F_DF = self.force_map(P_DF, h_DF) * self.force_scale  # <--- ★ 係数を掛ける
+            F_F  = self.force_map(P_F,  h_F)  * self.force_scale  # <--- ★
+            F_G  = self.force_map(P_G,  h_G)  * self.force_scale  # <--- ★
         else:
-            F_DF = Fpam_quasi_static(P_DF, h_DF, N=self.N, Pmax=self.Pmax)
-            F_F  = Fpam_quasi_static(P_F,  h_F,  N=self.N, Pmax=self.Pmax)
-            F_G  = Fpam_quasi_static(P_G,  h_G,  N=self.N, Pmax=self.Pmax)
+            # 数式モデルの場合も適用しておくと統一性が取れます
+            F_DF = Fpam_quasi_static(P_DF, h_DF, N=self.N, Pmax=self.Pmax) * self.force_scale
+            F_F  = Fpam_quasi_static(P_F,  h_F,  N=self.N, Pmax=self.Pmax) * self.force_scale
+            F_G  = Fpam_quasi_static(P_G,  h_G,  N=self.N, Pmax=self.Pmax) * self.force_scale
 
         # 4.5) 弛み判定
         if self.h0_map is not None:

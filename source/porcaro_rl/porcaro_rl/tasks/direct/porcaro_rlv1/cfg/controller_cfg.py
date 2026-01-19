@@ -20,5 +20,6 @@ class TorqueControllerCfg:
     dead_time: float = 0.03
     N: float = 630.0 # 簡易式 Fpam_quasi_static 用 (CSVがあれば不要)
     force_map_csv: str | None = FORCE_MAP_CSV
+    force_scale = 1
     h0_map_csv: str | None = H0_MAP_CSV
     use_pressure_dependent_tau: bool = True

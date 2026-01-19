@@ -32,39 +32,71 @@ def quat_from_euler_zyx(yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
     norm = math.sqrt(w*w + qx*qx + qy*qy + qz*qz)
     return (w/norm, qx/norm, qy/norm, qz/norm)
 
-# --- アセットのパス設定 ---
-# このスクリプトが (リポジトリルート)/source/standalone/environments/porcaro/
-# に置かれることを想定しています。
+# =========================================================================
+# ★ 変更箇所: データパス探索ロジックの強化
+# =========================================================================
+def find_project_root_and_data(start_path: Path, max_depth: int = 6) -> tuple[Path, Path]:
+    """
+    カレントまたはファイルの場所から親ディレクトリを遡り、'data' フォルダを探す。
+    見つからない場合はエラーとする。
+    """
+    current = start_path.resolve()
+    for _ in range(max_depth):
+        # 候補: dataフォルダがあるかチェック
+        candidate_data = current / "data"
+        if candidate_data.exists() and candidate_data.is_dir():
+             # さらにその中にpam_force_map.csvがあるか確認（確実性のため）
+             if (candidate_data / "pam_force_map.csv").exists():
+                 return current, candidate_data
+        
+        # 親へ
+        if current.parent == current: # ルート到達
+            break
+        current = current.parent
+    
+    raise FileNotFoundError(
+        f"Could not find 'data' directory containing 'pam_force_map.csv' by traversing up from {start_path}. "
+        "Please ensure the 'data' folder exists in the project root."
+    )
+
+# パス解決の実行
 try:
-    ASSETS_DIR = (Path(__file__).resolve().parents[3] / "assets")
-    DATA_DIR = (Path(__file__).resolve().parents[3] / "data")
-except (IndexError, NameError):
-    # 対話環境などで __file__ が未定義の場合のフォールバック
-    print("[Warning] __file__ が未定義です。ASSETS_DIR をカレントディレクトリ基準で仮設定します。")
-    ASSETS_DIR = Path.cwd().parents[2] / "assets"
-    DATA_DIR = Path.cwd().parents[2] / "data"
+    # このファイルの場所を基準に探索
+    BASE_DIR = Path(__file__).parent
+    PROJECT_ROOT, DATA_DIR = find_project_root_and_data(BASE_DIR)
+    
+    # Assetsは data と同階層にあると仮定、なければ探索
+    ASSETS_DIR = PROJECT_ROOT / "assets"
+    if not ASSETS_DIR.exists():
+        # assetsも探す場合の簡易ロジック（必要ならdata同様にする）
+        print(f"[Warning] assets dir not found at {ASSETS_DIR}, trying to rely on defaults or manual set.")
+
+except NameError:
+    # __file__ がない対話実行時などはカレントディレクトリ基準
+    PROJECT_ROOT, DATA_DIR = find_project_root_and_data(Path.cwd())
+    ASSETS_DIR = PROJECT_ROOT / "assets"
+
+print(f"[INFO] Asset Configuration:")
+print(f"  - Project Root: {PROJECT_ROOT}")
+print(f"  - Data Dir    : {DATA_DIR}")
+print(f"  - Assets Dir  : {ASSETS_DIR}")
 
 ROBOT_USD  = str(ASSETS_DIR / "porcaro.usd")
 DRUM_USD   = str(ASSETS_DIR / "sneadrum.usd")
+
+# ★ 変更箇所: ファイルが見つからない場合は例外を発生させ、サイレントなフォールバックを阻止する
 FORCE_MAP_CSV_PATH = str(DATA_DIR / "pam_force_map.csv")
-H0_MAP_CSV_PATH    = str(DATA_DIR / "pam_force_0_map.csv")
-
-if not os.path.exists(ROBOT_USD):
-    raise FileNotFoundError(f"Robot USD not found: {ROBOT_USD}")
-if not os.path.exists(DRUM_USD):
-    raise FileNotFoundError(f"Drum USD not found: {DRUM_USD}")
-
 if not os.path.exists(FORCE_MAP_CSV_PATH):
-    print(f"[Warning] Force map CSV not found (setting to None): {FORCE_MAP_CSV_PATH}")
-    FORCE_MAP_CSV = None
-else:
-    FORCE_MAP_CSV = FORCE_MAP_CSV_PATH
+    raise FileNotFoundError(f"[CRITICAL] Force Map CSV NOT found at: {FORCE_MAP_CSV_PATH}")
+FORCE_MAP_CSV = FORCE_MAP_CSV_PATH
 
+H0_MAP_CSV_PATH    = str(DATA_DIR / "pam_force_0_map.csv")
 if not os.path.exists(H0_MAP_CSV_PATH):
-    print(f"[Warning] H0 map CSV not found (setting to None): {H0_MAP_CSV_PATH}")
+    print(f"[Warning] H0 Map CSV NOT found at: {H0_MAP_CSV_PATH}. Using None.")
     H0_MAP_CSV = None
 else:
     H0_MAP_CSV = H0_MAP_CSV_PATH
+# =========================================================================
 
 # --- アセットCFG定義 ---
 

@@ -79,7 +79,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # デフォルトは True (有効収縮率を使用) とし、オフセットは 0 (影響なし) で初期化
     pam_geometric_cfg: PamGeometricCfg = PamGeometricCfg(
         enable_slack_compensation=True,
-        wire_slack_offsets=(0.001, 0.005, 0.005), # 後でキャリブレーション値をここに入れます 0.00xmmのワイヤーが正しく貼るまでの長さ
+        wire_slack_offsets=(0.0, 0.005, 0.003), # 後でキャリブレーション値をここに入れます 0.00x mのワイヤーが正しく貼るまでの長さ
         natural_length=0.150
     )
     # --------------------------
@@ -164,7 +164,7 @@ def apply_domain_randomization(cfg: PorcaroRLEnvCfg):
 class PorcaroRLEnvCfg_ModelA(PorcaroRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
-        self.pam_delay_cfg = PamDelayModelCfg(delay_time=0.02, time_constant=0.05)
+        self.pam_delay_cfg = PamDelayModelCfg(delay_time=0.04, time_constant=0.15)
         self.pam_hysteresis_cfg = None
         self.actuator_net_cfg = None
 

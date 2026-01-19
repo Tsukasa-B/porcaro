@@ -87,6 +87,7 @@ class PorcaroRLEnv(DirectRLEnv):
             dead_time=ctrl_cfg.dead_time,
             N=ctrl_cfg.N,
             force_map_csv=ctrl_cfg.force_map_csv,
+            force_scale=ctrl_cfg.force_scale,
             h0_map_csv=ctrl_cfg.h0_map_csv,
             use_pressure_dependent_tau=ctrl_cfg.use_pressure_dependent_tau,
             geometric_cfg=self.cfg.pam_geometric_cfg,
