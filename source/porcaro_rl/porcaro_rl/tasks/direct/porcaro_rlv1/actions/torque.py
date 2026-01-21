@@ -3,11 +3,11 @@ from __future__ import annotations
 import torch
 from .base import ActionController, RobotLike
 from .pam import (
-    PAMChannel, contraction_ratio_from_angle, calculate_effective_contraction, # <--- 追加
+    PAMChannel, contraction_ratio_from_angle, calculate_effective_contraction,
     Fpam_quasi_static, PamForceMap, H0Map
 )
-# 型ヒント用に Config を import (TYPE_CHECKING ブロック内または直接)
-from ..cfg.actuator_cfg import PamGeometricCfg # <--- 追加
+# 型ヒント用に Config を import
+from ..cfg.actuator_cfg import PamGeometricCfg
 
 class TorqueActionController(ActionController):
     def __init__(self,
@@ -36,7 +36,7 @@ class TorqueActionController(ActionController):
         self.N = float(N)
         self.force_scale = float(force_scale)
 
-        # === 変更箇所: ForceMap読み込みとデバッグ出力 ===
+        # === ForceMap読み込み ===
         print("-" * 60)
         print(f"[TorqueActionController] Initializing PAM Force Model...")
         
@@ -56,23 +56,21 @@ class TorqueActionController(ActionController):
             print("      This may cause Sim-to-Real mismatch!")
         
         print("-" * 60)
-        # ================================================
+        # ========================
 
-        self.force_map = PamForceMap.from_csv(force_map_csv) if force_map_csv else None
-        self.h0_map    = H0Map.from_csv(h0_map_csv) if h0_map_csv else None
+        # H0Map (弛み判定用) の読み込み
+        self.h0_map = H0Map.from_csv(h0_map_csv) if h0_map_csv else None
 
-        # --- 追加ブロック: 幾何学補正設定の読み込み ---
+        # --- 幾何学補正設定 ---
         if geometric_cfg is not None:
             self.use_effective_contraction = geometric_cfg.enable_slack_compensation
             self.slack_offsets = torch.tensor(geometric_cfg.wire_slack_offsets)
-            # 新手法では Config の L0 を優先使用
             self.L0_sim = geometric_cfg.natural_length 
         else:
-            # Configがない場合（または旧動作）はデフォルト値
             self.use_effective_contraction = False
             self.slack_offsets = torch.zeros(3)
-            self.L0_sim = self.L # 引数の L を使用
-        # ---------------------------------------------
+            self.L0_sim = self.L
+        # ---------------------
 
         tau_lut = None
         if use_pressure_dependent_tau:
@@ -84,13 +82,20 @@ class TorqueActionController(ActionController):
         self.ch_F  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut)
         self.ch_G  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut)
         
-        # 変更箇所: テレメトリ保存用変数の初期化
         self._last_telemetry: dict | None = None
 
     def reset(self, n_envs: int, device: str | torch.device):
         self.ch_DF.reset(n_envs, device)
         self.ch_F.reset(n_envs, device)
         self.ch_G.reset(n_envs, device)
+        
+        # --- 修正箇所: nn.Module化したマップをデバイスへ転送 ---
+        if self.force_map is not None:
+            self.force_map.to(device)
+        if self.h0_map is not None:
+            self.h0_map.to(device)
+        # ----------------------------------------------------
+
         self._last_telemetry = None
 
     def reset_idx(self, env_ids: torch.Tensor):
@@ -98,8 +103,10 @@ class TorqueActionController(ActionController):
         self.ch_F.reset_idx(env_ids)
         self.ch_G.reset_idx(env_ids)
 
-    # 変更箇所: 外部から P_cmd を計算するためのヘルパーメソッドを追加
     def compute_pressure(self, actions: torch.Tensor) -> torch.Tensor:
+        # ここでも念のためサニタイズしておく
+        actions = torch.nan_to_num(actions, nan=0.0)
+        actions = torch.clamp(actions, min=-1.0, max=1.0)
         return self._compute_command_pressure(actions)
 
     def _compute_command_pressure(self, actions: torch.Tensor) -> torch.Tensor:
@@ -127,14 +134,18 @@ class TorqueActionController(ActionController):
         wid, gid = joint_ids
         n_envs = int(q.shape[0])
 
-        # --- 追加: オフセットのデバイス同期 ---
         if self.slack_offsets.device != q.device:
             self.slack_offsets = self.slack_offsets.to(q.device)
-        # ----------------------------------
+
+        # --- 修正箇所: ActionのNaNチェックとサニタイズ ---
+        # 学習初期などにPolicyがNaNを出力した場合、シミュレーション全体をクラッシュさせないため
+        # 0.0 (中立/安全値) に置換し、範囲内にクランプする。
+        if torch.isnan(actions).any():
+            actions = torch.nan_to_num(actions, nan=0.0)
+        actions = torch.clamp(actions, min=-1.0, max=1.0)
+        # ---------------------------------------------
 
         # 1) 指令値計算
-        # ここでの actions は遅れやヒステリシス適用後の値が入ってくるため、
-        # 計算される圧力は「実際にモデルに入力される圧力 (P_out)」に相当します。
         P_cmd_stack = self._compute_command_pressure(actions)
 
         # 2) 遅れ計算
@@ -142,35 +153,30 @@ class TorqueActionController(ActionController):
         P_F  = self.ch_F.step(P_cmd_stack[:, 1])
         P_G  = self.ch_G.step(P_cmd_stack[:, 2])
 
-        # 3) 収縮率 h (epsilon) の計算 --- ここを大幅変更 ---
+        # 3) 収縮率 h (epsilon) の計算
         q_wrist = torch.rad2deg(q[:, joint_ids[0]])
         q_grip  = torch.rad2deg(q[:, joint_ids[1]])
 
         if self.use_effective_contraction:
-            # [Mode B: 新手法] 有効収縮率 (Slack考慮)
             eps_DF = calculate_effective_contraction(
                 q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0])
             eps_F = calculate_effective_contraction(
                 q_wrist, self.theta_t["F"], self.r, self.L0_sim, self.slack_offsets[1])
             eps_G = calculate_effective_contraction(
                 q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2])
-            
-            # 変数名を既存コード(h_DFなど)に合わせる
             h_DF, h_F, h_G = eps_DF, eps_F, eps_G
         else:
-            # [Mode A: 既存手法] 幾何学的収縮率 (Slack無視)
             h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L)
             h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"], self.r, self.L)
             h_G  = contraction_ratio_from_angle(q_grip, self.theta_t["G"], self.r, self.L)
-        # ---------------------------------------------------
 
         # 4) 力 F
         if self.force_map is not None:
-            F_DF = self.force_map(P_DF, h_DF) * self.force_scale  # <--- ★ 係数を掛ける
-            F_F  = self.force_map(P_F,  h_F)  * self.force_scale  # <--- ★
-            F_G  = self.force_map(P_G,  h_G)  * self.force_scale  # <--- ★
+            # resetで転送済みなのでここはエラーにならない
+            F_DF = self.force_map(P_DF, h_DF) * self.force_scale
+            F_F  = self.force_map(P_F,  h_F)  * self.force_scale
+            F_G  = self.force_map(P_G,  h_G)  * self.force_scale
         else:
-            # 数式モデルの場合も適用しておくと統一性が取れます
             F_DF = Fpam_quasi_static(P_DF, h_DF, N=self.N, Pmax=self.Pmax) * self.force_scale
             F_F  = Fpam_quasi_static(P_F,  h_F,  N=self.N, Pmax=self.Pmax) * self.force_scale
             F_G  = Fpam_quasi_static(P_G,  h_G,  N=self.N, Pmax=self.Pmax) * self.force_scale
@@ -194,8 +200,6 @@ class TorqueActionController(ActionController):
         tau_full[:, gid] = tau_g
         robot.set_joint_effort_target(tau_full)
 
-        # 変更箇所: テレメトリ保存
-        # ここでの P_cmd_stack は、ダイナミクス適用後のActionから計算されたものなので P_out として扱います
         self._last_telemetry = {
             "P_out": P_cmd_stack.clone(),
             "tau_w": tau_w.clone(),
@@ -203,5 +207,4 @@ class TorqueActionController(ActionController):
         }
     
     def get_last_telemetry(self):
-        # 変更箇所: 辞書を返すように変更
         return self._last_telemetry

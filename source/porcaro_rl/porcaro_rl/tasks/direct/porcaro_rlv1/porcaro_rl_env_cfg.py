@@ -172,6 +172,11 @@ class PorcaroRLEnvCfg_ModelA(PorcaroRLEnvCfg):
         self.pam_hysteresis_cfg = None
         self.actuator_net_cfg = None
 
+        # 2. ★二重遅れ防止: コントローラ側を理想応答(遅れゼロ)に設定
+        self.controller.tau = 0.0
+        self.controller.dead_time = 0.0
+        self.controller.use_pressure_dependent_tau = False
+
 @configclass
 class PorcaroRLEnvCfg_ModelA_DR(PorcaroRLEnvCfg_ModelA):
     """Model A + DR"""
@@ -200,6 +205,11 @@ class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
         
         self.actuator_net_cfg = None
 
+        # 3. ★二重遅れ防止: コントローラ側を理想応答(遅れゼロ)に設定
+        self.controller.tau = 0.0
+        self.controller.dead_time = 0.0
+        self.controller.use_pressure_dependent_tau = False
+
 @configclass
 class PorcaroRLEnvCfg_ModelB_DR(PorcaroRLEnvCfg_ModelB):
     """Model B + DR"""
@@ -220,6 +230,11 @@ class PorcaroRLEnvCfg_ModelC(PorcaroRLEnvCfg):
         # Model C は遅れモデルを使わないため None
         self.pam_delay_cfg = None
         self.pam_hysteresis_cfg = None
+
+        # ★コントローラ側も理想応答に設定 (ActuatorNetの予測値をそのまま使うため)
+        self.controller.tau = 0.0
+        self.controller.dead_time = 0.0
+        self.controller.use_pressure_dependent_tau = False
 
 @configclass
 class PorcaroRLEnvCfg_ModelC_DR(PorcaroRLEnvCfg_ModelC):

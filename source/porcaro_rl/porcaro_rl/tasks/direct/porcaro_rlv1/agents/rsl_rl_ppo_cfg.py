@@ -21,7 +21,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 1500
     
     save_interval = 50
-    experiment_name = "porcaro_rslrl_recurrent_lstm_120bpm" # 名前を変えておくと管理しやすいです
+    experiment_name = "porcaro_rslrl_recurrent_lstm_double" # 名前を変えておくと管理しやすいです
     
     # 💡 修正点2: PolicyクラスをRecurrentバージョンに変更
     policy = RslRlPpoActorCriticRecurrentCfg(
