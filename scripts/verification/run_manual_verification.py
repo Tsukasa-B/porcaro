@@ -1,60 +1,54 @@
+# scripts/verification/run_manual_verification.py
 """
-Porcaro Robot: Multi-Model Manual Verification Script (Sim-to-Real Ready)
-Modified for Replay Verification with Auto-Path Resolution & No-Drum Option
-(Fixed: Disabling BOTH Terminations and Timeouts, and Syncing Replay Time)
+Porcaro Robot: Multi-Model Manual Verification Script
+GUI Crash Fix Included
 """
 import argparse
 import sys
 import os
 
+# =============================================================================
+# ★最重要修正: GUIクラッシュ対策
+# Isaac Sim (Kit) のGUIと競合しないよう、Matplotlibを非表示モードに強制設定します。
+# これを他のあらゆるimportより先に書く必要があります。
+# =============================================================================
+import matplotlib
+matplotlib.use('Agg') 
+#import matplotlib.pyplot as plt
+
 # -----------------------------------------------------------------------------
-# 1. 引数定義 (ライブラリインポート前に解析が必要)
+# 1. 引数定義
 # -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="Multi-Model Verification Script")
-
-# --- 実験モード設定 ---
-parser.add_argument("--model_type", type=str, default="A", choices=["A", "B", "C"], 
-                    help="Model Type: A (Ideal/Delay), B (Hysteresis), C (ActuatorNet)")
-parser.add_argument("--dr", action="store_true", help="Enable Domain Randomization (DR)")
-parser.add_argument("--no_drum", action="store_true", help="Disable drum physics (Air Drumming)")
-
-# --- リプレイ設定 ---
-parser.add_argument("--replay_csv", type=str, default=None, 
-                    help="Filename of real data CSV (searches in external_data/jetson_project)")
-
-# --- 入力信号設定 ---
-parser.add_argument("--mode", type=str, default="double", choices=["sine", "step", "const", "double"], 
-                    help="Input signal pattern (ignored if --replay_csv is set)")
-parser.add_argument("--bpm", type=float, default=120.0, help="Beats Per Minute for 'double' mode")
-parser.add_argument("--pattern", type=str, default="1,1,0,0", help="Rhythm pattern (1=Hit, 0=Rest) for 'double' mode")
-
-# --- 圧力/アクション設定 ---
-parser.add_argument("--pressure_high", type=float, default=0.55, help="Active pressure [MPa]")
-parser.add_argument("--pressure_low", type=float, default=0.05, help="Inactive pressure [MPa]")
-parser.add_argument("--pressure_grip", type=float, default=0.3, help="Grip pressure [MPa]")
-parser.add_argument("--duty_cycle", type=float, default=0.5, help="Hit duration ratio")
-
-# --- Sine/Step 詳細設定 ---
-parser.add_argument("--freq", type=float, default=1.0, help="Frequency for Sine [Hz]")
-parser.add_argument("--amp", type=float, default=0.25, help="Amplitude for Sine")
-parser.add_argument("--offset", type=float, default=0.3, help="Offset for Sine")
-parser.add_argument("--step_interval", type=float, default=1.0, help="Interval for Step [s]")
-
-# --- 環境設定 ---
+parser.add_argument("--model_type", type=str, default="A", choices=["A", "B", "C"])
+parser.add_argument("--dr", action="store_true")
+parser.add_argument("--no_drum", action="store_true")
+parser.add_argument("--replay_csv", type=str, default=None)
+parser.add_argument("--mode", type=str, default="double", choices=["sine", "step", "const", "double"])
+parser.add_argument("--bpm", type=float, default=120.0)
+parser.add_argument("--pattern", type=str, default="1,1,0,0")
+parser.add_argument("--pressure_high", type=float, default=0.55)
+parser.add_argument("--pressure_low", type=float, default=0.05)
+parser.add_argument("--pressure_grip", type=float, default=0.3)
+parser.add_argument("--duty_cycle", type=float, default=0.5)
+parser.add_argument("--freq", type=float, default=1.0)
+parser.add_argument("--amp", type=float, default=0.25)
+parser.add_argument("--offset", type=float, default=0.3)
+parser.add_argument("--step_interval", type=float, default=1.0)
 parser.add_argument("--num_envs", type=int, default=1)
-parser.add_argument("--headless", action="store_true", help="Run without GUI")
+parser.add_argument("--headless", action="store_true")
 
 args, unknown = parser.parse_known_args()
 
 # -----------------------------------------------------------------------------
-# 2. App起動 (ここが最重要！他のライブラリより先に実行)
+# 2. App起動
 # -----------------------------------------------------------------------------
 from isaaclab.app import AppLauncher
 app_launcher = AppLauncher(headless=args.headless)
 simulation_app = app_launcher.app
 
 # -----------------------------------------------------------------------------
-# 3. その他ライブラリのインポート (App起動後に移動)
+# 3. その他ライブラリ (App起動後にimport)
 # -----------------------------------------------------------------------------
 import traceback
 import torch
@@ -77,7 +71,7 @@ except Exception as e:
 
 
 # -----------------------------------------------------------------------------
-# 4. エージェントクラス (時系列補間機能付き・修正版)
+# 4. エージェントクラス
 # -----------------------------------------------------------------------------
 class SignalGeneratorAgent:
     def __init__(self, num_envs, dt, device, args):
@@ -97,7 +91,6 @@ class SignalGeneratorAgent:
             self._init_pattern_mode(args)
 
     def _init_replay(self, csv_filename):
-        # ファイル探索
         candidates = [
             csv_filename,
             os.path.join("external_data", "jetson_project", csv_filename),
@@ -118,19 +111,14 @@ class SignalGeneratorAgent:
         print(f"\n[Agent] REPLAY MODE: Loading {final_path} ...")
         try:
             df = pd.read_csv(final_path)
-            
-            # --- 【修正】データのサニタイズ（時系列異常の防止） ---
             df = df.sort_values(by='timestamp')
             df = df.drop_duplicates(subset='timestamp', keep='first')
             
-            # タイムスタンプを0始まりに正規化
             t_real = df['timestamp'].values
             t_real = t_real - t_real[0]
             
-            # 指令値データの抽出
             cmd_data = df[['cmd_DF', 'cmd_F', 'cmd_G']].values
 
-            # --- 【修正】 線形補間関数の作成 ---
             self.replay_interpolator = interp1d(
                 t_real, cmd_data, axis=0, kind='linear', 
                 bounds_error=False, fill_value=(cmd_data[0], cmd_data[-1])
@@ -150,7 +138,6 @@ class SignalGeneratorAgent:
         print(f"\n[Agent] Mode: {args.mode}")
 
     def _pressure_to_action(self, p_mpa):
-        # 圧力(0~0.6) を Action(-1~1) に変換
         p = np.clip(p_mpa, 0.0, self.P_MAX)
         return 2.0 * (p / self.P_MAX) - 1.0
 
@@ -161,8 +148,6 @@ class SignalGeneratorAgent:
             if self.t > self.max_replay_time + 0.5:
                 self.replay_finished = True
                 return torch.zeros((self.num_envs, 3), device=self.device)
-            
-            # 補間の実行
             cmds = self.replay_interpolator(self.t)
             p_df, p_f, p_g = cmds[0], cmds[1], cmds[2]
 
@@ -223,23 +208,16 @@ def main():
         env_cfg.scene.num_envs = args.num_envs
         env_cfg.controller.control_mode = "pressure" 
         
-        # -------------------------------------------------------------
-        # [タイムアウト無効化] 
-        # -------------------------------------------------------------
-        print("[System] Extending episode length to avoid timeout reset.")
         env_cfg.episode_length_s = 1000.0
-        
         if hasattr(env_cfg, "terminations"):
             env_cfg.terminations = None
             
-        # --- ドラム退避 (No Drum) ---
         if args.no_drum:
             if hasattr(env_cfg, "drum_cfg"):
                 env_cfg.drum_cfg.init_state.pos = (0.0, 0.0, -10.0)
             elif hasattr(env_cfg.scene, "drum"):
                 env_cfg.scene.drum.init_state.pos = (0.0, 0.0, -10.0)
 
-        # --- ログ設定 ---
         dr_str = "DR" if args.dr else "Ideal"
         if args.replay_csv:
             base_csv = os.path.splitext(os.path.basename(args.replay_csv))[0]
@@ -253,27 +231,19 @@ def main():
 
         print(f"[System] Log file: {log_name}")
 
+        # 環境の初期化
         env = PorcaroRLEnv(cfg=env_cfg)
         
-        # ---------------------------------------------------------------------
-        # 【修正】 DT計算ロジック： デシメーションズレを防止
-        # ---------------------------------------------------------------------
-        # 1. DirectRLEnvの step_dt プロパティがあればそれを信じる
         if hasattr(env, "step_dt"):
              dt_step = env.step_dt
-             print(f"[System] Using env.step_dt: {dt_step:.5f}s")
         else:
-             # 2. なければ計算。ただし decimation が 1 になっている可能性を警戒
              sim_dt = env.cfg.sim.dt
-             decimation = getattr(env.cfg, "decimation", 4) # Default to 4 if missing
+             decimation = getattr(env.cfg, "decimation", 4)
              dt_step = sim_dt * decimation
-             print(f"[System] Calculated dt: {dt_step:.5f}s (sim_dt={sim_dt} * dec={decimation})")
+             print(f"[System] Calculated dt: {dt_step:.5f}s")
 
-        # 【安全策】 dt_step が極端に小さい(0.01未満)場合は、制御周波数50Hz(0.02s)に強制補正
-        # 「波形が4倍伸びる」現象はここが 0.005s になっているのが原因
         if dt_step < 0.01:
-            print(f"\n[WARNING] dt_step ({dt_step:.5f}s) is too small! Likely decimation mismatch.")
-            print(f"[WARNING] Forcing dt_step = 0.02s (50Hz) to sync with real robot data.")
+            print(f"[WARNING] dt_step too small. Forcing 0.02s.")
             dt_step = 0.02
 
         agent = SignalGeneratorAgent(env.num_envs, dt_step, env.device, args)

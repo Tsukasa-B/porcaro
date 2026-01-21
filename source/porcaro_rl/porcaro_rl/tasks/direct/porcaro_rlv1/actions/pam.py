@@ -10,7 +10,7 @@ from .pneumatic import(
     FractionalDelay,
     interp1d_clamp_torch,
     interp2d_bilinear,
-    get_2d_tables, # <--- 追加: データ取得用関数
+    get_2d_tables,
 )
 
 
@@ -79,14 +79,50 @@ def contraction_ratio_from_angle(theta: torch.Tensor, theta_t_deg: float, r: flo
     theta_t = math.radians(theta_t_deg)
     return (r / L) * torch.abs(theta - theta_t)
 
-def calculate_effective_contraction(theta_deg, theta_t_deg, r, L0, slack_offset):
+# --- [変更] clamp引数を追加 ---
+def calculate_effective_contraction(theta_deg, theta_t_deg, r, L0, 
+                                    slack_offset, pressure: torch.Tensor = 0.0, 
+                                    shrink_gain: float = 0.0, clamp: bool = True):
     theta_rad = torch.deg2rad(theta_deg)
     theta_t_rad = math.radians(theta_t_deg)
     delta_geo = r * torch.abs(theta_rad - theta_t_rad)
     L_geo = L0 - delta_geo
-    L_eff = L_geo + slack_offset
+    
+    # ★修正ロジック: 圧力が上がるとオフセット(たるみ)が減る
+    # pressureは Tensorの場合があるので注意
+    dynamic_offset = slack_offset - (shrink_gain * pressure)
+    
+    L_eff = L_geo + dynamic_offset
     epsilon = (L0 - L_eff) / L0
-    return torch.clamp(epsilon, min=0.0)
+    
+    if clamp:
+        return torch.clamp(epsilon, min=0.0)
+    else:
+        return epsilon
+
+# --- [新規追加] Soft Engagement ロジック ---
+def apply_soft_engagement(force: torch.Tensor, epsilon: torch.Tensor, smoothness: float = 100.0) -> torch.Tensor:
+    """
+    [修正版v2] 2乗カーブによるSoft Engagement
+    epsilon <= 0 で完全0。
+    epsilon > 0 で 2乗カーブを描いて立ち上がる（初期の衝撃がSigmoidより小さい）。
+    """
+    # 1. 負の値を0にする (ReLU)
+    positive_epsilon = torch.clamp(epsilon, min=0.0)
+    
+    # 2. Smoothnessを掛けて 0~1 にクリップする
+    #    例: smoothness=100 なら、epsilon=0.01(1%)で x=1.0 (Saturation)
+    #    もっと緩やかにしたい場合は smoothness を 20~50 に下げてください
+    x = torch.clamp(positive_epsilon * smoothness, max=1.0)
+    
+    # 3. 2乗カーブ (0付近の傾きが0になる = 衝撃がない)
+    #    x=0.1 -> mask=0.01 (1%)
+    #    x=0.5 -> mask=0.25 (25%)
+    #    x=1.0 -> mask=1.00 (100%)
+    engagement_mask = x * x 
+    
+    return force * engagement_mask
+
 
 @torch.no_grad()
 def Fpam_quasi_static(P: torch.Tensor, h: torch.Tensor, N: float = 1200.0, Pmax: float = 0.6) -> torch.Tensor:

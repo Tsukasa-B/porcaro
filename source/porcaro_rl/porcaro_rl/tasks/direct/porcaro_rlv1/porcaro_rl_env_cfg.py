@@ -79,7 +79,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # デフォルトは True (有効収縮率を使用) とし、オフセットは 0 (影響なし) で初期化
     pam_geometric_cfg: PamGeometricCfg = PamGeometricCfg(
         enable_slack_compensation=True,
-        wire_slack_offsets=(-0.00504, -0.01146, -0.00357), # 後でキャリブレーション値をここに入れます 0.00x mのワイヤーが正しく貼るまでの長さ
+        wire_slack_offsets=(0.00504, 0.01146, 0.00357), # 後でキャリブレーション値をここに入れます 0.00x mのワイヤーが正しく貼るまでの長さ
         natural_length=0.150
     )
     # --------------------------

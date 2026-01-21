@@ -4,7 +4,8 @@ import torch
 from .base import ActionController, RobotLike
 from .pam import (
     PAMChannel, contraction_ratio_from_angle, calculate_effective_contraction,
-    Fpam_quasi_static, PamForceMap, H0Map
+    Fpam_quasi_static, PamForceMap, H0Map,
+    apply_soft_engagement  # <--- [追加]
 )
 # 型ヒント用に Config を import
 from ..cfg.actuator_cfg import PamGeometricCfg
@@ -15,7 +16,7 @@ class TorqueActionController(ActionController):
                  control_mode: str = "ep", 
                  r: float = 0.014, L: float = 0.150,
                  theta_t_DF_deg: float = 0.0,
-                 theta_t_F_deg:  float = -90.0,
+                 theta_t_F_deg:  float = -60.0,
                  theta_t_G_deg:  float = -45.0,
                  Pmax: float = 0.6,
                  tau: float = 0.09, dead_time: float = 0.03,
@@ -24,7 +25,9 @@ class TorqueActionController(ActionController):
                  force_scale: float = 1.0,
                  h0_map_csv: str | None = None,
                  use_pressure_dependent_tau: bool = True,
-                 geometric_cfg: PamGeometricCfg | None = None):
+                 geometric_cfg: PamGeometricCfg | None = None,
+                 pressure_shrink_gain: float = 0.02, 
+                 engagement_smoothness: float = 100.0):
 
         self.dt_ctrl = float(dt_ctrl)
         self.control_mode = control_mode
@@ -35,6 +38,7 @@ class TorqueActionController(ActionController):
         self.Pmax = float(Pmax)
         self.N = float(N)
         self.force_scale = float(force_scale)
+        self.engagement_smoothness = float(engagement_smoothness) # <--- [追加] 保存
 
         # === ForceMap読み込み ===
         print("-" * 60)
@@ -83,6 +87,7 @@ class TorqueActionController(ActionController):
         self.ch_G  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut)
         
         self._last_telemetry: dict | None = None
+        self.pressure_shrink_gain = float(pressure_shrink_gain)
 
     def reset(self, n_envs: int, device: str | torch.device):
         self.ch_DF.reset(n_envs, device)
@@ -137,7 +142,6 @@ class TorqueActionController(ActionController):
 
         # --- 2. ★追加: 圧力の量子化 (Quantization) ---
         # 0.05 MPa 刻みに丸め込む処理
-        # ロジック: round( 値 / 0.05 ) * 0.05
         STEP_SIZE = 0.05
         P_cmd_quantized = torch.round(P_cmd_stack / STEP_SIZE) * STEP_SIZE
 
@@ -154,8 +158,6 @@ class TorqueActionController(ActionController):
             self.slack_offsets = self.slack_offsets.to(q.device)
 
         # --- 修正箇所: ActionのNaNチェックとサニタイズ ---
-        # 学習初期などにPolicyがNaNを出力した場合、シミュレーション全体をクラッシュさせないため
-        # 0.0 (中立/安全値) に置換し、範囲内にクランプする。
         if torch.isnan(actions).any():
             actions = torch.nan_to_num(actions, nan=0.0)
         actions = torch.clamp(actions, min=-1.0, max=1.0)
@@ -174,21 +176,45 @@ class TorqueActionController(ActionController):
         q_grip  = torch.rad2deg(q[:, joint_ids[1]])
 
         if self.use_effective_contraction:
+            # ★修正: 圧力とゲインを渡す
             eps_DF = calculate_effective_contraction(
-                q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0])
+                q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0], 
+                pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False)
+            
             eps_F = calculate_effective_contraction(
-                q_wrist, self.theta_t["F"], self.r, self.L0_sim, self.slack_offsets[1])
+                q_wrist, self.theta_t["F"], self.r, self.L0_sim, self.slack_offsets[1], 
+                pressure=P_F, shrink_gain=self.pressure_shrink_gain, clamp=False)
+            
             eps_G = calculate_effective_contraction(
-                q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2])
-            h_DF, h_F, h_G = eps_DF, eps_F, eps_G
+                q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2], 
+                pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False)
+            
+            # Soft Engagement用の生データ保持
+            raw_eps_DF, raw_eps_F, raw_eps_G = eps_DF, eps_F, eps_G
+
+        #                 # ★追加: この行を入れて、epsilonの値を確認する
+        # # 負の値になっていなければ、Slack Offsetが足りていません！
+        #     if n_envs > 0:
+        #         print(f"Epsilon DF: {raw_eps_DF[0].item():.4f}")
+
+            # 力計算用には負の値を0にクランプしておく（Map参照エラー防止）
+            h_DF = torch.clamp(eps_DF, min=0.0)
+            h_F  = torch.clamp(eps_F,  min=0.0)
+            h_G  = torch.clamp(eps_G,  min=0.0)
         else:
             h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L)
             h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"], self.r, self.L)
             h_G  = contraction_ratio_from_angle(q_grip, self.theta_t["G"], self.r, self.L)
+            # 生の値も同じにしておく
+            raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
 
-        # 4) 力 F
+            # ★追加: この行を入れて、epsilonの値を確認する
+        # # 負の値になっていなければ、Slack Offsetが足りていません！
+        #     if n_envs > 0:
+        #         print(f"Epsilon DF: {raw_eps_DF[0].item():.4f}")
+
+        # 4) 力 F (理想値)
         if self.force_map is not None:
-            # resetで転送済みなのでここはエラーにならない
             F_DF = self.force_map(P_DF, h_DF) * self.force_scale
             F_F  = self.force_map(P_F,  h_F)  * self.force_scale
             F_G  = self.force_map(P_G,  h_G)  * self.force_scale
@@ -197,7 +223,14 @@ class TorqueActionController(ActionController):
             F_F  = Fpam_quasi_static(P_F,  h_F,  N=self.N, Pmax=self.Pmax) * self.force_scale
             F_G  = Fpam_quasi_static(P_G,  h_G,  N=self.N, Pmax=self.Pmax) * self.force_scale
 
-        # 4.5) 弛み判定
+        # --- [新規追加] Soft Engagement の適用 ---
+        # 有効収縮率を使っている場合のみ、滑らかな係合を適用する
+        if self.use_effective_contraction:
+            F_DF = apply_soft_engagement(F_DF, raw_eps_DF, self.engagement_smoothness)
+            F_F  = apply_soft_engagement(F_F,  raw_eps_F,  self.engagement_smoothness)
+            F_G  = apply_soft_engagement(F_G,  raw_eps_G,  self.engagement_smoothness)
+
+        # 4.5) 弛み判定 (既存の h0_map: 圧力起因の不感帯)
         if self.h0_map is not None:
             h0_DF = self.h0_map(P_DF)
             h0_F  = self.h0_map(P_F)
