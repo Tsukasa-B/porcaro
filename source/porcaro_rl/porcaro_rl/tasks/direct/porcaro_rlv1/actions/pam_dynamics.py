@@ -1,8 +1,14 @@
+# source/porcaro_rl/porcaro_rl/tasks/direct/porcaro_rlv1/actions/pam_dynamics.py
 from __future__ import annotations
 import torch
 import torch.nn as nn
-import math
 from typing import TYPE_CHECKING
+from .pneumatic import (
+    interp2d_bilinear, 
+    get_2d_tables, 
+    FractionalDelay, 
+    first_order_lag
+)
 
 if TYPE_CHECKING:
     from ..cfg.actuator_cfg import PamDelayModelCfg, PamHysteresisModelCfg, ActuatorNetModelCfg
@@ -10,6 +16,7 @@ if TYPE_CHECKING:
 class PamDelayModel(nn.Module):
     """
     空気圧の伝送遅れ(可変)と応答遅れ(可変)を模擬するモデル
+    pneumatic.py のロジックをラップして nn.Module 化したもの。
     """
     def __init__(self, cfg: PamDelayModelCfg, dt: float, device: str):
         super().__init__()
@@ -17,104 +24,58 @@ class PamDelayModel(nn.Module):
         self.dt = dt
         self.device = device
         
-        # --- LUTの登録 (Tau & Deadtime) ---
-        # Tau (時定数)
-        self.register_buffer('tau_p_axis', torch.tensor(
-            self.cfg.tau_pressure_axis if self.cfg.tau_pressure_axis else [0.0, 1.0], 
-            dtype=torch.float32, device=self.device
-        ))
-        self.register_buffer('tau_vals', torch.tensor(
-            self.cfg.tau_values if self.cfg.tau_values else [self.cfg.time_constant]*2, 
-            dtype=torch.float32, device=self.device
-        ))
-
-        # Deadtime (むだ時間)
-        self.register_buffer('dead_p_axis', torch.tensor(
-            self.cfg.deadtime_pressure_axis if self.cfg.deadtime_pressure_axis else [0.0, 1.0], 
-            dtype=torch.float32, device=self.device
-        ))
-        self.register_buffer('dead_vals', torch.tensor(
-            self.cfg.deadtime_values if self.cfg.deadtime_values else [self.cfg.delay_time]*2, 
-            dtype=torch.float32, device=self.device
-        ))
-
-        # --- リングバッファ設定 ---
-        # 最大遅延時間からバッファサイズを決定
-        max_delay = self.cfg.max_delay_time
-        self.buffer_len = math.ceil(max_delay / self.dt) + 2  # 余裕を持たせる
+        # --- モード判定 ---
+        tau_vals = self.cfg.tau_values if self.cfg.tau_values else [self.cfg.time_constant]
+        dead_vals = self.cfg.deadtime_values if self.cfg.deadtime_values else [self.cfg.delay_time]
+        self.is_scalar_mode = (len(tau_vals) <= 1 and len(dead_vals) <= 1)
         
-        self.pressure_buffer = None   # Shape: [num_envs, num_channels, buffer_len]
-        self.write_ptr = 0            # 書き込み位置 (int)
-        self.current_pressure = None  # フィルタ出力
+        if self.is_scalar_mode:
+            self.fixed_tau = float(tau_vals[0])
+            self.fixed_dead = float(dead_vals[0])
+        else:
+            # Shared Data from pneumatic module
+            self._tau_2d, self._dead_2d, self._p_axis_2d = get_2d_tables(self.device)
+            # 永続化バッファとして登録（保存・ロード対応）
+            self.register_buffer('tau_table', self._tau_2d)
+            self.register_buffer('dead_table', self._dead_2d)
+            self.register_buffer('p_axis', self._p_axis_2d)
 
-    def _init_buffers(self, num_envs: int, num_channels: int):
-        self.pressure_buffer = torch.zeros((num_envs, num_channels, self.buffer_len), device=self.device)
-        self.current_pressure = torch.zeros((num_envs, num_channels), device=self.device)
-        self.write_ptr = 0
+        # --- 共通モジュールの利用 ---
+        # FractionalDelayは状態を持つがnn.Moduleではないため、ここでインスタンス化
+        # バッファの確保は初回forwardまたはreset_idxで行われる
+        self.delay_proc = FractionalDelay(self.dt, L_max=self.cfg.max_delay_time)
+        
+        # 状態変数
+        self.current_pressure = None
 
     def reset_idx(self, env_ids: torch.Tensor):
-        if self.pressure_buffer is not None:
-            self.pressure_buffer[env_ids] = 0.0
+        if self.current_pressure is not None:
             self.current_pressure[env_ids] = 0.0
-
-    def _interp_lut(self, x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor) -> torch.Tensor:
-        """汎用LUT線形補間"""
-        x_clamped = x.clamp(min=xp[0], max=xp[-1])
-        idx = torch.bucketize(x_clamped, xp).clamp(1, len(xp)-1)
-        x0, x1 = xp[idx-1], xp[idx]
-        f0, f1 = fp[idx-1], fp[idx]
-        t = (x_clamped - x0) / (x1 - x0 + 1e-12)
-        return f0 + t * (f1 - f0)
+        # pneumatic.FractionalDelay のリセット機能を呼ぶ
+        self.delay_proc.reset_idx(env_ids)
 
     def forward(self, target_pressure: torch.Tensor) -> torch.Tensor:
-        # 初回初期化
-        if self.pressure_buffer is None:
-            self._init_buffers(target_pressure.shape[0], target_pressure.shape[1])
-            
-        # 1. 現在の指令圧に基づいて「遅延時間 L」と「時定数 Tau」を決定
-        #    (遅延や時定数は入力圧の大きさで変わる非線形性を持つため)
-        L = self._interp_lut(target_pressure, self.dead_p_axis, self.dead_vals)
-        tau = self._interp_lut(target_pressure, self.tau_p_axis, self.tau_vals)
-        
-        # 2. リングバッファへの書き込み
-        self.pressure_buffer[:, :, self.write_ptr] = target_pressure
-        
-        # 3. 可変遅延読み出し (Fractional Delay)
-        #    遅延ステップ数 D = L / dt
-        D = (L / self.dt).clamp(min=0.0, max=self.buffer_len - 2.0)
-        
-        #    読み出し位置 (float) = 現在位置 - 遅延ステップ
-        #    バッファが循環するため modulo 計算が必要
-        read_idx_float = (self.write_ptr - D) % self.buffer_len
-        
-        #    線形補間読み出し
-        idx0 = torch.floor(read_idx_float).long()
-        idx1 = (idx0 + 1) % self.buffer_len
-        alpha_idx = read_idx_float - idx0
-        
-        #    バッチ一括取得のために gather を使う手もあるが、インデックスアクセスで十分
-        #    [num_envs, num_channels]
-        val0 = self.pressure_buffer[:, :, idx0].clone() # 形状注意: gatherが必要な場合は工夫要
-        #    上記インデックスアクセスは全バッチ共通インデックスなら動くが、
-        #    遅延 D がバッチ(圧力)ごとに異なるため、advanced indexingが必要
-        
-        #    --- Advanced Indexing for Batch-Varying Delay ---
-        #    idx0, idx1 は [num_envs, num_channels] の形状を持つ
-        #    pressure_buffer は [num_envs, num_channels, buffer_len]
-        
-        #    次元を合わせるために gather を使用
-        val0 = self.pressure_buffer.gather(2, idx0.unsqueeze(2)).squeeze(2)
-        val1 = self.pressure_buffer.gather(2, idx1.unsqueeze(2)).squeeze(2)
-        
-        delayed_input = (1.0 - alpha_idx) * val0 + alpha_idx * val1
-        
-        # 4. 1次遅れフィルタの更新 (可変Tauを使用)
-        #    alpha = dt / (tau + dt)
-        alpha_filter = self.dt / (tau + self.dt)
-        self.current_pressure = (1.0 - alpha_filter) * self.current_pressure + alpha_filter * delayed_input
-        
-        # 5. ポインタ更新
-        self.write_ptr = (self.write_ptr + 1) % self.buffer_len
+        # 初回初期化 (バッファ未確保時)
+        if self.delay_proc.buf is None:
+             self.delay_proc.reset(target_pressure.shape, self.device)
+        if self.current_pressure is None:
+             self.current_pressure = torch.zeros_like(target_pressure)
+
+        # 1. パラメータ(L, Tau) の決定
+        if self.is_scalar_mode:
+            L = torch.full_like(target_pressure, self.fixed_dead)
+            tau = torch.full_like(target_pressure, self.fixed_tau)
+        else:
+            # Current pressure state for lookup
+            P_curr = self.current_pressure.detach() 
+            tau = interp2d_bilinear(self.p_axis, self.p_axis, self.tau_table, 
+                                  x_query=target_pressure, y_query=P_curr)
+            L = interp2d_bilinear(self.p_axis, self.p_axis, self.dead_table, 
+                                  x_query=target_pressure, y_query=P_curr)
+
+        # 2. 共通ロジックによる遅延とフィルタ
+        P_delayed = self.delay_proc.step(target_pressure, L)
+        self.current_pressure = first_order_lag(P_delayed, self.current_pressure, tau, self.dt)
         
         return self.current_pressure
 

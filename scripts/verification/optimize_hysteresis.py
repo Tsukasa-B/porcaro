@@ -1,166 +1,203 @@
-# scripts/verification/optimize_hysteresis.py
-import torch
-import torch.nn as nn
-import math
+import os
+import glob
 import pandas as pd
 import numpy as np
+import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
-import os
+from scipy.optimize import minimize
 from dataclasses import dataclass
 
-# ==========================================
-# 1. Config & Model Definitions (Standalone)
-# ==========================================
-@dataclass
-class PamDelayModelCfg:
-    tau_pressure_axis: tuple = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
-    tau_values: tuple = (0.043, 0.045, 0.060, 0.066, 0.094, 0.131)
-    deadtime_pressure_axis: tuple = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
-    deadtime_values: tuple = (0.038, 0.035, 0.032, 0.030, 0.023, 0.023)
-    max_delay_time: float = 0.1
-    delay_time: float = 0.04  
-    time_constant: float = 0.15
+# =========================================================
+#  Standalone Definitions (To avoid Isaac Lab dependencies)
+# =========================================================
 
 @dataclass
 class PamHysteresisModelCfg:
+    """PAMのヒステリシスモデル設定"""
     hysteresis_width: float = 0.1
     curve_shape_param: float = 2.0
 
-class PamDelayModel(nn.Module):
-    def __init__(self, cfg: PamDelayModelCfg, dt: float, device: str):
-        super().__init__()
-        self.cfg = cfg
-        self.dt = dt
-        self.device = device
-        self.register_buffer('tau_p_axis', torch.tensor(self.cfg.tau_pressure_axis, dtype=torch.float32))
-        self.register_buffer('tau_vals', torch.tensor(self.cfg.tau_values, dtype=torch.float32))
-        self.register_buffer('dead_p_axis', torch.tensor(self.cfg.deadtime_pressure_axis, dtype=torch.float32))
-        self.register_buffer('dead_vals', torch.tensor(self.cfg.deadtime_values, dtype=torch.float32))
-        self.buffer_len = math.ceil(self.cfg.max_delay_time / self.dt) + 2
-        self.pressure_buffer = None
-        self.write_ptr = 0
-        self.current_pressure = None
-
-    def _init_buffers(self, num_envs, num_channels):
-        self.pressure_buffer = torch.zeros((num_envs, num_channels, self.buffer_len), device=self.device)
-        self.current_pressure = torch.zeros((num_envs, num_channels), device=self.device)
-        self.write_ptr = 0
-
-    def _interp_lut(self, x, xp, fp):
-        x_clamped = x.clamp(min=xp[0], max=xp[-1])
-        idx = torch.bucketize(x_clamped, xp).clamp(1, len(xp)-1)
-        x0, x1 = xp[idx-1], xp[idx]
-        f0, f1 = fp[idx-1], fp[idx]
-        t = (x_clamped - x0) / (x1 - x0 + 1e-12)
-        return f0 + t * (f1 - f0)
-
-    def forward(self, target_pressure):
-        if self.pressure_buffer is None: self._init_buffers(target_pressure.shape[0], target_pressure.shape[1])
-        L = self._interp_lut(target_pressure, self.dead_p_axis, self.dead_vals)
-        tau = self._interp_lut(target_pressure, self.tau_p_axis, self.tau_vals)
-        self.pressure_buffer[:, :, self.write_ptr] = target_pressure
-        D = (L / self.dt).clamp(min=0.0, max=self.buffer_len - 2.0)
-        read_idx_float = (self.write_ptr - D) % self.buffer_len
-        idx0 = torch.floor(read_idx_float).long()
-        idx1 = (idx0 + 1) % self.buffer_len
-        alpha_idx = read_idx_float - idx0
-        val0 = self.pressure_buffer.gather(2, idx0.unsqueeze(2)).squeeze(2)
-        val1 = self.pressure_buffer.gather(2, idx1.unsqueeze(2)).squeeze(2)
-        delayed_input = (1.0 - alpha_idx) * val0 + alpha_idx * val1
-        alpha_filter = self.dt / (tau + self.dt)
-        self.current_pressure = (1.0 - alpha_filter) * self.current_pressure + alpha_filter * delayed_input
-        self.write_ptr = (self.write_ptr + 1) % self.buffer_len
-        return self.current_pressure
-
 class PamHysteresisModel(nn.Module):
-    def __init__(self, cfg: PamHysteresisModelCfg, device: str):
+    """
+    Additive Hysteresis Model (Play Operator)
+    圧力に対する「摩擦（一定の圧力幅）」を再現するモデル
+    (porcaro_rl/actions/pam_dynamics.py からロジックを抜粋)
+    """
+    def __init__(self, cfg: PamHysteresisModelCfg, device: str = 'cpu'):
         super().__init__()
         self.cfg = cfg
+        self.device = device
         self.last_output = None
-    
-    def reset_idx(self, env_ids):
-        if self.last_output is not None: self.last_output[env_ids] = 0.0
 
-    def forward(self, x):
-        if self.last_output is None or self.last_output.shape != x.shape: self.last_output = x.clone()
+    def reset_idx(self, env_ids: torch.Tensor):
+        if self.last_output is not None:
+            self.last_output[env_ids] = 0.0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Play Operator Logic:
+        y(t) = min( x(t) + r, max( x(t) - r, y(t-1) ) )
+        """
+        # 初回初期化: 入力値に合わせて初期化
+        if self.last_output is None or self.last_output.shape != x.shape:
+            self.last_output = x.clone()
+
+        # ヒステリシス幅 (全幅) から 半幅 (r) を計算
         r = self.cfg.hysteresis_width / 2.0
-        output = torch.max(x - r, torch.min(x + r, self.last_output))
+        
+        # Play Operator 計算
+        lower_bound = x - r
+        upper_bound = x + r
+        
+        # 前回の値を上下限でクリップする
+        output = torch.max(lower_bound, torch.min(upper_bound, self.last_output))
+        
+        # 状態更新
         self.last_output = output.clone()
+        
         return output
 
-# ==========================================
-# 2. Optimization Logic
-# ==========================================
-CSV_PATH = "external_data/jetson_project/01-11-hysteresis.csv"
-DT = 0.01
+# =========================================================
+#  Main Optimization Script
+# =========================================================
 
-def run_sweep():
-    if not os.path.exists(CSV_PATH):
-        print("CSV not found.")
+# --- 設定 ---
+DATA_DIR = "./external_data/jetson_project"
+TARGET_FREQ = "0.5Hz" # 準静的パラメータを決めるため、最も低速なデータを使用
+
+def load_data():
+    # ファイル検索
+    pattern = os.path.join(DATA_DIR, f"data_exp2_hysteresis_{TARGET_FREQ}_*.csv")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        # パスが見つからない場合のフォールバック（カレントディレクトリ確認）
+        print(f"[WARN] No files found in {pattern}. Checking current dir...")
+        files = sorted(glob.glob(f"data_exp2_hysteresis_{TARGET_FREQ}_*.csv"))
+        if not files:
+            raise FileNotFoundError(f"No files found for {TARGET_FREQ}")
+    
+    target_file = files[-1]
+    print(f"[INFO] Loading: {target_file}")
+    df = pd.read_csv(target_file)
+    
+    # 安定した後半データを使用 (最初の20%をカット)
+    start_idx = int(len(df) * 0.2)
+    df = df.iloc[start_idx:].reset_index(drop=True)
+    
+    # 入力: 差圧 (P_DF - P_F)
+    # 出力: 角度 (Angle)
+    u_data = (df['meas_pres_DF'] - df['meas_pres_F']).values
+    y_data = df['meas_ang_wrist'].values
+    
+    return u_data, y_data
+
+def run_model(width, u_tensor, device='cpu'):
+    """指定されたwidthでモデルを実行"""
+    cfg = PamHysteresisModelCfg(hysteresis_width=float(width))
+    model = PamHysteresisModel(cfg, device=device)
+    
+    # 時系列シミュレーション
+    # (Play Operatorは履歴依存なのでシーケンシャルに計算)
+    
+    # バッチサイズ1として処理するため次元追加せずにループで回す（可読性重視）
+    # 初期化: 最初の入力値を初期状態とする
+    model.last_output = torch.tensor([u_tensor[0]], dtype=torch.float32, device=device)
+    
+    h_vals = []
+    # 高速化のため torch.no_grad は外側で適用済み前提
+    for t in range(len(u_tensor)):
+        x_t = u_tensor[t:t+1] # shape [1]
+        h_t = model(x_t)
+        h_vals.append(h_t.item())
+        
+    return np.array(h_vals)
+
+def objective_function(params, u_data, y_data):
+    """最小化する目的関数 (MSE)"""
+    width = params[0]
+    scale = params[1] # 角度への変換ゲイン
+    bias = params[2]  # オフセット
+    
+    if width < 0: return 1e9 # 制約
+    
+    u_tensor = torch.tensor(u_data, dtype=torch.float32)
+    h_eff = run_model(width, u_tensor)
+    
+    # 線形回帰: y_pred = scale * h_eff + bias
+    y_pred = scale * h_eff + bias
+    
+    mse = np.mean((y_data - y_pred)**2)
+    return mse
+
+def main():
+    try:
+        u_data, y_data = load_data()
+    except FileNotFoundError as e:
+        print(f"[ERROR] {e}")
         return
 
-    df = pd.read_csv(CSV_PATH)
-    cmd_data = torch.tensor(df[['cmd_DF', 'cmd_F', 'cmd_G']].values, dtype=torch.float32)
-    meas_data = torch.tensor(df[['meas_pres_DF', 'meas_pres_F', 'meas_pres_G']].values, dtype=torch.float32)
+    print(f"[INFO] Optimizing hysteresis parameters for {len(u_data)} steps...")
     
-    # 探索範囲: 0.00 (Model A相当) 〜 0.15
-    widths = np.linspace(0.00, 0.15, 31) 
-    rmses = []
+    # 初期値推定 [width, scale, bias]
+    # width: 0.1 (MPa), scale: 100 (deg/MPa), bias: -30 (deg)
+    initial_guess = [0.1, 100.0, -30.0]
     
-    best_rmse = float('inf')
-    best_width = 0.0
-
-    print(f"Starting sweep on {len(widths)} points...")
-
-    for w in widths:
-        # モデル初期化
-        cfg_hys = PamHysteresisModelCfg(hysteresis_width=w)
-        cfg_delay = PamDelayModelCfg()
-        
-        model_hys = PamHysteresisModel(cfg_hys, "cpu")
-        model_delay = PamDelayModel(cfg_delay, DT, "cpu")
-        model_delay._init_buffers(1, 3)
-
-        # シミュレーションループ
-        preds = []
-        for t in range(len(cmd_data)):
-            u = cmd_data[t].unsqueeze(0)
-            val = model_hys(u)
-            out = model_delay(val)
-            preds.append(out.squeeze(0).clone())
-        
-        pred_tensor = torch.stack(preds)
-        
-        # DF(背屈)のみで評価
-        rmse = torch.sqrt(torch.mean((pred_tensor[:, 0] - meas_data[:, 0])**2)).item()
-        rmses.append(rmse)
-        
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_width = w
-
-    # 結果表示
-    print(f"\n=== Optimization Result ===")
-    print(f"Best Hysteresis Width: {best_width:.4f}")
-    print(f"Best RMSE: {best_rmse:.5f}")
+    # 最適化実行 (Nelder-Mead法)
+    result = minimize(
+        objective_function, 
+        initial_guess, 
+        args=(u_data, y_data),
+        method='Nelder-Mead',
+        tol=1e-4
+    )
     
-    # Model A (Width=0) との比較
-    rmse_model_a = rmses[0]
-    improvement = (rmse_model_a - best_rmse) / rmse_model_a * 100
-    print(f"Improvement over Model A: {improvement:.2f}%")
-
-    # プロット
-    plt.figure(figsize=(8, 5))
-    plt.plot(widths, rmses, 'o-', label='RMSE vs Width')
-    plt.axvline(best_width, color='r', linestyle='--', label=f'Best: {best_width:.3f}')
-    plt.axhline(rmse_model_a, color='g', linestyle=':', label='Model A (Baseline)')
-    plt.xlabel('Hysteresis Width')
-    plt.ylabel('RMSE')
-    plt.title('Hysteresis Parameter Sweep')
+    best_width = result.x[0]
+    best_scale = result.x[1]
+    best_bias = result.x[2]
+    
+    print("-" * 40)
+    print(f"Optimization Result:")
+    print(f"  Best Hysteresis Width : {best_width:.4f} MPa")
+    print(f"  Scale Factor          : {best_scale:.2f}")
+    print(f"  Bias                  : {best_bias:.2f}")
+    print(f"  Final MSE             : {result.fun:.4f}")
+    print("-" * 40)
+    
+    # --- 結果のプロット ---
+    u_tensor = torch.tensor(u_data, dtype=torch.float32)
+    h_eff = run_model(best_width, u_tensor)
+    y_pred = best_scale * h_eff + best_bias
+    
+    plt.figure(figsize=(12, 6))
+    
+    # 左: 時系列比較
+    plt.subplot(1, 2, 1)
+    plt.title("Time Series Comparison")
+    plt.plot(y_data, label="Real Angle", color='black', alpha=0.6)
+    plt.plot(y_pred, label=f"Sim Angle (Width={best_width:.3f})", color='red', linestyle='--')
+    plt.ylabel("Angle [deg]")
+    plt.xlabel("Step")
     plt.legend()
-    plt.grid()
-    plt.savefig('hysteresis_optimization.png')
-    print("Saved plot to hysteresis_optimization.png")
+    plt.grid(True, alpha=0.3)
+    
+    # 右: ヒステリシスループ比較
+    plt.subplot(1, 2, 2)
+    plt.title(f"Hysteresis Loop Fitting ({TARGET_FREQ})")
+    plt.plot(u_data, y_data, label="Real Data", color='blue', alpha=0.3)
+    plt.plot(u_data, y_pred, label="Sim Model", color='orange', alpha=0.8)
+    plt.xlabel("Diff Pressure (P_DF - P_F) [MPa]")
+    plt.ylabel("Angle [deg]")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 保存
+    if not os.path.exists("analysis_results"):
+        os.makedirs("analysis_results")
+    out_path = "analysis_results/hysteresis_optimization.png"
+    plt.savefig(out_path, dpi=300)
+    print(f"[INFO] Saved plot to {out_path}")
+    print(f"\n[ACTION] Update 'actuator_cfg.py' -> PamHysteresisModelCfg -> hysteresis_width = {best_width:.4f}")
 
 if __name__ == "__main__":
-    run_sweep()
+    main()

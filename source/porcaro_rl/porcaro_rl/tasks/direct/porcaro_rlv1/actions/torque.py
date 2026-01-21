@@ -110,23 +110,39 @@ class TorqueActionController(ActionController):
         return self._compute_command_pressure(actions)
 
     def _compute_command_pressure(self, actions: torch.Tensor) -> torch.Tensor:
+        # --- 1. 各モードごとの理想的な圧力計算 (ここは変更なし) ---
         if self.control_mode == "pressure":
             P_cmd_unscaled = (actions + 1.0) * 0.5
             P_cmd_stack = P_cmd_unscaled * self.Pmax
+            
         elif self.control_mode == "ep":
             MAX_P_BASE = self.Pmax * 0.5
             MAX_P_DIFF = self.Pmax * 0.5
             a = actions
+            
+            # P_base (剛性): 0 ~ 0.3 MPa
             P_base = MAX_P_BASE * (a[:, 1] + 1.0) * 0.5
+            # P_diff (位置): -0.3 ~ +0.3 MPa
             P_diff = MAX_P_DIFF * a[:, 0] 
+            
             P_cmd_DF = torch.clamp(P_base + P_diff, 0.0, self.Pmax)
             P_cmd_F  = torch.clamp(P_base - P_diff, 0.0, self.Pmax)
+            # Gripは独立制御
             P_cmd_G = self.Pmax * (a[:, 2] + 1.0) * 0.5
+            
             P_cmd_stack = torch.stack([P_cmd_DF, P_cmd_F, P_cmd_G], dim=-1)
+            
         else:
             P_cmd_stack = torch.zeros_like(actions) 
-        
-        return torch.clamp(P_cmd_stack, 0.0, self.Pmax)
+
+        # --- 2. ★追加: 圧力の量子化 (Quantization) ---
+        # 0.05 MPa 刻みに丸め込む処理
+        # ロジック: round( 値 / 0.05 ) * 0.05
+        STEP_SIZE = 0.05
+        P_cmd_quantized = torch.round(P_cmd_stack / STEP_SIZE) * STEP_SIZE
+
+        # --- 3. 範囲制限 (念のため再度クランプ) ---
+        return torch.clamp(P_cmd_quantized, 0.0, self.Pmax)
 
     @torch.no_grad()
     def apply(self, *, actions: torch.Tensor, q: torch.Tensor,
