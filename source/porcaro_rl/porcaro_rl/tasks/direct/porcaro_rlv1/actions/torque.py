@@ -21,13 +21,16 @@ class TorqueActionController(ActionController):
                  Pmax: float = 0.6,
                  tau: float = 0.09, dead_time: float = 0.03,
                  N: float = 630.0,
+                 # ▼▼▼ [追加] 粘性係数 (N / (m/s)) ▼▼▼
+                 # 目安: 10.0 ~ 50.0 くらいから調整
+                 pam_viscosity: float = 500.0,
                  force_map_csv: str | None = None,
                  force_scale: float = 1.0,
                  h0_map_csv: str | None = None,
                  use_pressure_dependent_tau: bool = True,
                  geometric_cfg: PamGeometricCfg | None = None,
                  pressure_shrink_gain: float = 0.02, 
-                 engagement_smoothness: float = 100.0):
+                 engagement_smoothness: float = 20.0):
 
         self.dt_ctrl = float(dt_ctrl)
         self.control_mode = control_mode
@@ -37,6 +40,7 @@ class TorqueActionController(ActionController):
                         "G":  float(theta_t_G_deg)}
         self.Pmax = float(Pmax)
         self.N = float(N)
+        self.pam_viscosity = float(pam_viscosity)
         self.force_scale = float(force_scale)
         self.engagement_smoothness = float(engagement_smoothness) # <--- [追加] 保存
 
@@ -154,14 +158,19 @@ class TorqueActionController(ActionController):
         wid, gid = joint_ids
         n_envs = int(q.shape[0])
 
+        # ▼▼▼ [追加] 角速度 (dq) の取得 ▼▼▼
+        # robot.data.joint_vel は全関節の速度を含んでいるので、wid, gidで抽出
+        # 注意: IsaacLabのバージョンによっては robot.data.joint_vel へのアクセス方法を確認
+        dq = robot.data.joint_vel  
+        dq_wrist = torch.rad2deg(dq[:, wid]) # [deg/s]
+        dq_grip  = torch.rad2deg(dq[:, gid]) # [deg/s]
+
         if self.slack_offsets.device != q.device:
             self.slack_offsets = self.slack_offsets.to(q.device)
 
-        # --- 修正箇所: ActionのNaNチェックとサニタイズ ---
         if torch.isnan(actions).any():
             actions = torch.nan_to_num(actions, nan=0.0)
         actions = torch.clamp(actions, min=-1.0, max=1.0)
-        # ---------------------------------------------
 
         # 1) 指令値計算
         P_cmd_stack = self._compute_command_pressure(actions)
@@ -176,71 +185,95 @@ class TorqueActionController(ActionController):
         q_grip  = torch.rad2deg(q[:, joint_ids[1]])
 
         if self.use_effective_contraction:
-            # ★修正: 圧力とゲインを渡す
+            # 変更: signの適用
+            # DF (Negative Torque): theta減で縮む -> sign = -1
             eps_DF = calculate_effective_contraction(
                 q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0], 
-                pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False)
+                pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False,
+                sign=-1.0) # <---
             
+            # F (Positive Torque): theta増で縮む -> sign = +1
             eps_F = calculate_effective_contraction(
                 q_wrist, self.theta_t["F"], self.r, self.L0_sim, self.slack_offsets[1], 
-                pressure=P_F, shrink_gain=self.pressure_shrink_gain, clamp=False)
+                pressure=P_F, shrink_gain=self.pressure_shrink_gain, clamp=False,
+                sign=1.0) # <---
             
+            # Grip (Positive Torque): theta増で縮む(閉じる) -> sign = +1
             eps_G = calculate_effective_contraction(
                 q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2], 
-                pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False)
+                pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False,
+                sign=1.0) # <---
             
-            # Soft Engagement用の生データ保持
             raw_eps_DF, raw_eps_F, raw_eps_G = eps_DF, eps_F, eps_G
 
-        #                 # ★追加: この行を入れて、epsilonの値を確認する
-        # # 負の値になっていなければ、Slack Offsetが足りていません！
-        #     if n_envs > 0:
-        #         print(f"Epsilon DF: {raw_eps_DF[0].item():.4f}")
+            # デバッグ: 負の値（伸び）が正しく出ているか確認
+            # if n_envs > 0:
+            #     print(f"DEBUG Eps: DF={eps_DF[0].item():.3f}, F={eps_F[0].item():.3f}")
 
-            # 力計算用には負の値を0にクランプしておく（Map参照エラー防止）
-            h_DF = torch.clamp(eps_DF, min=0.0)
-            h_F  = torch.clamp(eps_F,  min=0.0)
-            h_G  = torch.clamp(eps_G,  min=0.0)
+            # 変更: 0クランプを削除 (負の値を許容)
+            h_DF = eps_DF
+            h_F  = eps_F
+            h_G  = eps_G
         else:
-            h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L)
-            h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"], self.r, self.L)
-            h_G  = contraction_ratio_from_angle(q_grip, self.theta_t["G"], self.r, self.L)
-            # 生の値も同じにしておく
+            # 従来モードも sign 対応
+            h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L, sign=-1.0)
+            h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"], self.r, self.L, sign=1.0)
+            h_G  = contraction_ratio_from_angle(q_grip, self.theta_t["G"], self.r, self.L, sign=1.0)
             raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
 
-            # ★追加: この行を入れて、epsilonの値を確認する
-        # # 負の値になっていなければ、Slack Offsetが足りていません！
-        #     if n_envs > 0:
-        #         print(f"Epsilon DF: {raw_eps_DF[0].item():.4f}")
-
-        # 4) 力 F (理想値)
+            # 4) 静的力 F (Static Force)
         if self.force_map is not None:
-            F_DF = self.force_map(P_DF, h_DF) * self.force_scale
-            F_F  = self.force_map(P_F,  h_F)  * self.force_scale
-            F_G  = self.force_map(P_G,  h_G)  * self.force_scale
+            F_DF_static = self.force_map(P_DF, h_DF) * self.force_scale
+            F_F_static  = self.force_map(P_F,  h_F)  * self.force_scale
+            F_G_static  = self.force_map(P_G,  h_G)  * self.force_scale
         else:
-            F_DF = Fpam_quasi_static(P_DF, h_DF, N=self.N, Pmax=self.Pmax) * self.force_scale
-            F_F  = Fpam_quasi_static(P_F,  h_F,  N=self.N, Pmax=self.Pmax) * self.force_scale
-            F_G  = Fpam_quasi_static(P_G,  h_G,  N=self.N, Pmax=self.Pmax) * self.force_scale
+            # 理想モデル
+            F_DF_static = Fpam_quasi_static(P_DF, torch.clamp(h_DF, min=0), N=self.N, Pmax=self.Pmax) * self.force_scale
+            F_F_static  = Fpam_quasi_static(P_F,  torch.clamp(h_F, min=0),  N=self.N, Pmax=self.Pmax) * self.force_scale
+            F_G_static  = Fpam_quasi_static(P_G,  torch.clamp(h_G, min=0),  N=self.N, Pmax=self.Pmax) * self.force_scale
 
-        # --- [新規追加] Soft Engagement の適用 ---
-        # 有効収縮率を使っている場合のみ、滑らかな係合を適用する
+        # 5) 粘性力 F_visc (Viscous Force)
+        # 係数を大きくする必要があります (例: 1000.0 ~ 5000.0)
+        def calculate_viscous_force(dq_deg, r, sign, viscosity_coeff):
+            dq_rad = torch.deg2rad(dq_deg)
+            # 筋肉の収縮速度 v (縮む方向が負、伸びる方向が正)
+            v_muscle = -1.0 * sign * r * dq_rad
+            # 粘性抵抗: 速度に対抗する力
+            return viscosity_coeff * v_muscle
+
+        visc_DF = calculate_viscous_force(dq_wrist, self.r, -1.0, self.pam_viscosity)
+        visc_F  = calculate_viscous_force(dq_wrist, self.r,  1.0, self.pam_viscosity)
+        visc_G  = calculate_viscous_force(dq_grip,  self.r,  1.0, self.pam_viscosity)
+
+        # 6) 【重要修正】合算してから Engagement を適用
+        # ワイヤーがたるんでいる時(Mask=0)は、静的力も粘性力も伝わらないのが物理的に正しい
+        F_DF_total_raw = F_DF_static + visc_DF
+        F_F_total_raw  = F_F_static  + visc_F
+        F_G_total_raw  = F_G_static  + visc_G
+
         if self.use_effective_contraction:
-            F_DF = apply_soft_engagement(F_DF, raw_eps_DF, self.engagement_smoothness)
-            F_F  = apply_soft_engagement(F_F,  raw_eps_F,  self.engagement_smoothness)
-            F_G  = apply_soft_engagement(F_G,  raw_eps_G,  self.engagement_smoothness)
+            # Soft Engagement (Mask) を「合力」にかける
+            F_DF = apply_soft_engagement(F_DF_total_raw, raw_eps_DF, self.engagement_smoothness)
+            F_F  = apply_soft_engagement(F_F_total_raw,  raw_eps_F,  self.engagement_smoothness)
+            F_G  = apply_soft_engagement(F_G_total_raw,  raw_eps_G,  self.engagement_smoothness)
+        else:
+            # Engagementを使わない場合はそのまま (負の値は0クリップ推奨)
+            F_DF = torch.clamp(F_DF_total_raw, min=0.0)
+            F_F  = torch.clamp(F_F_total_raw,  min=0.0)
+            F_G  = torch.clamp(F_G_total_raw,  min=0.0)
 
-        # 4.5) 弛み判定 (既存の h0_map: 圧力起因の不感帯)
+        # 7) h0マップによる不感帯処理 (これも合力にかける)
         if self.h0_map is not None:
             h0_DF = self.h0_map(P_DF)
             h0_F  = self.h0_map(P_F)
             h0_G  = self.h0_map(P_G)
             
+            # h <= h0 (張っている) なら力を通す。そうでなければ0
             F_DF = torch.where(h_DF <= h0_DF, F_DF, torch.zeros_like(F_DF))
             F_F  = torch.where(h_F  <= h0_F,  F_F,  torch.zeros_like(F_F))
             F_G  = torch.where(h_G  <= h0_G,  F_G,  torch.zeros_like(F_G))
 
-        # 5) トルク計算
+        # 8) トルク計算
         tau_w = self.r * (F_F - F_DF)
         tau_g = self.r * F_G
 

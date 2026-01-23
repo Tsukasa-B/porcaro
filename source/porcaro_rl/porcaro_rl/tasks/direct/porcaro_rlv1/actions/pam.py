@@ -75,24 +75,28 @@ class H0Map(nn.Module):
         return interp1d_clamp_torch(self.P, self.h0, P_in)
 
 @torch.no_grad()
-def contraction_ratio_from_angle(theta: torch.Tensor, theta_t_deg: float, r: float, L: float) -> torch.Tensor:
+def contraction_ratio_from_angle(theta: torch.Tensor, theta_t_deg: float, r: float, L: float, sign: float = 1.0) -> torch.Tensor:
     theta_t = math.radians(theta_t_deg)
-    return (r / L) * torch.abs(theta - theta_t)
+    # 変更: sign * (theta - theta_t) で符号付き変位を計算
+    return (r / L) * sign * (theta - theta_t)
 
-# --- [変更] clamp引数を追加 ---
+# 変更箇所: sign引数を追加し、絶対値を削除
 def calculate_effective_contraction(theta_deg, theta_t_deg, r, L0, 
                                     slack_offset, pressure: torch.Tensor = 0.0, 
-                                    shrink_gain: float = 0.0, clamp: bool = True):
+                                    shrink_gain: float = 0.0, clamp: bool = True,
+                                    sign: float = 1.0):
     theta_rad = torch.deg2rad(theta_deg)
     theta_t_rad = math.radians(theta_t_deg)
-    delta_geo = r * torch.abs(theta_rad - theta_t_rad)
+    
+    delta_geo = r * sign * (theta_rad - theta_t_rad)
     L_geo = L0 - delta_geo
     
-    # ★修正ロジック: 圧力が上がるとオフセット(たるみ)が減る
-    # pressureは Tensorの場合があるので注意
+    # 修正: slack_offset(正) は「ワイヤーが余っている」=「筋肉がその分縮まないと張らない」
+    # L_eff (張力発生に必要な長さ) = L_geo - slack
+    # これで「Offset正 = たるみ(Loose)」になります
     dynamic_offset = slack_offset - (shrink_gain * pressure)
+    L_eff = L_geo - dynamic_offset  # <--- '+' を '-' に変更
     
-    L_eff = L_geo + dynamic_offset
     epsilon = (L0 - L_eff) / L0
     
     if clamp:
@@ -100,28 +104,30 @@ def calculate_effective_contraction(theta_deg, theta_t_deg, r, L0,
     else:
         return epsilon
 
-# --- [新規追加] Soft Engagement ロジック ---
 def apply_soft_engagement(force: torch.Tensor, epsilon: torch.Tensor, smoothness: float = 100.0) -> torch.Tensor:
     """
-    [修正版v2] 2乗カーブによるSoft Engagement
-    epsilon <= 0 で完全0。
-    epsilon > 0 で 2乗カーブを描いて立ち上がる（初期の衝撃がSigmoidより小さい）。
+    [修正版v3] 正しいSoft Engagement
+    - epsilon <= 0 (伸び/張っている): Mask = 1.0 (そのまま)
+    - epsilon > 0  (縮み/たるみ): epsilonが増えるほど Mask -> 0.0 になる
     """
-    # 1. 負の値を0にする (ReLU)
-    positive_epsilon = torch.clamp(epsilon, min=0.0)
+    # 1. 伸びている時(負)は常に1.0
+    # 2. たるんでいる時(正)は、0付近なら通し、離れると0にする
     
-    # 2. Smoothnessを掛けて 0~1 にクリップする
-    #    例: smoothness=100 なら、epsilon=0.01(1%)で x=1.0 (Saturation)
-    #    もっと緩やかにしたい場合は smoothness を 20~50 に下げてください
-    x = torch.clamp(positive_epsilon * smoothness, max=1.0)
+    # たるみ量 (正の値)
+    slack_amount = torch.clamp(epsilon, min=0.0)
     
-    # 3. 2乗カーブ (0付近の傾きが0になる = 衝撃がない)
-    #    x=0.1 -> mask=0.01 (1%)
-    #    x=0.5 -> mask=0.25 (25%)
-    #    x=1.0 -> mask=1.00 (100%)
-    engagement_mask = x * x 
+    # たるみが大きいほど x は大きくなる
+    x = slack_amount * smoothness
     
-    return force * engagement_mask
+    # x=0(張り始め) -> mask=1.0
+    # x=1(たるみ大) -> mask=0.0
+    # ReLU(1-x) を使って線形減衰、あるいはSigmoid等
+    mask_val = torch.clamp(1.0 - x, min=0.0)
+    
+    # 2乗でスムーズに立ち上がり (0付近の連続性確保)
+    mask_val = mask_val * mask_val
+    
+    return force * mask_val
 
 
 @torch.no_grad()
