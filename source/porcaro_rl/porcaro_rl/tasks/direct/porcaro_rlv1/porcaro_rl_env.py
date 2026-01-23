@@ -24,6 +24,8 @@ from .rewards.reward import RewardManager
 from .rhythm_generator import RhythmGenerator
 from .simple_rhythm_generator import SimpleRhythmGenerator
 from .cfg.assets import WRIST_J0, GRIP_J0
+from .cfg.actuator_net_cfg import CascadedActuatorNetCfg # <--- 追加
+from .actions.actuator_net import CascadedActuatorNet
 
 
 class PorcaroRLEnv(DirectRLEnv):
@@ -101,8 +103,17 @@ class PorcaroRLEnv(DirectRLEnv):
         if hasattr(self.cfg, "pam_hysteresis_cfg") and self.cfg.pam_hysteresis_cfg is not None:
              self.pam_hysteresis = PamHysteresisModel(self.cfg.pam_hysteresis_cfg, self.device)
 
+        # --- [修正] ActuatorNet の分岐初期化 ---
         if hasattr(self.cfg, "actuator_net_cfg") and self.cfg.actuator_net_cfg is not None:
-             self.actuator_net = ActuatorNetModel(self.cfg.actuator_net_cfg, self.device)
+             if isinstance(self.cfg.actuator_net_cfg, CascadedActuatorNetCfg):
+                 # Model C (New)
+                 self.actuator_net = CascadedActuatorNet(self.cfg.actuator_net_cfg, self.device)
+             else:
+                 # Model B (Old / Simple MLP)
+                 self.actuator_net = ActuatorNetModel(self.cfg.actuator_net_cfg, self.device)
+
+        # Model C用の状態変数 (前回の推定内圧) [Batch, 3] (DF, F, G)
+        self.last_pressure_est = torch.zeros((self.num_envs, 3), device=self.device)
              
         # ---------------------------------------------------------
         # 3. 各種マネージャの初期化
@@ -357,15 +368,47 @@ class PorcaroRLEnv(DirectRLEnv):
         # 1. 基本のアクション
         raw_cmd = (self.actions + 1.0) / 2.0
         
-        # P_cmd (ダイナミクス適用前の指令圧力) を計算してコントローラ内部にキャッシュ
-        # (telemetry用にコントローラが保持するはず)
+        # P_cmd (3ch) の取得
+        # TorqueActionController の compute_pressure が [Batch, 3] を返すと仮定
+        # (返さない場合は TorqueActionController 側の実装確認が必要ですが、標準的な実装であれば返します)
+        p_cmd_3d = None
         if hasattr(self.action_controller, "compute_pressure"):
             with torch.no_grad():
-                _ = self.action_controller.compute_pressure(self.actions)
+                p_cmd_3d = self.action_controller.compute_pressure(self.actions)
         
-        # 2. ActuatorNet (Model C)
-        if self.actuator_net is not None:
-             pass 
+        # --- [修正] ActuatorNet (Model C) の適用ロジック ---
+        if self.actuator_net is not None and isinstance(self.actuator_net, CascadedActuatorNet):
+             # 必要な状態量を取得
+             if p_cmd_3d is None:
+                 # フォールバック: もしコントローラが返さない場合、簡易計算 (ここは実装に合わせて調整)
+                 # 例: raw_cmd がそのまま圧力比率なら Pmax を掛けるなど
+                 p_cmd_3d = torch.zeros((self.num_envs, 3), device=self.device)
+            
+             theta = self.robot.data.joint_pos[:, self.dof_idx]
+             theta_dot = self.robot.data.joint_vel[:, self.dof_idx]
+             
+             # 推論実行: (P_cmd, P_prev, Theta, Theta_dot) -> (Force, P_est)
+             force, p_est = self.actuator_net(p_cmd_3d, self.last_pressure_est, theta, theta_dot)
+             
+             # 状態更新
+             self.last_pressure_est = p_est.detach()
+             
+             # トルク計算: Tau = r * (Pull_F - Pull_DF)
+             # Index: 0=DF, 1=F, 2=G (cfg/actuator_net_cfg.py の定義に準拠)
+             r = self.action_controller.cfg.r
+             
+             # 手首: 屈曲(F) - 背屈(DF)
+             tau_wrist = r * (force[:, 1] - force[:, 0])
+             # グリップ: 把持(G)
+             tau_grip  = r * force[:, 2]
+             
+             torques = torch.stack([tau_wrist, tau_grip], dim=1)
+             
+             # ロボットへ適用 (Model Cの場合はここで終了)
+             self.robot.set_joint_effort_target(torques, joint_ids=self.joint_ids_tuple)
+             return 
+
+        # --- 以下、既存の Model A/B ロジック (Model Cじゃない場合のみ実行) ---
 
         # 3. 簡易ヒステリシスモデル (Model B)
         if self.pam_hysteresis is not None:
@@ -470,6 +513,10 @@ class PorcaroRLEnv(DirectRLEnv):
             self.pam_delay.reset_idx(env_ids)
         if self.pam_hysteresis is not None:
             self.pam_hysteresis.reset_idx(env_ids)
+
+        # --- [追加] Model C用のリセット ---
+        if hasattr(self, "last_pressure_est"):
+            self.last_pressure_est[env_ids] = 0.0
 
     def close(self):
         if hasattr(self, "logging_manager") and self.logging_manager is not None:

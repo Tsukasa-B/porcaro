@@ -27,6 +27,7 @@ from .cfg.controller_cfg import TorqueControllerCfg
 from .cfg.logging_cfg import LoggingCfg, RewardLoggingCfg
 from .cfg.rewards_cfg import RewardsCfg
 from .cfg.actuator_cfg import PamDelayModelCfg, PamHysteresisModelCfg, ActuatorNetModelCfg, PamGeometricCfg # <--- 追加
+from .cfg.actuator_net_cfg import CascadedActuatorNetCfg
 
 
 @configclass
@@ -223,18 +224,15 @@ class PorcaroRLEnvCfg_ModelB_DR(PorcaroRLEnvCfg_ModelB):
 class PorcaroRLEnvCfg_ModelC(PorcaroRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
-        self.actuator_net_cfg = ActuatorNetModelCfg(
-            input_dim=4, output_dim=1, hidden_units=[64, 64],
-            # model_path="models/actuator_net.pt" 
+        
+        # 古い ActuatorNetModelCfg ではなく、新しい CascadedActuatorNetCfg を使用
+        self.actuator_net_cfg = CascadedActuatorNetCfg(
+            slack_offsets=(0.0, 0.0, 0.0)
         )
-        # Model C は遅れモデルを使わないため None
+        
+        # 遅れモデルなどは使用しないため None
         self.pam_delay_cfg = None
         self.pam_hysteresis_cfg = None
-
-        # ★コントローラ側も理想応答に設定 (ActuatorNetの予測値をそのまま使うため)
-        self.controller.tau = 0.0
-        self.controller.dead_time = 0.0
-        self.controller.use_pressure_dependent_tau = False
 
 @configclass
 class PorcaroRLEnvCfg_ModelC_DR(PorcaroRLEnvCfg_ModelC):
