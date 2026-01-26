@@ -26,13 +26,13 @@ from .cfg.sensors import contact_forces_stick_at_drum_cfg, drum_vs_stick_cfg
 from .cfg.controller_cfg import TorqueControllerCfg
 from .cfg.logging_cfg import LoggingCfg, RewardLoggingCfg
 from .cfg.rewards_cfg import RewardsCfg
-from .cfg.actuator_cfg import PamDelayModelCfg, PamHysteresisModelCfg, ActuatorNetModelCfg, PamGeometricCfg # <--- 追加
+from .cfg.actuator_cfg import PamDelayModelCfg, PamHysteresisModelCfg, ActuatorNetModelCfg, PamGeometricCfg
 from .cfg.actuator_net_cfg import CascadedActuatorNetCfg
 
 
 @configclass
 class PorcaroRLEnvCfg(DirectRLEnvCfg):
-    """Porcaro 環境用の設定クラス (基本構成 - DRなし)"""
+    """Porcaro 環境用の設定クラス (基本構成 - Model B Default)"""
     
     # --- シミュレーション設定 ---
     sim: SimulationCfg = SimulationCfg(
@@ -43,65 +43,51 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
         ),
     )
 
-    # ===================================================
-    # PAM Dynamics 設定スロット (デフォルトはNone)
-    # ===================================================
+    # Dynamics Configurations
     pam_delay_cfg: PamDelayModelCfg | None = None
     pam_hysteresis_cfg: PamHysteresisModelCfg | None = None
     actuator_net_cfg: ActuatorNetModelCfg | None = None
 
-    # --- シーン設定 ---
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=32,
-        env_spacing=3.0,
-        replicate_physics=True,
+    # --- [Geometric Defaults] ---
+    # デフォルトは Model B (High-Fidelity) 相当の設定
+    pam_geometric_cfg: PamGeometricCfg = PamGeometricCfg(
+        model_type="B",
+        enable_slack_compensation=True,
+        enable_soft_engagement=True,
+        use_abs_epsilon=False,
+        viscosity=500.0,
+        wire_slack_offsets=(0.00504, 0.02146, 0.01357),
+        natural_length=0.150
     )
-    
-    # --- アセット設定 ---
+
+    # --- シーン・アセット・センサ設定 (変更なし) ---
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=32, env_spacing=3.0, replicate_physics=True,
+    )
     robot_cfg: ArticulationCfg = ROBOT_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     drum_cfg:  RigidObjectCfg  = DRUM_CFG.replace(prim_path="/World/envs/env_.*/Drum")
-    
-    # --- センサ設定 ---
     stick_contact_cfg: ContactSensorCfg = contact_forces_stick_at_drum_cfg
     drum_contact_cfg: ContactSensorCfg = drum_vs_stick_cfg
     
     # --- RL 設定 ---
-    decimation: int = 4 # 20ms (50Hz)
+    decimation: int = 4
     episode_length_s: float = 8.0
-    
-    # --- 空間定義 ---
     action_space: int = 3
     observation_space: int = 30
     state_space: int = 0
-    
     dof_names: list[str] = ["Base_link_Wrist_joint", "Hand_link_Grip_joint"]
 
-    # --- 追加: 幾何学補正設定 ---
-    # デフォルトは True (有効収縮率を使用) とし、オフセットは 0 (影響なし) で初期化
-    pam_geometric_cfg: PamGeometricCfg = PamGeometricCfg(
-        enable_slack_compensation=True,
-        wire_slack_offsets=(0.00504, 0.02146, 0.01357), # 後でキャリブレーション値をここに入れます 0.00x mのワイヤーが正しく貼るまでの長さ
-        natural_length=0.150
-    )
-    # --------------------------
-
-    # ===================================================
-    # ★ 追加箇所: シンプルリズム生成設定
-    # ===================================================
-    use_simple_rhythm: bool = True   # TrueにするとSimpleRhythmGeneratorを使用
-    simple_rhythm_mode: str = "double" # "single", "double", "steady"
-    simple_rhythm_bpm: float = 160.0    # steadyモード時のBPM
-
-    # --- 追加設定 ---
+    # --- その他 ---
+    use_simple_rhythm: bool = True
+    simple_rhythm_mode: str = "double"
+    simple_rhythm_bpm: float = 160.0
     lookahead_horizon: float = 0.5
 
-    # --- モジュール別設定 ---
+    # --- モジュール ---
     controller: TorqueControllerCfg = TorqueControllerCfg()
     logging: LoggingCfg = LoggingCfg()
     rewards: RewardsCfg = RewardsCfg() 
     reward_logging: RewardLoggingCfg = RewardLoggingCfg()
-    
-    # DR設定用のスロット (デフォルトはNone)
     events: PorcaroEventCfg | None = None
 
 
@@ -112,68 +98,58 @@ class PorcaroEventCfg:
     randomize_material: EventTerm = None
     reset_robot_joints: EventTerm = None
 
-
-# =========================================================
-#  DR設定を適用するヘルパー関数
-# =========================================================
 def apply_domain_randomization(cfg: PorcaroRLEnvCfg):
-    """引数で渡されたcfgにDR設定を注入する"""
+    # (既存の実装そのまま)
     cfg.events = PorcaroEventCfg()
-    
-    # 1. リンク質量のランダム化 (±20%)
     cfg.events.randomize_mass = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "mass_distribution_params": (0.8, 1.2),
-            "operation": "scale",
-        },
+        params={"asset_cfg": SceneEntityCfg("robot"), "mass_distribution_params": (0.8, 1.2), "operation": "scale"},
     )
-
-    # 2. 物理マテリアル(摩擦・反発)のランダム化
     cfg.events.randomize_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "static_friction_range": (0.7, 1.3),
-            "dynamic_friction_range": (0.7, 1.3),
-            "restitution_range": (0.8, 1.0),
-            "num_buckets": 64,
-        },
+        params={"asset_cfg": SceneEntityCfg("robot"), "static_friction_range": (0.7, 1.3), "dynamic_friction_range": (0.7, 1.3), "restitution_range": (0.8, 1.0), "num_buckets": 64},
     )
-    
-    # 3. リセット時の関節角度ノイズ
     cfg.events.reset_robot_joints = EventTerm(
         func=mdp.reset_joints_by_scale,
         mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "position_range": (0.9, 1.1),
-            "velocity_range": (-0.1, 0.1),
-        },
+        params={"asset_cfg": SceneEntityCfg("robot"), "position_range": (0.9, 1.1), "velocity_range": (-0.1, 0.1)},
     )
 
 
 # =========================================================
-#  実験条件ごとの設定クラス (Model A / B / C × DRあり/なし)
+#  実験条件ごとの設定クラス (Model A / B / C)
 # =========================================================
 
-# --- [Model A] 理想/簡易遅れモデル ---
+# --- [Model A] Baseline: Modified IECON2025 ---
 @configclass
 class PorcaroRLEnvCfg_ModelA(PorcaroRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
-        # [変更] time_constant などの古い引数を削除し、バッファ確保用の max_delay_time を指定
-        # デフォルトで pneumatic.py の Table I (可変Tau, 可変Deadtime) が使用されます
+        
+        # 1. Pneumatic: Constant Tau, 1D Deadtime
         self.pam_delay_cfg = PamDelayModelCfg(
-            max_delay_time=0.1  # 0.1秒分のバッファを確保 (deadtimeの最大値0.04sに対して十分な余裕)
+            model_type="A",  # <--- [New]
+            max_delay_time=0.1,
+            tau_const=0.15   # Baseline Time Constant
         )
         self.pam_hysteresis_cfg = None
+        
+        # 2. Geometric: No Viscosity, No Slack Comp, Abs Epsilon
+        self.pam_geometric_cfg = PamGeometricCfg(
+            model_type="A", # <--- [New]
+            enable_slack_compensation=False, # オフセット無効
+            enable_soft_engagement=False,    # 不感帯平滑化なし
+            use_abs_epsilon=True,            # 絶対値使用 (たるみでも力発生)
+            viscosity=0.0,                   # 粘性なし
+            force_scale=1.0,
+            wire_slack_offsets=(0.0, 0.0, 0.0) # 念のため0埋め
+        )
+
         self.actuator_net_cfg = None
 
-        # 2. ★二重遅れ防止: コントローラ側を理想応答(遅れゼロ)に設定
+        # Controller: Ideal response (遅れはPamDelayModelで処理)
         self.controller.tau = 0.0
         self.controller.dead_time = 0.0
         self.controller.use_pressure_dependent_tau = False
@@ -186,19 +162,29 @@ class PorcaroRLEnvCfg_ModelA_DR(PorcaroRLEnvCfg_ModelA):
         apply_domain_randomization(self)
 
 
-# --- [Model B] ヒステリシスモデル ---
+# --- [Model B] Proposed: High-Fidelity ---
 @configclass
 class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         
-        # [変更] Model Aと同様に max_delay_time を指定
-        # 必要であればここで tau_values や deadtime_values を上書き定義可能
+        # 1. Pneumatic: 2D Pressure-dependent Tau & Deadtime
         self.pam_delay_cfg = PamDelayModelCfg(
+            model_type="B", # <--- [New]
             max_delay_time=0.1
         )
         
-        # ヒステリシス設定
+        # 2. Geometric: Viscosity, Slack Comp, Soft Engagement
+        self.pam_geometric_cfg = PamGeometricCfg(
+            model_type="B", # <--- [New]
+            enable_slack_compensation=True,
+            enable_soft_engagement=True,
+            use_abs_epsilon=False, # 負の収縮率を許容
+            viscosity=500.0,
+            force_scale=1.0,
+            wire_slack_offsets=(0.00504, 0.02146, 0.01357) # Calibrated values
+        )
+        
         self.pam_hysteresis_cfg = PamHysteresisModelCfg(
             hysteresis_width=0.0854, 
             curve_shape_param=2.0
@@ -206,7 +192,6 @@ class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
         
         self.actuator_net_cfg = None
 
-        # 3. ★二重遅れ防止: コントローラ側を理想応答(遅れゼロ)に設定
         self.controller.tau = 0.0
         self.controller.dead_time = 0.0
         self.controller.use_pressure_dependent_tau = False
@@ -225,14 +210,13 @@ class PorcaroRLEnvCfg_ModelC(PorcaroRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         
-        # 古い ActuatorNetModelCfg ではなく、新しい CascadedActuatorNetCfg を使用
         self.actuator_net_cfg = CascadedActuatorNetCfg(
-            slack_offsets=(0.0, 0.0, 0.0)
+            slack_offsets=(0.0, 0.0, 0.0) # ActuatorNetは自力で学習するためOffset不要か要検討
         )
         
-        # 遅れモデルなどは使用しないため None
         self.pam_delay_cfg = None
         self.pam_hysteresis_cfg = None
+        # Geometric Cfgは ActuatorNet内部では使われないが、互換性のため残す
 
 @configclass
 class PorcaroRLEnvCfg_ModelC_DR(PorcaroRLEnvCfg_ModelC):

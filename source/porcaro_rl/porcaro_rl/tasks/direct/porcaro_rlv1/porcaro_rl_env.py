@@ -24,12 +24,12 @@ from .rewards.reward import RewardManager
 from .rhythm_generator import RhythmGenerator
 from .simple_rhythm_generator import SimpleRhythmGenerator
 from .cfg.assets import WRIST_J0, GRIP_J0
-from .cfg.actuator_net_cfg import CascadedActuatorNetCfg # <--- 追加
+from .cfg.actuator_net_cfg import CascadedActuatorNetCfg
 from .actions.actuator_net import CascadedActuatorNet
 
 
 class PorcaroRLEnv(DirectRLEnv):
-    """Porcaro 環境クラス (ActuatorNet & Sim-to-Real対応版 - Fixed Logging)"""
+    """Porcaro 環境クラス (ActuatorNet & Sim-to-Real対応版 - Fixed)"""
 
     cfg: PorcaroRLEnvCfg
 
@@ -65,9 +65,7 @@ class PorcaroRLEnv(DirectRLEnv):
         # アクションバッファの初期化
         self.actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
 
-        # =========================================================
-        # ★ [維持] サブステップ間の最大力を保持するバッファ
-        # =========================================================
+        # 最大力保持バッファ
         self.max_force_z_buffer = torch.zeros(self.num_envs, device=self.device)
 
         # ---------------------------------------------------------
@@ -76,6 +74,7 @@ class PorcaroRLEnv(DirectRLEnv):
         dt_ctrl = self.cfg.sim.dt
         ctrl_cfg = self.cfg.controller
         
+        # TorqueActionControllerの初期化 (幾何学設定を含む)
         self.action_controller = TorqueActionController(
             dt_ctrl=dt_ctrl,
             control_mode=ctrl_cfg.control_mode,
@@ -92,7 +91,7 @@ class PorcaroRLEnv(DirectRLEnv):
             force_scale=ctrl_cfg.force_scale,
             h0_map_csv=ctrl_cfg.h0_map_csv,
             use_pressure_dependent_tau=ctrl_cfg.use_pressure_dependent_tau,
-            geometric_cfg=self.cfg.pam_geometric_cfg,
+            geometric_cfg=self.cfg.pam_geometric_cfg, # Configから渡す
         )
         self.action_controller.reset(self.num_envs, self.device)
 
@@ -103,16 +102,15 @@ class PorcaroRLEnv(DirectRLEnv):
         if hasattr(self.cfg, "pam_hysteresis_cfg") and self.cfg.pam_hysteresis_cfg is not None:
              self.pam_hysteresis = PamHysteresisModel(self.cfg.pam_hysteresis_cfg, self.device)
 
-        # --- [修正] ActuatorNet の分岐初期化 ---
         if hasattr(self.cfg, "actuator_net_cfg") and self.cfg.actuator_net_cfg is not None:
              if isinstance(self.cfg.actuator_net_cfg, CascadedActuatorNetCfg):
-                 # Model C (New)
+                 # Model C (Cascaded ActuatorNet)
                  self.actuator_net = CascadedActuatorNet(self.cfg.actuator_net_cfg, self.device)
              else:
-                 # Model B (Old / Simple MLP)
+                 # Model B (Old / Simple MLP Fallback)
                  self.actuator_net = ActuatorNetModel(self.cfg.actuator_net_cfg, self.device)
 
-        # Model C用の状態変数 (前回の推定内圧) [Batch, 3] (DF, F, G)
+        # Model C用の状態変数 (前回の推定内圧) [Batch, 3]
         self.last_pressure_est = torch.zeros((self.num_envs, 3), device=self.device)
              
         # ---------------------------------------------------------
@@ -137,9 +135,7 @@ class PorcaroRLEnv(DirectRLEnv):
             device=self.device,
         )
 
-        # =========================================================
-        # リズム生成器の切り替えロジック (維持)
-        # =========================================================
+        # リズム生成器の初期化
         self.dt_ctrl_step = self.cfg.sim.dt * self.cfg.decimation
         use_simple = getattr(self.cfg, "use_simple_rhythm", False)
         target_force_val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
@@ -147,7 +143,7 @@ class PorcaroRLEnv(DirectRLEnv):
         if use_simple:
             mode = getattr(self.cfg, "simple_rhythm_mode", "single")
             bpm = getattr(self.cfg, "simple_rhythm_bpm", 60.0)
-            print(f"[INFO] SimpleRhythmGenerator (Mode: {mode}, BPM: {bpm}, Force: {target_force_val})")
+            print(f"[INFO] SimpleRhythmGenerator (Mode: {mode}, BPM: {bpm})")
             self.rhythm_generator = SimpleRhythmGenerator(
                 num_envs=self.num_envs,
                 device=self.device,
@@ -178,16 +174,7 @@ class PorcaroRLEnv(DirectRLEnv):
         lookahead_horizon = getattr(self.cfg, "lookahead_horizon", 0.5)
         self.lookahead_steps = int(lookahead_horizon / self.dt_ctrl_step)
         
-        # ---------------------------------------------------------
-        # 4. 診断情報の表示
-        # ---------------------------------------------------------
-        print("=" * 80)
-        print(f"[DEBUG DIAGNOSTIC] 環境設定値の確認")
-        print(f"  - sim.dt (物理ステップ): {self.cfg.sim.dt}")
-        print(f"  - decimation (間引き数): {self.cfg.decimation}")
-        print(f"  - dt_ctrl (制御周期)   : {self.dt_ctrl_step:.5f} 秒")
-        print("=" * 80)
-
+        # DRマネージャ
         if self.cfg.events is not None:
             self.event_manager = EventManager(self.cfg.events, self)
             self.event_manager.apply(mode="startup")
@@ -215,62 +202,46 @@ class PorcaroRLEnv(DirectRLEnv):
         self.scene.sensors["drum_contact"] = self.drum_sensor
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        # -- (1) Pre-physics --
         self._pre_physics_step(actions)
-        
         self.max_force_z_buffer[:] = 0.0
-        
-        # 安全策として履歴リストを用意
         force_history_list = []
         
-        # P_cmd の値を保持する変数 (ログ用)
-        # _apply_action で計算されるが、ここでログ用に取得したい場合は
-        # _apply_action の戻り値にするか、コントローラから再取得する
-        # ここでは後者(get_last_telemetry)を使う
-        
-        # -- (2) Physics Step (Decimation Loop) --
+        # Decimation Loop
         for i in range(self.cfg.decimation):
-            
-            # 1. アクション適用 (トルク計算・適用のみ)
+            # 1. Action適用
             self._apply_action()
             
-            # 2. 物理シミュレーション進行
+            # 2. Physics Step
             self.scene.write_data_to_sim()
             self.sim.step()
             self.scene.update(dt=self.cfg.sim.dt)
             
-            # 3. センサーデータ取得
+            # 3. Sensor Data
             if self.stick_sensor.data.net_forces_w.dim() == 3:
                 current_force_vec = self.stick_sensor.data.net_forces_w[:, 0, :] 
             else:
                 current_force_vec = self.stick_sensor.data.net_forces_w 
             
             force_history_list.append(current_force_vec.clone())
-            
             current_force_z = current_force_vec[:, 2].clamp(min=0.0)
             self.max_force_z_buffer = torch.max(self.max_force_z_buffer, current_force_z)
 
-            # 4. ★ログバッファリング (ここで一本化)
+            # 4. Logging Buffer
             if self.logging_manager.enable_logging:
-                # 時刻を進める (dt = 5ms)
                 self.logging_manager.update_time(self.cfg.sim.dt)
-                
-                # 情報取得
                 current_steps = self.episode_length_buf
                 tgt_val = self.rhythm_generator.get_current_target(current_steps)[0].item()
                 tgt_bpm = self.rhythm_generator.current_bpms[0].item()
                 
-                # テレメトリ取得
                 telemetry = self.action_controller.get_last_telemetry()
                 if telemetry is None: telemetry = {}
                 
-                # Model Cの補完など (必要なら)
+                # Model Cの補完
                 if self.actuator_net is not None:
                      nan_tensor = torch.full((self.num_envs, 3), float('nan'), device=self.device)
                      if "P_cmd" not in telemetry: telemetry["P_cmd"] = nan_tensor
                      if "P_out" not in telemetry: telemetry["P_out"] = nan_tensor
                 
-                # バッファに追加
                 self.logging_manager.buffer_step_data(
                     q_full=self.robot.data.joint_pos,
                     qd_full=self.robot.data.joint_vel,
@@ -281,9 +252,8 @@ class PorcaroRLEnv(DirectRLEnv):
                     target_bpm=tgt_bpm
                 )
 
-        # -- (3) Post-processing (RL Step) --
+        # Post-processing
         self.episode_length_buf += 1
-        
         obs = self._get_observations()
         
         target_force_val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
@@ -293,33 +263,26 @@ class PorcaroRLEnv(DirectRLEnv):
         self.reset_time_outs = self.episode_length_buf >= self.max_episode_length
         self.reset_terminated[:] = False
         terminated, time_outs = self._get_dones()
-        
-        # Reset Mask Definition
         reset_mask = terminated | time_outs
 
-        # 5. ★ログ書き込み確定
+        # Finalize Log
         if self.logging_manager.enable_logging:
-            force_history_tensor = torch.stack(force_history_list, dim=1) # [N, Decimation, 3]
-            
+            force_history_tensor = torch.stack(force_history_list, dim=1)
             f1_val = torch.zeros_like(rew)
             if hasattr(self.reward_manager, "get_first_hit_force"):
                  f1_val = self.reward_manager.get_first_hit_force()
-            
             self.logging_manager.finalize_log_step(
                 peak_force=force_history_tensor,
                 f1_force=f1_val,
                 step_reward=rew
             )
 
-        # RSL RL Logging
+        # Logging Extras
         if not hasattr(self, "extras"): self.extras = {}
         self.extras["log"] = {}
 
         if not hasattr(self, "episode_sums"):
-            self.episode_sums = {
-                k: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-                for k in reward_terms.keys()
-            }
+            self.episode_sums = {k: torch.zeros(self.num_envs, dtype=torch.float, device=self.device) for k in reward_terms.keys()}
             self.episode_sums["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         self.episode_sums["total"] += rew
@@ -333,15 +296,14 @@ class PorcaroRLEnv(DirectRLEnv):
             for key, count in self.episode_sums.items():
                 if key != "total":
                     episode_info[key] = count[env_ids]
-
             self.extras["episode"] = episode_info
+            
             self.episode_sums["total"][env_ids] = 0.0
             for key in self.episode_sums.keys():
                 self.episode_sums[key][env_ids] = 0.0
             self._reset_idx(env_ids)
         else:
-            if "episode" in self.extras:
-                self.extras.pop("episode")
+            if "episode" in self.extras: self.extras.pop("episode")
         
         for k, v in reward_terms.items():
              self.extras["log"][f"Step_Reward/{k}"] = torch.mean(v)
@@ -349,9 +311,9 @@ class PorcaroRLEnv(DirectRLEnv):
         self.extras["time_outs"] = time_outs
         self.extras["force/max_force_pooled"] = self.max_force_z_buffer.mean()
 
+        # Log Saving Check
         current_len = self.episode_length_buf[0].item() if isinstance(self.episode_length_buf, torch.Tensor) else self.episode_length_buf
         should_save = (current_len % 50 == 0) or (reset_mask.any().item())
-
         if self.logging_manager.enable_logging and should_save:
              if self.logging_manager.logger is not None:
                  self.logging_manager.logger.save()
@@ -363,68 +325,72 @@ class PorcaroRLEnv(DirectRLEnv):
             self.actions = torch.clamp(actions, -1.0, 1.0)
 
     def _apply_action(self) -> None:
-        """アクションの適用 (モデルの切り替えロジックを含む)"""
+        """アクションの適用 (Model A/B/C 切り替えロジック)"""
         
-        # 1. 基本のアクション
-        raw_cmd = (self.actions + 1.0) / 2.0
-        
-        # P_cmd (3ch) の取得
-        # TorqueActionController の compute_pressure が [Batch, 3] を返すと仮定
-        # (返さない場合は TorqueActionController 側の実装確認が必要ですが、標準的な実装であれば返します)
-        p_cmd_3d = None
-        if hasattr(self.action_controller, "compute_pressure"):
-            with torch.no_grad():
-                p_cmd_3d = self.action_controller.compute_pressure(self.actions)
-        
-        # --- [修正] ActuatorNet (Model C) の適用ロジック ---
+        # --- [1] Model C: ActuatorNet ---
         if self.actuator_net is not None and isinstance(self.actuator_net, CascadedActuatorNet):
-             # 必要な状態量を取得
+             # コントローラ経由でP_cmd [MPa] を取得 (EPモードなどの処理を含む)
+             p_cmd_3d = None
+             if hasattr(self.action_controller, "compute_pressure"):
+                 with torch.no_grad():
+                     p_cmd_3d = self.action_controller.compute_pressure(self.actions)
+             
              if p_cmd_3d is None:
-                 # フォールバック: もしコントローラが返さない場合、簡易計算 (ここは実装に合わせて調整)
-                 # 例: raw_cmd がそのまま圧力比率なら Pmax を掛けるなど
                  p_cmd_3d = torch.zeros((self.num_envs, 3), device=self.device)
             
              theta = self.robot.data.joint_pos[:, self.dof_idx]
              theta_dot = self.robot.data.joint_vel[:, self.dof_idx]
              
-             # 推論実行: (P_cmd, P_prev, Theta, Theta_dot) -> (Force, P_est)
+             # 推論: (P_cmd, P_prev, Theta, Theta_dot) -> (Force, P_est)
              force, p_est = self.actuator_net(p_cmd_3d, self.last_pressure_est, theta, theta_dot)
-             
-             # 状態更新
              self.last_pressure_est = p_est.detach()
              
-             # トルク計算: Tau = r * (Pull_F - Pull_DF)
-             # Index: 0=DF, 1=F, 2=G (cfg/actuator_net_cfg.py の定義に準拠)
-             r = self.action_controller.cfg.r
-             
-             # 手首: 屈曲(F) - 背屈(DF)
+             # トルク計算: Tau = r * (F_F - F_DF), Tau_G = r * F_G
+             # [修正] cfg.r ではなく self.action_controller.r を使用
+             r = self.action_controller.r
              tau_wrist = r * (force[:, 1] - force[:, 0])
-             # グリップ: 把持(G)
              tau_grip  = r * force[:, 2]
              
              torques = torch.stack([tau_wrist, tau_grip], dim=1)
-             
-             # ロボットへ適用 (Model Cの場合はここで終了)
              self.robot.set_joint_effort_target(torques, joint_ids=self.joint_ids_tuple)
              return 
 
-        # --- 以下、既存の Model A/B ロジック (Model Cじゃない場合のみ実行) ---
-
-        # 3. 簡易ヒステリシスモデル (Model B)
-        if self.pam_hysteresis is not None:
-            raw_cmd = self.pam_hysteresis(raw_cmd)
+        # --- [2] Model A/B: Physics-Based ---
+        # 既存ロジック: Dynamics (Env側) -> Force/Geometry (Controller側)
         
-        # 4. 遅れモデル (Model A/B)
-        if self.pam_delay is not None:
-            raw_cmd = self.pam_delay(raw_cmd)
+        # A. アクションから基本の圧力指令値 [MPa] を計算
+        # ※ ここで [0.0, Pmax] の範囲の値を取得する
+        # ※ (actions+1)/2 の単純変換ではなく、コントローラのロジックを通すことで
+        #    EPモードや量子化(Quantization)の影響を反映させる
+        if hasattr(self.action_controller, "compute_pressure"):
+            P_cmd_mpa = self.action_controller.compute_pressure(self.actions)
+        else:
+            # Fallback (Pressure Mode Assumption)
+            Pmax = self.action_controller.Pmax
+            P_cmd_mpa = (self.actions + 1.0) * 0.5 * Pmax
 
-        # 5. 指令値をコントローラ用に戻す
-        processed_actions = (raw_cmd * 2.0) - 1.0
+        # B. 簡易ヒステリシス (Pressure-based Hysteresis)
+        # ※ pam_dynamics.py の PamHysteresisModel は値を保持してフィルタリングする
+        if self.pam_hysteresis is not None:
+            P_cmd_mpa = self.pam_hysteresis(P_cmd_mpa)
+        
+        # C. 遅れモデル (Dynamics)
+        # ※ pam_dynamics.py の PamDelayModel は圧力 [MPa] を入力とし、
+        #    Map参照(Model B) または 1D参照(Model A) を行う
+        if self.pam_delay is not None:
+            P_cmd_mpa = self.pam_delay(P_cmd_mpa)
+
+        # D. アクション値への書き戻し
+        # コントローラは入力されたアクションを再度 P_cmd に変換する仕様になっている。
+        # Dynamics済みの圧力をコントローラに渡すため、逆変換してアクションに戻す。
+        # action' = (P / Pmax) * 2 - 1
+        Pmax = self.action_controller.Pmax
+        processed_actions = (P_cmd_mpa / (Pmax + 1e-6)) * 2.0 - 1.0
         processed_actions = torch.clamp(processed_actions, -1.0, 1.0)
 
-        # 6. トルク計算・適用
+        # E. 力発生とトルク適用
+        # TorqueActionController内で幾何学計算、粘性、Soft Engagement等が適用される
         q_full = self.robot.data.joint_pos 
-        
         self.action_controller.apply(
             actions=processed_actions,
             q=q_full,
@@ -432,32 +398,25 @@ class PorcaroRLEnv(DirectRLEnv):
             robot=self.robot
         )
 
-
     def _get_observations(self) -> dict:
         q = self.robot.data.joint_pos[:, self.dof_idx]
         qd = self.robot.data.joint_vel[:, self.dof_idx]
-        
         current_steps = self.episode_length_buf
         bpm_obs = self.rhythm_generator.current_bpms.view(self.num_envs, 1) / 180.0
         rhythm_buf = self.rhythm_generator.get_lookahead(current_steps, self.lookahead_steps)
         target_force = getattr(self.cfg.rewards, "target_force_fd", 20.0)
         rhythm_buf = rhythm_buf / target_force
-
         obs = torch.cat((q, qd, bpm_obs, rhythm_buf), dim=-1)
         return {"policy": obs}
 
     def _get_rewards(self, force_max: torch.Tensor = None, target_ref: torch.Tensor = None) -> torch.Tensor:
         if force_max is None: force_max = self.max_force_z_buffer
-        
         dt_step = self.cfg.sim.dt * self.cfg.decimation
-        
         current_steps = self.episode_length_buf
         target_trace = self.rhythm_generator.get_current_target(current_steps).view(-1)
-        
         if target_ref is None:
             val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
             target_ref = torch.full((self.num_envs,), val, device=self.device)
-
         total_reward, reward_terms = self.reward_manager.compute_rewards(
             actions=self.actions,
             joint_pos=self.robot.data.joint_pos[:, self.dof_idx],
@@ -466,9 +425,7 @@ class PorcaroRLEnv(DirectRLEnv):
             target_force_ref=target_ref,
             dt=dt_step
         )
-        
         if not hasattr(self, "extras"): self.extras = {}
-
         return total_reward, reward_terms
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -479,52 +436,30 @@ class PorcaroRLEnv(DirectRLEnv):
         if hasattr(self, "event_manager") and self.event_manager is not None:
             self.event_manager.reset(env_ids)
 
-        # 1. 現在の関節位置バッファを複製
         q_target = self.robot.data.joint_pos[env_ids].clone()
         qd_target = self.robot.data.joint_vel[env_ids].clone()
-        
-        # 1. assets.py から読み込んだ定数 (ラジアン)
         val_wrist = torch.tensor(WRIST_J0, device=self.device)
         val_grip  = torch.tensor(GRIP_J0,  device=self.device)
-        
-        # 2. インデックスを使って書き換え
         wrist_idx = self.dof_idx[0]
         grip_idx  = self.dof_idx[1]
-        
         q_target[:, wrist_idx] = val_wrist
         q_target[:, grip_idx]  = val_grip
         qd_target[:] = 0.0
-        
-        # 3. 物理エンジンへの書き込み
-        self.robot.write_joint_state_to_sim(
-            position=q_target, 
-            velocity=qd_target, 
-            env_ids=env_ids
-        )
+        self.robot.write_joint_state_to_sim(position=q_target, velocity=qd_target, env_ids=env_ids)
 
-        if hasattr(self, "reward_manager"):
-            self.reward_manager.reset_idx(env_ids)
-        if hasattr(self, "logging_manager"):
-            self.logging_manager.reset_idx(env_ids)
-        if hasattr(self, "rhythm_generator"):
-            self.rhythm_generator.reset(env_ids)
-            
-        if self.pam_delay is not None:
-            self.pam_delay.reset_idx(env_ids)
-        if self.pam_hysteresis is not None:
-            self.pam_hysteresis.reset_idx(env_ids)
-
-        # --- [追加] Model C用のリセット ---
-        if hasattr(self, "last_pressure_est"):
-            self.last_pressure_est[env_ids] = 0.0
+        if hasattr(self, "reward_manager"): self.reward_manager.reset_idx(env_ids)
+        if hasattr(self, "logging_manager"): self.logging_manager.reset_idx(env_ids)
+        if hasattr(self, "rhythm_generator"): self.rhythm_generator.reset(env_ids)
+        if self.pam_delay is not None: self.pam_delay.reset_idx(env_ids)
+        if self.pam_hysteresis is not None: self.pam_hysteresis.reset_idx(env_ids)
+        if hasattr(self, "last_pressure_est"): self.last_pressure_est[env_ids] = 0.0
 
     def close(self):
         if hasattr(self, "logging_manager") and self.logging_manager is not None:
             self.logging_manager.save_on_exit()
         super().close()
 
-
-# 実行用 main 関数
+# Main Function
 def _parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--headless", action="store_true", help="UI なしで実行")

@@ -14,28 +14,27 @@ TAU_TAB = torch.tensor([0.043, 0.045, 0.060, 0.066, 0.094, 0.131], dtype=torch.f
 L_TAB   = torch.tensor([0.038, 0.035, 0.032, 0.030, 0.023, 0.023], dtype=torch.float32)
 
 # High-Fidelity 2D Tables (moved from pam.py)
-# Rows: Start Pressure (0.0 to 0.6), Cols: Target Pressure (0.0 to 0.6)
+# ... (既存の TAU_TABLE_2D_DATA, DEAD_TABLE_2D_DATA はそのまま維持) ...
 TAU_TABLE_2D_DATA = [
-    [0.0010, 0.0200, 0.0404, 0.0404, 0.0808, 0.0909, 0.1313], # Start=0.0
-    [0.0908, 0.0010, 0.0404, 0.0405, 0.0505, 0.0908, 0.0808], # Start=0.1
-    [0.0404, 0.1313, 0.0010, 0.0913, 0.0404, 0.0811, 0.0808], # Start=0.2
-    [0.0404, 0.0808, 0.0910, 0.0010, 0.0809, 0.0403, 0.0808], # Start=0.3
-    [0.0909, 0.0909, 0.0404, 0.1717, 0.0010, 0.0914, 0.0808], # Start=0.4
-    [0.0404, 0.0909, 0.0406, 0.0404, 0.0404, 0.0010, 0.0404], # Start=0.5
-    [0.0404, 0.0909, 0.0505, 0.0404, 0.0505, 0.0200, 0.0010], # Start=0.6
+    [0.0010, 0.0200, 0.0404, 0.0404, 0.0808, 0.0909, 0.1313],
+    [0.0908, 0.0010, 0.0404, 0.0405, 0.0505, 0.0908, 0.0808],
+    [0.0404, 0.1313, 0.0010, 0.0913, 0.0404, 0.0811, 0.0808],
+    [0.0404, 0.0808, 0.0910, 0.0010, 0.0809, 0.0403, 0.0808],
+    [0.0909, 0.0909, 0.0404, 0.1717, 0.0010, 0.0914, 0.0808],
+    [0.0404, 0.0909, 0.0406, 0.0404, 0.0404, 0.0010, 0.0404],
+    [0.0404, 0.0909, 0.0505, 0.0404, 0.0505, 0.0200, 0.0010],
 ]
 
 DEAD_TABLE_2D_DATA = [
-    [0.0010, 0.0809, 0.0908, 0.0404, 0.0404, 0.0807, 0.0404], # Start=0.0
-    [0.0010, 0.0010, 0.0505, 0.0505, 0.0808, 0.0404, 0.0908], # Start=0.1
-    [0.0809, 0.0808, 0.0010, 0.0010, 0.0911, 0.0505, 0.0505], # Start=0.2
-    [0.0404, 0.0910, 0.1313, 0.0010, 0.0010, 0.0807, 0.0404], # Start=0.3
-    [0.0404, 0.0808, 0.0808, 0.0010, 0.0010, 0.0405, 0.0909], # Start=0.4
-    [0.0808, 0.0808, 0.0913, 0.0808, 0.0909, 0.0010, 0.0810], # Start=0.5
-    [0.0809, 0.0808, 0.0813, 0.0908, 0.0807, 0.1313, 0.0010], # Start=0.6
+    [0.0010, 0.0809, 0.0908, 0.0404, 0.0404, 0.0807, 0.0404],
+    [0.0010, 0.0010, 0.0505, 0.0505, 0.0808, 0.0404, 0.0908],
+    [0.0809, 0.0808, 0.0010, 0.0010, 0.0911, 0.0505, 0.0505],
+    [0.0404, 0.0910, 0.1313, 0.0010, 0.0010, 0.0807, 0.0404],
+    [0.0404, 0.0808, 0.0808, 0.0010, 0.0010, 0.0405, 0.0909],
+    [0.0808, 0.0808, 0.0913, 0.0808, 0.0909, 0.0010, 0.0810],
+    [0.0809, 0.0808, 0.0813, 0.0908, 0.0807, 0.1313, 0.0010],
 ]
 
-# Shared utility to get 2D tensors on device
 def get_2d_tables(device: torch.device | str):
     dev = torch.device(device) if isinstance(device, str) else device
     tau_t = torch.tensor(TAU_TABLE_2D_DATA, dtype=torch.float32, device=dev)
@@ -47,6 +46,7 @@ def get_2d_tables(device: torch.device | str):
 #  Math & Physics Functions
 # =========================================================
 
+# ... (_tabs_on, interp1d_clamp_torch, interp2d_bilinear はそのまま維持) ...
 def _tabs_on(P: torch.Tensor):
     """P の device / dtype に合わせたテーブルを返す (Legacy support)"""
     return (
@@ -57,9 +57,7 @@ def _tabs_on(P: torch.Tensor):
 
 @torch.no_grad()
 def interp1d_clamp_torch(xp: torch.Tensor, fp: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """1次補間（端はクランプ）。xp昇順・1D"""
     x = x.to(xp.dtype).to(xp.device)
-    # NaN対策と範囲クランプ
     if torch.isnan(x).any():
         x = torch.nan_to_num(x, nan=float(xp[0]))
     x = torch.clamp(x, min=float(xp[0]), max=float(xp[-1]))
@@ -71,19 +69,10 @@ def interp1d_clamp_torch(xp: torch.Tensor, fp: torch.Tensor, x: torch.Tensor) ->
     return f0 + t * (f1 - f0)
 
 @torch.no_grad()
-def interp2d_bilinear(
-    x_grid: torch.Tensor, y_grid: torch.Tensor, z_data: torch.Tensor, 
-    x_query: torch.Tensor, y_query: torch.Tensor
-) -> torch.Tensor:
-    """
-    双線形補間 (Bilinear Interpolation)
-    x_grid: Target Pressure (Col)
-    y_grid: Current Pressure (Row)
-    z_data: [Rows, Cols]
-    """
+def interp2d_bilinear(x_grid, y_grid, z_data, x_query, y_query):
+    # (既存の実装そのまま)
     dev = x_query.device
     dtype = x_query.dtype
-    
     if x_grid.device != dev: x_grid = x_grid.to(dev, dtype=dtype)
     if y_grid.device != dev: y_grid = y_grid.to(dev, dtype=dtype)
     if z_data.device != dev: z_data = z_data.to(dev, dtype=dtype)
@@ -103,19 +92,37 @@ def interp2d_bilinear(
     y1 = y0 + 1
     wy = y_idx_f - y0
 
-    v00 = z_data[y0, x0]
-    v01 = z_data[y0, x1]
-    v10 = z_data[y1, x0]
-    v11 = z_data[y1, x1]
+    v00 = z_data[y0, x0]; v01 = z_data[y0, x1]
+    v10 = z_data[y1, x0]; v11 = z_data[y1, x1]
 
     r0 = v00 * (1 - wx) + v01 * wx
     r1 = v10 * (1 - wx) + v11 * wx
-    
     val = r0 * (1 - wy) + r1 * wy
     return val
 
+# --- [New] Model A 用のパラメータ計算関数を追加 ---
+def get_dynamics_params_model_a(
+    P_cmd: torch.Tensor, 
+    tau_const: float, 
+    L_axis: torch.Tensor, 
+    L_values: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Model A (Baseline) 用のパラメータ計算
+    - Tau: 定数 (tau_const)
+    - L (Deadtime): P_cmd に基づく 1D テーブル参照
+    """
+    # Tauはバッチサイズに合わせて定数を拡張
+    tau = torch.full_like(P_cmd, tau_const)
+    
+    # Lは1D補間
+    L = interp1d_clamp_torch(L_axis.to(P_cmd.device), L_values.to(P_cmd.device), P_cmd)
+    
+    return tau, L
+
 @torch.no_grad()
 def tau_L_from_pressure(P, zero_mode="clamp"):
+    # (既存の実装そのまま)
     P = P if isinstance(P, torch.Tensor) else torch.as_tensor(P, dtype=torch.float32)
     XP, TAU, L = _tabs_on(P)
     P = torch.nan_to_num(P, nan=0.0)
@@ -124,14 +131,12 @@ def tau_L_from_pressure(P, zero_mode="clamp"):
     L   = interp1d_clamp_torch(XP, L,   Pq)
     return tau, L
 
+# ... (first_order_lag, FractionalDelay はそのまま維持) ...
 @torch.no_grad()
 def first_order_lag(u_now: torch.Tensor, x_prev: torch.Tensor, tau, dt: float) -> torch.Tensor:
-    """一次遅れ x'=(u-x)/τ"""
     if isinstance(tau, torch.Tensor):
         tau_t = torch.clamp(tau.to(u_now.dtype).to(u_now.device), min=1e-9)
-        alpha = dt / (tau_t + dt) # Use bilinear transform approx or standard Euler? Standard: dt/tau. Improved: dt/(tau+dt)
-        # 修正: 元の実装に合わせて dt / (tau + dt) の形を採用（離散化の安定性のため）
-        # x_next = (1-alpha)*x_prev + alpha*u_now
+        alpha = dt / (tau_t + dt) 
         x_next = x_prev + alpha * (u_now - x_prev)
         return torch.where(tau <= 1e-6, u_now, x_next)
     else:
@@ -142,17 +147,16 @@ def first_order_lag(u_now: torch.Tensor, x_prev: torch.Tensor, tau, dt: float) -
         return x_prev + alpha * (u_now - x_prev)
 
 class FractionalDelay:
-    """分数サンプル遅延"""
+    # (既存の実装そのまま)
     def __init__(self, dt: float, L_max: float = 0.20): 
         self.dt = float(dt)
         self.K  = int(math.ceil(L_max / self.dt) + 5)
         self.buf = None
         self.wp  = 0
-
+    # ... (rest of methods step, reset, reset_idx are same as your provided code) ...
     def reset(self, shape: torch.Size, device):
         self.buf = torch.zeros(self.K, *shape, dtype=torch.float32, device=device)
         self.wp  = 0
-
     @torch.no_grad()
     def reset_idx(self, env_ids: torch.Tensor | Sequence[int]):
         if self.buf is None: return
@@ -161,46 +165,24 @@ class FractionalDelay:
         else:
             if isinstance(env_ids, (torch.Tensor, list, tuple)) and len(env_ids) > 0:
                 self.buf.fill_(0.0)
-
     @torch.no_grad()
     def step(self, x: torch.Tensor, L: torch.Tensor) -> torch.Tensor:
-        if self.buf is None:
-            self.reset(x.shape, x.device)
-
+        if self.buf is None: self.reset(x.shape, x.device)
         L = torch.nan_to_num(L, nan=0.0)
         x = torch.nan_to_num(x, nan=0.0)
-
-        # 遅延ステップ数
         D  = torch.clamp(L / self.dt, min=0.0, max=self.K - 2.0)
         M  = torch.floor(D).to(torch.int64)
         mu = (D - M).to(torch.float32)
-
-        # バッファ書き込み
         self.buf[self.wp] = x
-
-        # 読み出し位置計算
         if x.ndim == 0:
             idx0 = (self.wp - int(M)) % self.K
             idx1 = (self.wp - int(M) - 1) % self.K
             out = (1.0 - float(mu)) * self.buf[idx0] + float(mu) * self.buf[idx1]
         else:
             B = x.shape[0]
-            # バッチインデックス用のレンジ
-            cols = torch.arange(B, device=x.device).unsqueeze(1).expand_as(x).flatten() if x.ndim > 1 else torch.arange(B, device=x.device)
-            # xが[batch, channel]の場合の対応
-            
-            # Simplified access for [batch, channel] or [batch]
-            # 汎用性を高めるため gather ではなく advanced indexing を使う
-            # wpはスカラー。Mは[batch, channel]。
-            # idx0, idx1 shape: [batch, channel]
+            # Advanced indexing (copied from your provided code)
             idx0 = (self.wp - M) % self.K
             idx1 = (self.wp - M - 1) % self.K
-            
-            # self.buf shape: [K, batch, channel]
-            # Advanced indexing: buf[idx_tensor, batch_tensor, channel_tensor]
-            # ここでは簡単のため、次元に応じた処理が必要だが、pneumatic.pyの既存実装を信頼する
-            # 元の実装: out0 = self.buf[idx0, cols] ... これは x:[batch] の場合のみ
-            
             if x.ndim == 2: # [Batch, Channel]
                 b_idx = torch.arange(x.shape[0], device=x.device).unsqueeze(1).expand_as(x)
                 c_idx = torch.arange(x.shape[1], device=x.device).unsqueeze(0).expand_as(x)
@@ -210,8 +192,6 @@ class FractionalDelay:
                 b_idx = torch.arange(x.shape[0], device=x.device)
                 out0 = self.buf[idx0, b_idx]
                 out1 = self.buf[idx1, b_idx]
-                
             out  = (1.0 - mu) * out0 + mu * out1
-
         self.wp = (self.wp + 1) % self.K
         return out

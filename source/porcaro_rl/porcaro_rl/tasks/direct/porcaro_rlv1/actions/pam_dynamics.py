@@ -7,7 +7,9 @@ from .pneumatic import (
     interp2d_bilinear, 
     get_2d_tables, 
     FractionalDelay, 
-    first_order_lag
+    first_order_lag,
+    get_dynamics_params_model_a, # <--- [New] 追加
+    P_TAB, L_TAB # <--- [New] 追加 (Model A default)
 )
 
 if TYPE_CHECKING:
@@ -24,25 +26,29 @@ class PamDelayModel(nn.Module):
         self.dt = dt
         self.device = device
         
-        # --- モード判定 ---
-        tau_vals = self.cfg.tau_values if self.cfg.tau_values else [self.cfg.time_constant]
-        dead_vals = self.cfg.deadtime_values if self.cfg.deadtime_values else [self.cfg.delay_time]
-        self.is_scalar_mode = (len(tau_vals) <= 1 and len(dead_vals) <= 1)
-        
-        if self.is_scalar_mode:
-            self.fixed_tau = float(tau_vals[0])
-            self.fixed_dead = float(dead_vals[0])
-        else:
-            # Shared Data from pneumatic module
+        # --- [Modified] モード判定ロジックの刷新 ---
+        self.model_type = getattr(cfg, "model_type", "B") # デフォルトB
+
+        # --- Model B (2D High-Fidelity) 用テーブル準備 ---
+        if self.model_type == "B":
+            # 既存のロジック + 2Dテーブルロード
             self._tau_2d, self._dead_2d, self._p_axis_2d = get_2d_tables(self.device)
-            # 永続化バッファとして登録（保存・ロード対応）
             self.register_buffer('tau_table', self._tau_2d)
             self.register_buffer('dead_table', self._dead_2d)
             self.register_buffer('p_axis', self._p_axis_2d)
+            
+        # --- Model A (Baseline) 用テーブル準備 ---
+        elif self.model_type == "A":
+            # Configに定義があればそれを使う、なければpneumatic.pyのデフォルト(P_TAB, L_TAB)
+            p_axis = torch.tensor(cfg.deadtime_pressure_axis, device=device) if cfg.deadtime_pressure_axis else P_TAB.to(device)
+            l_vals = torch.tensor(cfg.deadtime_values, device=device) if cfg.deadtime_values else L_TAB.to(device)
+            
+            self.register_buffer('_p_axis_1d', p_axis)
+            self.register_buffer('_l_values_1d', l_vals)
+            self.tau_const = getattr(cfg, "tau_const", 0.15) # デフォルト0.15
 
         # --- 共通モジュールの利用 ---
         # FractionalDelayは状態を持つがnn.Moduleではないため、ここでインスタンス化
-        # バッファの確保は初回forwardまたはreset_idxで行われる
         self.delay_proc = FractionalDelay(self.dt, L_max=self.cfg.max_delay_time)
         
         # 状態変数
@@ -62,16 +68,25 @@ class PamDelayModel(nn.Module):
              self.current_pressure = torch.zeros_like(target_pressure)
 
         # 1. パラメータ(L, Tau) の決定
-        if self.is_scalar_mode:
-            L = torch.full_like(target_pressure, self.fixed_dead)
-            tau = torch.full_like(target_pressure, self.fixed_tau)
-        else:
+        # --- [Modified] Model A / B 分岐 ---
+        if self.model_type == "A":
+            # Model A: Constant Tau + 1D Deadtime
+            tau, L = get_dynamics_params_model_a(
+                target_pressure, self.tau_const, self._p_axis_1d, self._l_values_1d
+            )
+            
+        elif self.model_type == "B":
+            # Model B: 2D Maps (Pressure-Dependent)
             # Current pressure state for lookup
             P_curr = self.current_pressure.detach() 
             tau = interp2d_bilinear(self.p_axis, self.p_axis, self.tau_table, 
                                   x_query=target_pressure, y_query=P_curr)
             L = interp2d_bilinear(self.p_axis, self.p_axis, self.dead_table, 
                                   x_query=target_pressure, y_query=P_curr)
+        else:
+            # Fallback (Legacy)
+            tau = torch.full_like(target_pressure, 0.15)
+            L = torch.full_like(target_pressure, 0.04)
 
         # 2. 共通ロジックによる遅延とフィルタ
         P_delayed = self.delay_proc.step(target_pressure, L)
@@ -79,60 +94,33 @@ class PamDelayModel(nn.Module):
         
         return self.current_pressure
 
+# (PamHysteresisModel, ActuatorNetModel は変更なし)
 class PamHysteresisModel(nn.Module):
-    """
-    Additive Hysteresis Model (Play Operator)
-    圧力に対する「摩擦（一定の圧力幅）」を再現するモデル
-    """
+    # ... (変更なし) ...
     def __init__(self, cfg: PamHysteresisModelCfg, device: str):
         super().__init__()
         self.cfg = cfg
         self.device = device
-        
-        # 状態変数: 前回の出力値 (y_{t-1})
         self.last_output = None
-
     def reset_idx(self, env_ids: torch.Tensor):
-        """
-        [追加] 指定された環境の状態をリセットする
-        """
         if self.last_output is not None:
             self.last_output[env_ids] = 0.0
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Play Operator Logic:
-        y(t) = min( x(t) + r, max( x(t) - r, y(t-1) ) )
-        """
-        # 初回初期化: 入力値に合わせて初期化
         if self.last_output is None or self.last_output.shape != x.shape:
             self.last_output = x.clone()
-
-        # ヒステリシス幅 (全幅) から 半幅 (r) を計算
         r = self.cfg.hysteresis_width / 2.0
-        
-        # Play Operator 計算
         lower_bound = x - r
         upper_bound = x + r
-        
-        # 前回の値を上下限でクリップする
         output = torch.max(lower_bound, torch.min(upper_bound, self.last_output))
-        
-        # 状態更新
         self.last_output = output.clone()
-        
         return output
 
-
 class ActuatorNetModel(nn.Module):
-    """
-    ActuatorNet (MLPによる学習モデル)
-    """
+    # ... (変更なし) ...
     def __init__(self, cfg: ActuatorNetModelCfg, device: str):
         super().__init__()
         self.cfg = cfg
         self.device = device
-        
         layers = []
         in_dim = self.cfg.input_dim
         for hidden in self.cfg.hidden_units:
@@ -140,15 +128,11 @@ class ActuatorNetModel(nn.Module):
             layers.append(nn.ReLU())
             in_dim = hidden
         layers.append(nn.Linear(in_dim, self.cfg.output_dim))
-        
         self.net = nn.Sequential(*layers).to(self.device)
-        
-        # 学習済みモデルのロード
         if self.cfg.model_path:
             import os
             if os.path.exists(self.cfg.model_path):
                 state_dict = torch.load(self.cfg.model_path, map_location=self.device)
                 self.net.load_state_dict(state_dict)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
