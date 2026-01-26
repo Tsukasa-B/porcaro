@@ -13,8 +13,7 @@ P_TAB   = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=torch.float32)
 TAU_TAB = torch.tensor([0.043, 0.045, 0.060, 0.066, 0.094, 0.131], dtype=torch.float32)
 L_TAB   = torch.tensor([0.038, 0.035, 0.032, 0.030, 0.023, 0.023], dtype=torch.float32)
 
-# High-Fidelity 2D Tables (moved from pam.py)
-# Rows: Start Pressure (0.0 to 0.6), Cols: Target Pressure (0.0 to 0.6)
+# High-Fidelity 2D Tables
 TAU_TABLE_2D_DATA = [
     [0.0010, 0.0200, 0.0404, 0.0404, 0.0808, 0.0909, 0.1313], # Start=0.0
     [0.0908, 0.0010, 0.0404, 0.0405, 0.0505, 0.0908, 0.0808], # Start=0.1
@@ -35,7 +34,6 @@ DEAD_TABLE_2D_DATA = [
     [0.0809, 0.0808, 0.0813, 0.0908, 0.0807, 0.1313, 0.0010], # Start=0.6
 ]
 
-# Shared utility to get 2D tensors on device
 def get_2d_tables(device: torch.device | str):
     dev = torch.device(device) if isinstance(device, str) else device
     tau_t = torch.tensor(TAU_TABLE_2D_DATA, dtype=torch.float32, device=dev)
@@ -48,7 +46,6 @@ def get_2d_tables(device: torch.device | str):
 # =========================================================
 
 def _tabs_on(P: torch.Tensor):
-    """P の device / dtype に合わせたテーブルを返す (Legacy support)"""
     return (
         P_TAB.to(device=P.device, dtype=P.dtype),
         TAU_TAB.to(device=P.device, dtype=P.dtype),
@@ -57,9 +54,7 @@ def _tabs_on(P: torch.Tensor):
 
 @torch.no_grad()
 def interp1d_clamp_torch(xp: torch.Tensor, fp: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """1次補間（端はクランプ）。xp昇順・1D"""
     x = x.to(xp.dtype).to(xp.device)
-    # NaN対策と範囲クランプ
     if torch.isnan(x).any():
         x = torch.nan_to_num(x, nan=float(xp[0]))
     x = torch.clamp(x, min=float(xp[0]), max=float(xp[-1]))
@@ -75,12 +70,6 @@ def interp2d_bilinear(
     x_grid: torch.Tensor, y_grid: torch.Tensor, z_data: torch.Tensor, 
     x_query: torch.Tensor, y_query: torch.Tensor
 ) -> torch.Tensor:
-    """
-    双線形補間 (Bilinear Interpolation)
-    x_grid: Target Pressure (Col)
-    y_grid: Current Pressure (Row)
-    z_data: [Rows, Cols]
-    """
     dev = x_query.device
     dtype = x_query.dtype
     
@@ -126,12 +115,9 @@ def tau_L_from_pressure(P, zero_mode="clamp"):
 
 @torch.no_grad()
 def first_order_lag(u_now: torch.Tensor, x_prev: torch.Tensor, tau, dt: float) -> torch.Tensor:
-    """一次遅れ x'=(u-x)/τ"""
     if isinstance(tau, torch.Tensor):
         tau_t = torch.clamp(tau.to(u_now.dtype).to(u_now.device), min=1e-9)
-        alpha = dt / (tau_t + dt) # Use bilinear transform approx or standard Euler? Standard: dt/tau. Improved: dt/(tau+dt)
-        # 修正: 元の実装に合わせて dt / (tau + dt) の形を採用（離散化の安定性のため）
-        # x_next = (1-alpha)*x_prev + alpha*u_now
+        alpha = dt / (tau_t + dt)
         x_next = x_prev + alpha * (u_now - x_prev)
         return torch.where(tau <= 1e-6, u_now, x_next)
     else:
@@ -142,7 +128,6 @@ def first_order_lag(u_now: torch.Tensor, x_prev: torch.Tensor, tau, dt: float) -
         return x_prev + alpha * (u_now - x_prev)
 
 class FractionalDelay:
-    """分数サンプル遅延"""
     def __init__(self, dt: float, L_max: float = 0.20): 
         self.dt = float(dt)
         self.K  = int(math.ceil(L_max / self.dt) + 5)
@@ -170,44 +155,28 @@ class FractionalDelay:
         L = torch.nan_to_num(L, nan=0.0)
         x = torch.nan_to_num(x, nan=0.0)
 
-        # 遅延ステップ数
         D  = torch.clamp(L / self.dt, min=0.0, max=self.K - 2.0)
         M  = torch.floor(D).to(torch.int64)
         mu = (D - M).to(torch.float32)
 
-        # バッファ書き込み
         self.buf[self.wp] = x
 
-        # 読み出し位置計算
         if x.ndim == 0:
             idx0 = (self.wp - int(M)) % self.K
             idx1 = (self.wp - int(M) - 1) % self.K
             out = (1.0 - float(mu)) * self.buf[idx0] + float(mu) * self.buf[idx1]
         else:
-            B = x.shape[0]
-            # バッチインデックス用のレンジ
-            cols = torch.arange(B, device=x.device).unsqueeze(1).expand_as(x).flatten() if x.ndim > 1 else torch.arange(B, device=x.device)
-            # xが[batch, channel]の場合の対応
-            
-            # Simplified access for [batch, channel] or [batch]
-            # 汎用性を高めるため gather ではなく advanced indexing を使う
-            # wpはスカラー。Mは[batch, channel]。
-            # idx0, idx1 shape: [batch, channel]
-            idx0 = (self.wp - M) % self.K
-            idx1 = (self.wp - M - 1) % self.K
-            
-            # self.buf shape: [K, batch, channel]
-            # Advanced indexing: buf[idx_tensor, batch_tensor, channel_tensor]
-            # ここでは簡単のため、次元に応じた処理が必要だが、pneumatic.pyの既存実装を信頼する
-            # 元の実装: out0 = self.buf[idx0, cols] ... これは x:[batch] の場合のみ
-            
-            if x.ndim == 2: # [Batch, Channel]
+            if x.ndim == 2:
                 b_idx = torch.arange(x.shape[0], device=x.device).unsqueeze(1).expand_as(x)
                 c_idx = torch.arange(x.shape[1], device=x.device).unsqueeze(0).expand_as(x)
+                idx0 = (self.wp - M) % self.K
+                idx1 = (self.wp - M - 1) % self.K
                 out0 = self.buf[idx0, b_idx, c_idx]
                 out1 = self.buf[idx1, b_idx, c_idx]
-            else: # [Batch]
+            else:
                 b_idx = torch.arange(x.shape[0], device=x.device)
+                idx0 = (self.wp - M) % self.K
+                idx1 = (self.wp - M - 1) % self.K
                 out0 = self.buf[idx0, b_idx]
                 out1 = self.buf[idx1, b_idx]
                 
@@ -215,3 +184,141 @@ class FractionalDelay:
 
         self.wp = (self.wp + 1) % self.K
         return out
+
+class PAMChannel:
+    def __init__(self, dt_ctrl: float, tau: float = 0.09, dead_time: float = 0.03, Pmax: float = 0.6,
+                 tau_lut: tuple[list[float], list[float]] | None = None,
+                 use_table_i: bool = True,
+                 latch_threshold: float = 0.02): 
+        
+        self.dt = dt_ctrl
+        self.dead_time = float(dead_time)
+        self.tau = float(tau)
+        self.Pmax = float(Pmax)
+        self.delay = FractionalDelay(dt_ctrl, L_max=0.20)
+        self.P_state = None
+        
+        self.use_2d_dynamics = True
+        self.use_table_i = use_table_i
+        
+        self._tau_2d = None
+        self._dead_2d = None
+        self._p_axis_2d = None
+
+        self.last_tau = None 
+        
+        self.P_cmd_prev = None
+        self.P_start_latch = None
+        # 修正: "直前の有効な方向" を保持する変数
+        self.last_valid_direction = None # 1:Inf, -1:Def, 0:Init
+        self.deadband = 1.0e-4
+        
+        self._tau_x, self._tau_y = None, None
+        if tau_lut is not None:
+            x, y = tau_lut
+            self._tau_x = torch.tensor(x, dtype=torch.float32)
+            self._tau_y = torch.tensor(y, dtype=torch.float32)
+
+    def reset(self, n_envs: int, device: str | torch.device):
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        z = torch.zeros(n_envs, device=dev, dtype=torch.float32)
+        self.P_state = z.clone()
+        self.delay.reset(z.shape, dev)
+        self.last_tau = torch.full_like(z, float(self.tau))
+        
+        self.P_cmd_prev = z.clone()
+        self.P_start_latch = z.clone()
+        self.last_valid_direction = torch.zeros(n_envs, dtype=torch.long, device=dev)
+        
+        if self.use_2d_dynamics:
+            self._tau_2d, self._dead_2d, self._p_axis_2d = get_2d_tables(dev)
+            
+        if self._tau_x is not None:
+            self._tau_x = self._tau_x.to(dev)
+            self._tau_y = self._tau_y.to(dev)
+
+    @torch.no_grad()
+    def reset_idx(self, env_ids: torch.Tensor | Sequence[int]):
+        if self.P_state is not None:
+            self.P_state[env_ids] = 0.0
+        if self.last_tau is not None:
+            self.last_tau[env_ids] = float(self.tau)
+            
+        if self.P_cmd_prev is not None:
+            self.P_cmd_prev[env_ids] = 0.0
+        if self.P_start_latch is not None:
+            self.P_start_latch[env_ids] = 0.0
+        
+        if self.last_valid_direction is not None:
+            self.last_valid_direction[env_ids] = 0
+            
+        self.delay.reset_idx(env_ids)
+
+    @torch.no_grad()
+    def step(self, P_cmd: torch.Tensor) -> torch.Tensor:
+        P_cmd = torch.clamp(P_cmd, 0.0, self.Pmax)
+        
+        if self.P_state is None or self.P_state.shape != P_cmd.shape:
+            # 初回初期化
+            self.P_state = torch.zeros_like(P_cmd)
+            self.P_cmd_prev = torch.zeros_like(P_cmd)
+            self.P_start_latch = torch.zeros_like(P_cmd)
+            self.last_valid_direction = torch.zeros_like(P_cmd, dtype=torch.long)
+
+        # === 修正箇所: Hold状態を挟んでも文脈を維持するロジック ===
+        # 1. 変化量の計算
+        diff = P_cmd - self.P_cmd_prev
+        
+        # 2. 現在の方向判定 (1: Inflation, -1: Deflation, 0: Hold)
+        curr_direction = torch.zeros_like(diff, dtype=torch.long)
+        curr_direction[diff > self.deadband] = 1
+        curr_direction[diff < -self.deadband] = -1
+        
+        # 3. 状態変化の検出とラッチ更新
+        #    更新条件:
+        #    A. 現在動いている (curr != 0)
+        #    B. かつ、方向が「直前の有効方向」と異なる (curr != last_valid)
+        #       ※ これにより、1 -> 0 -> 1 の場合、last_validは1のままなので更新されない。
+        #       ※ 1 -> 0 -> -1 の場合、last_valid(1) != curr(-1) なので更新される。
+        
+        is_moving = (curr_direction != 0)
+        direction_changed = (curr_direction != self.last_valid_direction)
+        
+        # Start Pressure 更新が必要なインデックス
+        update_mask = is_moving & direction_changed
+        
+        if update_mask.any():
+            self.P_start_latch[update_mask] = self.P_state[update_mask].detach()
+            # last_valid_direction を更新 (動いている方向のみ)
+            self.last_valid_direction[update_mask] = curr_direction[update_mask]
+            
+        # 次回のために指令値を保存
+        self.P_cmd_prev = P_cmd.clone()
+        # ===============================================
+
+        # 1. むだ時間 L と 時定数 tau の決定
+        if self.use_2d_dynamics and self._tau_2d is not None:
+            # P_start_latch (変化開始時の圧力) と P_cmd (目標圧力) でテーブルを引く
+            tau_now = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._tau_2d, 
+                                        x_query=P_cmd, y_query=self.P_start_latch)
+            L_cmd   = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._dead_2d, 
+                                        x_query=P_cmd, y_query=self.P_start_latch)
+            
+        elif self.use_table_i:
+            if self._tau_x is None:
+                tau_now, L_cmd = tau_L_from_pressure(P_cmd)
+            else:
+                tau_now = interp1d_clamp_torch(self._tau_x, self._tau_y, P_cmd)
+                L_cmd = torch.full_like(P_cmd, self.dead_time)
+        else:
+            tau_now = torch.full_like(P_cmd, self.tau)
+            L_cmd   = torch.full_like(P_cmd, self.dead_time)
+
+        # 2. 遅れ実行
+        P_delayed = self.delay.step(P_cmd, L_cmd)
+
+        # 3. 一次遅れ
+        self.last_tau = torch.clamp(tau_now, min=1e-6)
+        self.P_state = first_order_lag(P_delayed, self.P_state, self.last_tau, self.dt)
+        
+        return self.P_state

@@ -82,7 +82,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # デフォルトは True (有効収縮率を使用) とし、オフセットは 0 (影響なし) で初期化
     pam_geometric_cfg: PamGeometricCfg = PamGeometricCfg(
         enable_slack_compensation=True,
-        wire_slack_offsets=(0.00504, -0.02146, 0.02357), # 後でキャリブレーション値をここに入れます 0.00x mのワイヤーが正しく貼るまでの長さ
+        wire_slack_offsets=(-0.001, 0.00246, 0.01057), # 後でキャリブレーション値をここに入れます 0.00x mのワイヤーが正しく貼るまでの長さ
         natural_length=0.150
     )
     # --------------------------
@@ -216,13 +216,13 @@ class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
         # [1] 粘性係数 (Viscosity)
         # 値が大きいほど「ネバネバ」になり、振動が抑制されますが、動きが遅くなります。
         # デフォルト: 500.0 (torque.pyの初期値)
-        self.controller.pam_viscosity = 10000.0 
+        self.controller.pam_viscosity = 100.0 
 
         # [2] Soft Engagement (接触の鋭さ)
         # 値が大きいほど「硬い接触（急激な力発生）」になります。
         # 値が小さいほど「柔らかい接触（ワイヤーが徐々に張る）」になります。
-        # デフォルト: 20.0 (torque.pyの初期値)
-        self.controller.engagement_smoothness = 20.0
+        # デフォルト: 100.0 (torque.pyの初期値)
+        self.controller.engagement_smoothness = 100.0
 
 @configclass
 class PorcaroRLEnvCfg_ModelB_DR(PorcaroRLEnvCfg_ModelB):

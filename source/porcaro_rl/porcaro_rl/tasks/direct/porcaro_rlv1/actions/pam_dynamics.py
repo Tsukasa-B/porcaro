@@ -51,38 +51,58 @@ class PamDelayModel(nn.Module):
         self.delay_proc = FractionalDelay(self.dt, L_max=self.cfg.max_delay_time)
         self.current_pressure = None
 
+        self.register_buffer('prev_target', torch.zeros(1)) # 初期化時にサイズ合わせが必要
+        self.register_buffer('p_start_latch', torch.zeros(1))
+        self.initialized = False
+
     def reset_idx(self, env_ids: torch.Tensor):
         if self.current_pressure is not None:
             self.current_pressure[env_ids] = 0.0
+        
+        # ★追加: リセット時はラッチも0に戻す
+        if self.initialized:
+            self.p_start_latch[env_ids] = 0.0
+            self.prev_target[env_ids] = 0.0
+            
         self.delay_proc.reset_idx(env_ids)
 
     def forward(self, target_pressure: torch.Tensor) -> torch.Tensor:
-        if self.delay_proc.buf is None:
-             self.delay_proc.reset(target_pressure.shape, self.device)
-        if self.current_pressure is None:
+        # 初期化処理
+        if not self.initialized or self.current_pressure is None:
              self.current_pressure = torch.zeros_like(target_pressure)
+             self.prev_target = torch.zeros_like(target_pressure)
+             self.p_start_latch = torch.zeros_like(target_pressure) # 現在圧で初期化
+             self.delay_proc.reset(target_pressure.shape, self.device)
+             self.initialized = True
 
-        # 1. パラメータ決定ロジックの分岐
+        # =========================================================
+        # ★修正箇所: Change Detection & Latch Logic
+        # =========================================================
+        # ターゲットが変化したインデックスを検出 (浮動小数点誤差を考慮して少し余裕を持たせる)
+        change_mask = torch.abs(target_pressure - self.prev_target) > 1e-4
+        
+        # 変化があった環境だけ、"現在の圧力" を "開始圧力" としてラッチ(記憶)する
+        if change_mask.any():
+            self.p_start_latch[change_mask] = self.current_pressure[change_mask].detach()
+            self.prev_target[change_mask] = target_pressure[change_mask]
+
+        # =========================================================
+
+        # 1. パラメータ決定ロジック
         if self.is_model_a:
-            # [Model A]
-            # Time Constant: 固定値
             tau = torch.full_like(target_pressure, self.fixed_tau)
-            
-            # Dead Time: 1D Lookup Table (L only)
-            # pneumatic.tau_L_from_pressure を利用して L だけ取得
-            # (tau_L_from_pressure は (tau, L) を返すが、Model AではLだけ使う)
-            _, L = tau_L_from_pressure(target_pressure)
+            _, L = tau_L_from_pressure(target_pressure) # Model AはLのみP依存
             
         elif self.is_scalar_mode:
             L = torch.full_like(target_pressure, self.fixed_dead)
             tau = torch.full_like(target_pressure, self.fixed_tau)
         else:
             # [Model B] 2D Lookup
-            P_curr = self.current_pressure.detach() 
+            # ★修正: y_query に current_pressure ではなく p_start_latch を使う
             tau = interp2d_bilinear(self.p_axis, self.p_axis, self.tau_table, 
-                                  x_query=target_pressure, y_query=P_curr)
+                                  x_query=target_pressure, y_query=self.p_start_latch)
             L = interp2d_bilinear(self.p_axis, self.p_axis, self.dead_table, 
-                                  x_query=target_pressure, y_query=P_curr)
+                                  x_query=target_pressure, y_query=self.p_start_latch)
 
         # 2. 遅延とフィルタ (共通)
         P_delayed = self.delay_proc.step(target_pressure, L)

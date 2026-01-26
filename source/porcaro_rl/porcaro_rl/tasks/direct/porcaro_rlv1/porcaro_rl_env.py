@@ -47,7 +47,6 @@ class PorcaroRLEnv(DirectRLEnv):
         
         # ActuatorNet / Dynamics モデル（Noneで初期化）
         self.pam_delay: PamDelayModel | None = None
-        self.pam_hysteresis: PamHysteresisModel | None = None
         self.actuator_net: ActuatorNetModel | None = None
 
         # 親クラスの __init__ を呼ぶ
@@ -100,8 +99,7 @@ class PorcaroRLEnv(DirectRLEnv):
         if hasattr(self.cfg, "pam_delay_cfg") and self.cfg.pam_delay_cfg is not None:
              self.pam_delay = PamDelayModel(self.cfg.pam_delay_cfg, dt_ctrl, self.device)
         
-        if hasattr(self.cfg, "pam_hysteresis_cfg") and self.cfg.pam_hysteresis_cfg is not None:
-             self.pam_hysteresis = PamHysteresisModel(self.cfg.pam_hysteresis_cfg, self.device)
+
 
         # --- [修正] ActuatorNet の分岐初期化 ---
         if hasattr(self.cfg, "actuator_net_cfg") and self.cfg.actuator_net_cfg is not None:
@@ -410,9 +408,6 @@ class PorcaroRLEnv(DirectRLEnv):
 
         # --- 以下、既存の Model A/B ロジック (Model Cじゃない場合のみ実行) ---
 
-        # 3. 簡易ヒステリシスモデル (Model B)
-        if self.pam_hysteresis is not None:
-            raw_cmd = self.pam_hysteresis(raw_cmd)
         
         # 4. 遅れモデル (Model A/B)
         if self.pam_delay is not None:
@@ -511,8 +506,6 @@ class PorcaroRLEnv(DirectRLEnv):
             
         if self.pam_delay is not None:
             self.pam_delay.reset_idx(env_ids)
-        if self.pam_hysteresis is not None:
-            self.pam_hysteresis.reset_idx(env_ids)
 
         # --- [追加] Model C用のリセット ---
         if hasattr(self, "last_pressure_est"):

@@ -18,19 +18,19 @@ class TorqueActionController(ActionController):
                  control_mode: str = "ep", 
                  r: float = 0.014, L: float = 0.150,
                  theta_t_DF_deg: float = 0.0,
-                 theta_t_F_deg:  float = -60.0,
+                 theta_t_F_deg:  float = -90.0,
                  theta_t_G_deg:  float = -45.0,
                  Pmax: float = 0.6,
                  tau: float = 0.09, dead_time: float = 0.03,
                  N: float = 630.0,
-                 pam_viscosity: float = 500.0,
+                 pam_viscosity: float = 800.0,
                  force_map_csv: str | None = None,
                  force_scale: float = 1.0,
                  h0_map_csv: str | None = None,
                  use_pressure_dependent_tau: bool = True,
                  geometric_cfg: PamGeometricCfg | None = None,
                  pressure_shrink_gain: float = 0.02, 
-                 engagement_smoothness: float = 20.0):
+                 engagement_smoothness: float = 130.0):
 
         self.dt_ctrl = float(dt_ctrl)
         self.control_mode = control_mode
@@ -218,7 +218,8 @@ class TorqueActionController(ActionController):
                 dq_rad = torch.deg2rad(dq_deg)
                 v_muscle = -1.0 * sign * r * dq_rad
                 return viscosity_coeff * v_muscle
-
+            
+            # V_muscleを負にするためにsignで補正
             visc_DF = calculate_viscous_force(dq_wrist, self.r, -1.0, self.pam_viscosity)
             visc_F  = calculate_viscous_force(dq_wrist, self.r,  1.0, self.pam_viscosity)
             visc_G  = calculate_viscous_force(dq_grip,  self.r,  1.0, self.pam_viscosity)

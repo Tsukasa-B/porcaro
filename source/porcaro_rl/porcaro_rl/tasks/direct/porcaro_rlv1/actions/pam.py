@@ -124,8 +124,8 @@ def calculate_effective_contraction(theta_deg, theta_t_deg, r, L0,
     theta_t_rad = math.radians(theta_t_deg)
     delta_geo = r * sign * (theta_rad - theta_t_rad)
     L_geo = L0 - delta_geo
-    dynamic_offset = slack_offset - (shrink_gain * pressure)
-    L_eff = L_geo - dynamic_offset
+    dynamic_offset = slack_offset - (shrink_gain * pressure)     # たるませるならoffsetを正でいれる圧力の入力でoffsetが消える
+    L_eff = L_geo - dynamic_offset      # たるませるならoffsetを正でいれる
     epsilon = (L0 - L_eff) / L0
     if clamp:
         return torch.clamp(epsilon, min=0.0)
@@ -133,22 +133,27 @@ def calculate_effective_contraction(theta_deg, theta_t_deg, r, L0,
 
 def apply_soft_engagement(force: torch.Tensor, epsilon: torch.Tensor, smoothness: float = 100.0) -> torch.Tensor:
     """
-    修正版: 接触時の力の立ち上がりを滑らかにする
+    [修正版v3] 正しいSoft Engagement
+    - epsilon <= 0 (伸び/張っている): Mask = 1.0 (そのまま)
+    - epsilon > 0  (縮み/たるみ): epsilonが増えるほど Mask -> 0.0 になる
     """
-    # === 修正箇所 ===
-    # 修正前: slack_amount = torch.clamp(epsilon, min=0.0)
-    # 解説: 修正前は「正の値(張っている状態)」を「たるみ」として扱っていたため、
-    #       縮めば縮むほど力がゼロになるバグがありました。
+    # 1. 伸びている時(負)は常に1.0
+    # 2. たるんでいる時(正)は、0付近なら通し、離れると0にする
     
-    # 修正後: epsilonが「負(たるんでいる)」のとき、その絶対値を「たるみ量」とする。
-    # - epsilon > 0 (張っている): slack=0 -> マスク=1.0 (力そのまま)
-    # - epsilon < 0 (たるんでいる): slack>0 -> マスク<1.0 (力が弱まる)
-    slack_amount = torch.clamp(-epsilon, min=0.0) 
-    # =================
+    # たるみ量 (正の値)
+    slack_amount = torch.clamp(epsilon, min=0.0)
     
+    # たるみが大きいほど x は大きくなる
     x = slack_amount * smoothness
+    
+    # x=0(張り始め) -> mask=1.0
+    # x=1(たるみ大) -> mask=0.0
+    # ReLU(1-x) を使って線形減衰、あるいはSigmoid等
     mask_val = torch.clamp(1.0 - x, min=0.0)
+    
+    # 2乗でスムーズに立ち上がり (0付近の連続性確保)
     mask_val = mask_val * mask_val
+    
     return force * mask_val
 
 @torch.no_grad()
@@ -158,7 +163,6 @@ def Fpam_quasi_static(P: torch.Tensor, h: torch.Tensor, N: float = 1200.0, Pmax:
     return N * P * eff
 
 class PAMChannel:
-    # ... (既存コード) ...
     def __init__(self, dt_ctrl: float, tau: float = 0.09, dead_time: float = 0.03, Pmax: float = 0.6,
                  tau_lut: tuple[list[float], list[float]] | None = None,
                  use_table_i: bool = True):
@@ -167,7 +171,11 @@ class PAMChannel:
         self.tau = float(tau)
         self.Pmax = float(Pmax)
         self.delay = FractionalDelay(dt_ctrl, L_max=0.20)
+        
         self.P_state = None
+        # ★追加: ラッチ用変数の初期化
+        self.p_start_latch = None 
+        self.prev_target = None
         
         self.use_2d_dynamics = True
         self.use_table_i = use_table_i
@@ -175,6 +183,7 @@ class PAMChannel:
         self._L_prev = None
         self.last_tau = None 
         self._tau_x, self._tau_y = None, None
+        
         if tau_lut is not None:
             x, y = tau_lut
             self._tau_x = torch.tensor(x, dtype=torch.float32)
@@ -184,6 +193,11 @@ class PAMChannel:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         z = torch.zeros(n_envs, device=dev, dtype=torch.float32)
         self.P_state = z.clone()
+        
+        # ★追加: リセット処理
+        self.p_start_latch = z.clone()
+        self.prev_target = z.clone()
+        
         self.delay.reset(z.shape, dev)
         self.last_tau = torch.full_like(z, float(self.tau))
         self._L_prev  = None
@@ -197,6 +211,13 @@ class PAMChannel:
     def reset_idx(self, env_ids: torch.Tensor | Sequence[int]):
         if self.P_state is not None:
             self.P_state[env_ids] = 0.0
+            
+        # ★追加: リセットidx処理
+        if self.p_start_latch is not None:
+            self.p_start_latch[env_ids] = 0.0
+        if self.prev_target is not None:
+            self.prev_target[env_ids] = 0.0
+            
         if self.last_tau is not None:
             self.last_tau[env_ids] = float(self.tau)
         if self._L_prev is not None:
@@ -206,10 +227,29 @@ class PAMChannel:
     @torch.no_grad()
     def step(self, P_cmd: torch.Tensor) -> torch.Tensor:
         P_cmd = torch.clamp(P_cmd, 0.0, self.Pmax)
+        
+        # === ★修正: Change Detection & Latch Logic (pam_dynamicsと同じにする) ===
+        if self.P_state is None:
+             # 初回呼び出し時の安全策
+             self.P_state = torch.zeros_like(P_cmd)
+             self.p_start_latch = torch.zeros_like(P_cmd)
+             self.prev_target = torch.zeros_like(P_cmd)
+
+        # ターゲット変化検知
+        change_mask = torch.abs(P_cmd - self.prev_target) > 1e-4
+        if change_mask.any():
+            # 変化した環境だけ、現在の圧力を「開始圧力」として記憶
+            self.p_start_latch[change_mask] = self.P_state[change_mask].detach()
+            self.prev_target[change_mask] = P_cmd[change_mask]
+        # ====================================================================
+
         if self.use_2d_dynamics and self._tau_2d is not None:
-            P_curr = self.P_state if self.P_state is not None else torch.zeros_like(P_cmd)
-            tau_now = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._tau_2d, x_query=P_cmd, y_query=P_curr)
-            L_cmd   = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._dead_2d, x_query=P_cmd, y_query=P_curr)
+            # ★修正: y_query を P_state (現在値) から self.p_start_latch (記憶値) に変更
+            tau_now = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._tau_2d, 
+                                      x_query=P_cmd, y_query=self.p_start_latch)
+            L_cmd   = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._dead_2d, 
+                                      x_query=P_cmd, y_query=self.p_start_latch)
+            
         elif self.use_table_i:
             if self._tau_x is None:
                 tau_now, L_cmd = tau_L_from_pressure(P_cmd)
@@ -221,8 +261,10 @@ class PAMChannel:
             L_cmd   = torch.full_like(P_cmd, self.dead_time)
 
         P_delayed = self.delay.step(P_cmd, L_cmd)
+        
         if self.P_state is None or self.P_state.shape != P_cmd.shape:
-            self.P_state = P_delayed.clone()
+             self.P_state = P_delayed.clone()
+
         self.last_tau = torch.clamp(tau_now, min=1e-6)
         self.P_state = first_order_lag(P_delayed, self.P_state, self.last_tau, self.dt)
         return self.P_state
