@@ -118,7 +118,7 @@ def contraction_ratio_from_angle(theta: torch.Tensor, theta_t_deg: float, r: flo
 
 def calculate_effective_contraction(theta_deg, theta_t_deg, r, L0, 
                                     slack_offset, pressure: torch.Tensor = 0.0, 
-                                    shrink_gain: float = 0.0, clamp: bool = True,
+                                    shrink_gain: float = 0.0, clamp: bool = False,
                                     sign: float = 1.0):
     theta_rad = torch.deg2rad(theta_deg)
     theta_t_rad = math.radians(theta_t_deg)
@@ -132,7 +132,20 @@ def calculate_effective_contraction(theta_deg, theta_t_deg, r, L0,
     return epsilon
 
 def apply_soft_engagement(force: torch.Tensor, epsilon: torch.Tensor, smoothness: float = 100.0) -> torch.Tensor:
-    slack_amount = torch.clamp(epsilon, min=0.0)
+    """
+    修正版: 接触時の力の立ち上がりを滑らかにする
+    """
+    # === 修正箇所 ===
+    # 修正前: slack_amount = torch.clamp(epsilon, min=0.0)
+    # 解説: 修正前は「正の値(張っている状態)」を「たるみ」として扱っていたため、
+    #       縮めば縮むほど力がゼロになるバグがありました。
+    
+    # 修正後: epsilonが「負(たるんでいる)」のとき、その絶対値を「たるみ量」とする。
+    # - epsilon > 0 (張っている): slack=0 -> マスク=1.0 (力そのまま)
+    # - epsilon < 0 (たるんでいる): slack>0 -> マスク<1.0 (力が弱まる)
+    slack_amount = torch.clamp(-epsilon, min=0.0) 
+    # =================
+    
     x = slack_amount * smoothness
     mask_val = torch.clamp(1.0 - x, min=0.0)
     mask_val = mask_val * mask_val
