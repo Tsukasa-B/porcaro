@@ -26,7 +26,10 @@ from .cfg.sensors import contact_forces_stick_at_drum_cfg, drum_vs_stick_cfg
 from .cfg.controller_cfg import TorqueControllerCfg
 from .cfg.logging_cfg import LoggingCfg, RewardLoggingCfg
 from .cfg.rewards_cfg import RewardsCfg
-from .cfg.actuator_cfg import PamDelayModelCfg, ActuatorNetModelCfg, PamGeometricCfg # <--- 追加
+from .cfg.actuator_cfg import (
+    PamDelayModelCfg, ActuatorNetModelCfg, PamGeometricCfg,
+    PamModelA_GeometricCfg, PamModelA_DynamicsCfg # <--- 追加
+)
 from .cfg.actuator_net_cfg import CascadedActuatorNetCfg
 
 
@@ -164,16 +167,20 @@ def apply_domain_randomization(cfg: PorcaroRLEnvCfg):
 class PorcaroRLEnvCfg_ModelA(PorcaroRLEnvCfg):
     def __post_init__(self):
         super().__post_init__()
-        # [変更] time_constant などの古い引数を削除し、バッファ確保用の max_delay_time を指定
-        # デフォルトで pneumatic.py の Table I (可変Tau, 可変Deadtime) が使用されます
-        self.pam_delay_cfg = PamDelayModelCfg(
-            max_delay_time=0.1  # 0.1秒分のバッファを確保 (deadtimeの最大値0.04sに対して十分な余裕)
+        
+        # [Dynamics] Model A専用設定 (固定Tau, 1D Deadtime)
+        self.pam_delay_cfg = PamModelA_DynamicsCfg(
+            max_delay_time=0.1
         )
+        
+        # [Geometry] Model A専用設定 (絶対値, Slackなし)
+        # ★ ここで PamModelA_GeometricCfg に差し替えます
+        self.pam_geometric_cfg = PamModelA_GeometricCfg()
+        
         self.pam_hysteresis_cfg = None
         self.actuator_net_cfg = None
-        self.pam_geometric_cfg.enable_pressure_dependency = False
 
-        # 2. ★二重遅れ防止: コントローラ側を理想応答(遅れゼロ)に設定
+        # コントローラ側の遅れは無効化 (二重適用防止)
         self.controller.tau = 0.0
         self.controller.dead_time = 0.0
         self.controller.use_pressure_dependent_tau = False

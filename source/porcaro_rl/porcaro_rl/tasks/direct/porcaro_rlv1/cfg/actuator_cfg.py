@@ -51,3 +51,23 @@ class PamGeometricCfg:
     
     # 筋肉の自然長 L0 [m]
     natural_length: float = 0.150
+    use_absolute_geometry: bool = False
+
+@configclass
+class PamModelA_GeometricCfg(PamGeometricCfg):
+    """Model A用: 絶対値幾何学、スラックなし"""
+    enable_slack_compensation: bool = False  # ワイヤーたるみ計算無効
+    use_absolute_geometry: bool = True       # 符号無視・絶対値計算有効
+    wire_slack_offsets: tuple[float, ...] = (0.0, 0.0, 0.0)
+
+@configclass
+class PamModelA_DynamicsCfg(PamDelayModelCfg):
+    """Model A用: 固定時定数 + 1Dむだ時間"""
+    # 2Dダイナミクス(ヒステリシス等)を無効化
+    use_2d_dynamics: bool = False 
+    
+    # 固定時定数 (Model A定義: 0.09s)
+    fixed_time_constant: float = 0.09
+    
+    # むだ時間は 1D Table (L(P)) を使用するフラグ
+    use_1d_deadtime: bool = True

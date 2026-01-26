@@ -20,7 +20,7 @@ def main():
     # 実機データとSimデータのファイル名
     # ※ 必要に応じてファイル名を変更してください
     real_csv_name = "data_exp4_validation_seq_.csv"
-    sim_csv_name = "verify_ModelB_Ideal_REPLAY_data_exp4_validation_seq_.csv"
+    sim_csv_name = "verify_ModelA_Ideal_REPLAY_data_exp4_validation_seq_.csv"
 
     real_csv_path = os.path.join(project_root, "external_data", "jetson_project", real_csv_name)
     sim_csv_path = os.path.join(project_root, sim_csv_name)
