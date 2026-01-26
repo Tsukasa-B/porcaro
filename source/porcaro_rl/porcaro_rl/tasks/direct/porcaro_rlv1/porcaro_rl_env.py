@@ -16,8 +16,8 @@ from isaaclab.managers import EventManager
 # Porcaro RL imports
 from .porcaro_rl_env_cfg import PorcaroRLEnvCfg
 from .actions.base import ActionController
-from .cfg.actuator_cfg import PamDelayModelCfg, PamHysteresisModelCfg, ActuatorNetModelCfg
-from .actions.pam_dynamics import PamDelayModel, PamHysteresisModel, ActuatorNetModel
+from .cfg.actuator_cfg import PamDelayModelCfg, ActuatorNetModelCfg
+from .actions.pam_dynamics import PamDelayModel, ActuatorNetModel
 from .actions.torque import TorqueActionController
 from .logging.logging_manager import LoggingManager
 from .rewards.reward import RewardManager

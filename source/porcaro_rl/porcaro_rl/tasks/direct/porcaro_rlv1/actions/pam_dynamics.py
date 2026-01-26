@@ -1,4 +1,5 @@
 # source/porcaro_rl/porcaro_rl/tasks/direct/porcaro_rlv1/actions/pam_dynamics.py
+
 from __future__ import annotations
 import torch
 import torch.nn as nn
@@ -11,7 +12,8 @@ from .pneumatic import (
 )
 
 if TYPE_CHECKING:
-    from ..cfg.actuator_cfg import PamDelayModelCfg, PamHysteresisModelCfg, ActuatorNetModelCfg
+    # 変更: PamHysteresisModelCfg を削除
+    from ..cfg.actuator_cfg import PamDelayModelCfg, ActuatorNetModelCfg
 
 class PamDelayModel(nn.Module):
     """
@@ -41,8 +43,6 @@ class PamDelayModel(nn.Module):
             self.register_buffer('p_axis', self._p_axis_2d)
 
         # --- 共通モジュールの利用 ---
-        # FractionalDelayは状態を持つがnn.Moduleではないため、ここでインスタンス化
-        # バッファの確保は初回forwardまたはreset_idxで行われる
         self.delay_proc = FractionalDelay(self.dt, L_max=self.cfg.max_delay_time)
         
         # 状態変数
@@ -79,50 +79,9 @@ class PamDelayModel(nn.Module):
         
         return self.current_pressure
 
-class PamHysteresisModel(nn.Module):
-    """
-    Additive Hysteresis Model (Play Operator)
-    圧力に対する「摩擦（一定の圧力幅）」を再現するモデル
-    """
-    def __init__(self, cfg: PamHysteresisModelCfg, device: str):
-        super().__init__()
-        self.cfg = cfg
-        self.device = device
-        
-        # 状態変数: 前回の出力値 (y_{t-1})
-        self.last_output = None
-
-    def reset_idx(self, env_ids: torch.Tensor):
-        """
-        [追加] 指定された環境の状態をリセットする
-        """
-        if self.last_output is not None:
-            self.last_output[env_ids] = 0.0
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Play Operator Logic:
-        y(t) = min( x(t) + r, max( x(t) - r, y(t-1) ) )
-        """
-        # 初回初期化: 入力値に合わせて初期化
-        if self.last_output is None or self.last_output.shape != x.shape:
-            self.last_output = x.clone()
-
-        # ヒステリシス幅 (全幅) から 半幅 (r) を計算
-        r = self.cfg.hysteresis_width / 2.0
-        
-        # Play Operator 計算
-        lower_bound = x - r
-        upper_bound = x + r
-        
-        # 前回の値を上下限でクリップする
-        output = torch.max(lower_bound, torch.min(upper_bound, self.last_output))
-        
-        # 状態更新
-        self.last_output = output.clone()
-        
-        return output
-
+# --------------------------------------------------------
+# [削除] PamHysteresisModel クラスをここに定義していましたが削除しました
+# --------------------------------------------------------
 
 class ActuatorNetModel(nn.Module):
     """
@@ -143,7 +102,6 @@ class ActuatorNetModel(nn.Module):
         
         self.net = nn.Sequential(*layers).to(self.device)
         
-        # 学習済みモデルのロード
         if self.cfg.model_path:
             import os
             if os.path.exists(self.cfg.model_path):

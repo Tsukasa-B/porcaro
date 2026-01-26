@@ -25,11 +25,6 @@ class PamDelayModelCfg:
     delay_time: float = 0.04  
     time_constant: float = 0.15
 
-@configclass
-class PamHysteresisModelCfg:
-    """PAMのヒステリシスモデル（簡易Prandtl-Ishlinskii等）の設定"""
-    hysteresis_width: float = 0.1  # ヒステリシスの幅係数
-    curve_shape_param: float = 2.0  # 曲率パラメータ
 
 @configclass
 class ActuatorNetModelCfg:

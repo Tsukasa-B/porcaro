@@ -26,7 +26,7 @@ from .cfg.sensors import contact_forces_stick_at_drum_cfg, drum_vs_stick_cfg
 from .cfg.controller_cfg import TorqueControllerCfg
 from .cfg.logging_cfg import LoggingCfg, RewardLoggingCfg
 from .cfg.rewards_cfg import RewardsCfg
-from .cfg.actuator_cfg import PamDelayModelCfg, PamHysteresisModelCfg, ActuatorNetModelCfg, PamGeometricCfg # <--- 追加
+from .cfg.actuator_cfg import PamDelayModelCfg, ActuatorNetModelCfg, PamGeometricCfg # <--- 追加
 from .cfg.actuator_net_cfg import CascadedActuatorNetCfg
 
 
@@ -47,7 +47,6 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # PAM Dynamics 設定スロット (デフォルトはNone)
     # ===================================================
     pam_delay_cfg: PamDelayModelCfg | None = None
-    pam_hysteresis_cfg: PamHysteresisModelCfg | None = None
     actuator_net_cfg: ActuatorNetModelCfg | None = None
 
     # --- シーン設定 ---
@@ -172,6 +171,7 @@ class PorcaroRLEnvCfg_ModelA(PorcaroRLEnvCfg):
         )
         self.pam_hysteresis_cfg = None
         self.actuator_net_cfg = None
+        self.pam_geometric_cfg.enable_pressure_dependency = False
 
         # 2. ★二重遅れ防止: コントローラ側を理想応答(遅れゼロ)に設定
         self.controller.tau = 0.0
@@ -198,11 +198,7 @@ class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
             max_delay_time=0.1
         )
         
-        # ヒステリシス設定
-        self.pam_hysteresis_cfg = PamHysteresisModelCfg(
-            hysteresis_width=0.0854, 
-            curve_shape_param=2.0
-        )
+        self.pam_geometric_cfg.enable_pressure_dependency = True
         
         self.actuator_net_cfg = None
 
