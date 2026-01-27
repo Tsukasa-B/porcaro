@@ -18,8 +18,8 @@ class TorqueActionController(ActionController):
                  control_mode: str = "ep", 
                  r: float = 0.014, L: float = 0.150,
                  theta_t_DF_deg: float = 0.0,
-                 theta_t_F_deg:  float = -90.0,
-                 theta_t_G_deg:  float = -45.0,
+                 theta_t_F_deg:  float = 90.0,
+                 theta_t_G_deg:  float = 45.0,
                  Pmax: float = 0.6,
                  tau: float = 0.09, dead_time: float = 0.03,
                  N: float = 630.0,
@@ -187,20 +187,20 @@ class TorqueActionController(ActionController):
             if self.use_effective_contraction:
                 h_DF = calculate_effective_contraction(
                     q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0], 
-                    pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=-1.0)
+                    pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=1.0)
                 h_F = calculate_effective_contraction(
                     q_wrist, self.theta_t["F"], self.r, self.L0_sim, self.slack_offsets[1], 
-                    pressure=P_F, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=1.0)
+                    pressure=P_F, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=-1.0)
                 h_G = calculate_effective_contraction(
                     q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2], 
-                    pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=1.0)
+                    pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=-1.0)
                 
                 raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
             else:
                 # Legacy Mode
-                h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L, sign=-1.0)
-                h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"],  self.r, self.L, sign=1.0)
-                h_G  = contraction_ratio_from_angle(q_grip,  self.theta_t["G"],  self.r, self.L, sign=1.0)
+                h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L, sign=1.0)
+                h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"],  self.r, self.L, sign=-1.0)
+                h_G  = contraction_ratio_from_angle(q_grip,  self.theta_t["G"],  self.r, self.L, sign=-1.0)
                 raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
 
             # 4) 静的力 (Static Force)
@@ -220,9 +220,9 @@ class TorqueActionController(ActionController):
                 return viscosity_coeff * v_muscle
             
             # V_muscleを負にするためにsignで補正
-            visc_DF = calculate_viscous_force(dq_wrist, self.r, -1.0, self.pam_viscosity)
-            visc_F  = calculate_viscous_force(dq_wrist, self.r,  1.0, self.pam_viscosity)
-            visc_G  = calculate_viscous_force(dq_grip,  self.r,  1.0, self.pam_viscosity)
+            visc_DF = calculate_viscous_force(dq_wrist, self.r,  1.0, self.pam_viscosity)
+            visc_F  = calculate_viscous_force(dq_wrist, self.r, -1.0, self.pam_viscosity)
+            visc_G  = calculate_viscous_force(dq_grip,  self.r, -1.0, self.pam_viscosity)
 
             # 6) 合算 & Soft Engagement
             F_DF_total_raw = F_DF_static + visc_DF
@@ -248,12 +248,14 @@ class TorqueActionController(ActionController):
         # ---------------------------------------------------------------
         # 共通: トルク変換 & 適用
         # ---------------------------------------------------------------
-        tau_w = self.r * (F_F - F_DF)
-        tau_g = self.r * F_G
+        # 現実ベース F_DFは上向きの力 F_FとF_Gは下向きの力
+        tau_w = self.r * (F_DF - F_F)
+        tau_g = self.r * (- F_G)
 
         tau_full = torch.zeros(n_envs, robot.num_joints, device=q.device, dtype=q.dtype)
-        tau_full[:, wid] = tau_w
-        tau_full[:, gid] = tau_g
+        # ★重要: Sim(下=正)に送るため、ここでトルクを反転させる (Code:Up+ -> Sim:Down+) 現実ベースと反転させるために負にする
+        tau_full[:, wid] = -tau_w # <--- 反転
+        tau_full[:, gid] = -tau_g
         robot.set_joint_effort_target(tau_full)
 
         self._last_telemetry = {
