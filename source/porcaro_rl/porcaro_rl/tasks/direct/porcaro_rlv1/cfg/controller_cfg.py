@@ -13,8 +13,8 @@ class TorqueControllerCfg:
     r: float = 0.014
     L: float = 0.150
     theta_t_DF_deg: float = 0.0
-    theta_t_F_deg: float = -90.0
-    theta_t_G_deg: float = -45.0
+    theta_t_F_deg: float = 90.0
+    theta_t_G_deg: float = 45.0
     Pmax: float = 0.6 # pneumatic.py (Table I) の最大に合わせる
     tau: float = 0.09
     dead_time: float = 0.03
