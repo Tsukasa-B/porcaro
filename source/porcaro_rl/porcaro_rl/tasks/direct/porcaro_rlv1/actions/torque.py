@@ -198,7 +198,7 @@ class TorqueActionController(ActionController):
                 raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
             else:
                 # Legacy Mode
-                h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L, sign=1.0)
+                h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L, sign= 1.0)
                 h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"],  self.r, self.L, sign=-1.0)
                 h_G  = contraction_ratio_from_angle(q_grip,  self.theta_t["G"],  self.r, self.L, sign=-1.0)
                 raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
