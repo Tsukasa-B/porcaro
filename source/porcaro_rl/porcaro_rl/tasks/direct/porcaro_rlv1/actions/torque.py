@@ -136,9 +136,11 @@ class TorqueActionController(ActionController):
         n_envs = int(q.shape[0])
 
         # 速度取得
-        dq = robot.data.joint_vel  
-        dq_wrist = torch.rad2deg(dq[:, wid]) 
-        dq_grip  = torch.rad2deg(dq[:, gid]) 
+        # robot.data.joint_vel はSim生データ(下=正)なので、そのまま使うと逆になる
+        dq_sim = robot.data.joint_vel  
+        # Code座標系(上=正) に合わせるために -1.0 を掛ける
+        dq_wrist = -torch.rad2deg(dq_sim[:, wid]) 
+        dq_grip  = -torch.rad2deg(dq_sim[:, gid])
 
         if self.slack_offsets.device != q.device:
             self.slack_offsets = self.slack_offsets.to(q.device)
@@ -161,46 +163,56 @@ class TorqueActionController(ActionController):
         # ---------------------------------------------------------------
         # Model A (Ideal) vs Model B (Physics-Informed) の分岐
         # ---------------------------------------------------------------
+        # ---------------------------------------------------------------
+        # Model A / B 共通修正
+        # ---------------------------------------------------------------
+        # ---------------------------------------------------------------
+        # 収縮率計算 (Signの定義: Code座標系での動作方向に対する筋肉の伸縮)
+        # ---------------------------------------------------------------
+        # Code座標系:
+        #   Wrist: 上(正)に動くと -> DF縮む(sign=1.0), F伸びる(sign=-1.0)
+        #   Grip : 上(正)に動くと -> G伸びる(sign=-1.0)
+        SIGN_DF =  1.0      # 上が正 → 上がると縮む
+        SIGN_F  = -1.0      # 上が正 → 上がると伸びる
+        SIGN_G  = -1.0      # 上が正　→　上がるとの伸びる
+
         if self.use_absolute_geometry:
-            # === [Model A: Ideal / Absolute Geometry] ===
-            # 3) 絶対収縮率の計算 (Slackなし, 符号無視)
+            # === [Model A] ===
+            # 絶対値を取るため sign は直接影響しないが、theta_t の解釈に関わるため一貫性を保つ
             eps_DF = calculate_absolute_contraction(q_wrist, self.theta_t["DF"], self.r, self.L0_sim)
             eps_F  = calculate_absolute_contraction(q_wrist, self.theta_t["F"],  self.r, self.L0_sim)
             eps_G  = calculate_absolute_contraction(q_grip,  self.theta_t["G"],  self.r, self.L0_sim)
-
-            # 4) 力の計算 (Soft Engagementなし, H0カットオフあり)
+            
+            # ... (力の計算ロジックは変更なし) ...
             if self.force_map is not None and self.h0_map is not None:
                 F_DF = apply_model_a_force(self.force_map, self.h0_map, P_DF, eps_DF) * self.force_scale
                 F_F  = apply_model_a_force(self.force_map, self.h0_map, P_F,  eps_F)  * self.force_scale
                 F_G  = apply_model_a_force(self.force_map, self.h0_map, P_G,  eps_G)  * self.force_scale
             else:
-                # 理想マップがない場合のフォールバック (単純な静特性)
                 F_DF = Fpam_quasi_static(P_DF, eps_DF, N=self.N, Pmax=self.Pmax) * self.force_scale
                 F_F  = Fpam_quasi_static(P_F,  eps_F,  N=self.N, Pmax=self.Pmax) * self.force_scale
                 F_G  = Fpam_quasi_static(P_G,  eps_G,  N=self.N, Pmax=self.Pmax) * self.force_scale
-            
-            # Model Aでは粘性やSoft Engagement追加処理は行わない (理想化のため)
-        
+
         else:
-            # === [Model B: Physics-Informed / Effective Geometry] ===
-            # 3) 有効収縮率の計算 (Slack補償あり, Sign考慮)
+            # === [Model B] ===
             if self.use_effective_contraction:
+                # ★修正: sign引数を変更
                 h_DF = calculate_effective_contraction(
                     q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0], 
-                    pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=1.0)
+                    pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_DF) 
                 h_F = calculate_effective_contraction(
                     q_wrist, self.theta_t["F"], self.r, self.L0_sim, self.slack_offsets[1], 
-                    pressure=P_F, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=-1.0)
+                    pressure=P_F, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_F)
                 h_G = calculate_effective_contraction(
                     q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2], 
-                    pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=-1.0)
+                    pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_G)
                 
                 raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
             else:
                 # Legacy Mode
-                h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L, sign= 1.0)
-                h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"],  self.r, self.L, sign=-1.0)
-                h_G  = contraction_ratio_from_angle(q_grip,  self.theta_t["G"],  self.r, self.L, sign=-1.0)
+                h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L, sign=SIGN_DF)
+                h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"],  self.r, self.L, sign=SIGN_F)
+                h_G  = contraction_ratio_from_angle(q_grip,  self.theta_t["G"],  self.r, self.L, sign=SIGN_G)
                 raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
 
             # 4) 静的力 (Static Force)
@@ -219,12 +231,12 @@ class TorqueActionController(ActionController):
                 v_muscle = -1.0 * sign * r * dq_rad
                 return viscosity_coeff * v_muscle
             
-            # V_muscleを負にするためにsignで補正
-            visc_DF = calculate_viscous_force(dq_wrist, self.r,  1.0, self.pam_viscosity)
-            visc_F  = calculate_viscous_force(dq_wrist, self.r, -1.0, self.pam_viscosity)
-            visc_G  = calculate_viscous_force(dq_grip,  self.r, -1.0, self.pam_viscosity)
+            # ★修正: 粘性も新しい sign を使用
+            visc_DF = calculate_viscous_force(dq_wrist, self.r, SIGN_DF, self.pam_viscosity)
+            visc_F  = calculate_viscous_force(dq_wrist, self.r, SIGN_F,  self.pam_viscosity)
+            visc_G  = calculate_viscous_force(dq_grip,  self.r, SIGN_G,  self.pam_viscosity)
 
-            # 6) 合算 & Soft Engagement
+            # 6) 合算 & Soft Engagement (変更なし)
             F_DF_total_raw = F_DF_static + visc_DF
             F_F_total_raw  = F_F_static  + visc_F
             F_G_total_raw  = F_G_static  + visc_G
@@ -238,7 +250,7 @@ class TorqueActionController(ActionController):
                 F_F  = torch.clamp(F_F_total_raw,  min=0.0)
                 F_G  = torch.clamp(F_G_total_raw,  min=0.0)
 
-            # 7) H0による完全カットオフ (念のため)
+            # 7) H0による完全カットオフ (変更なし)
             if self.h0_map is not None:
                 h0_DF, h0_F, h0_G = self.h0_map(P_DF), self.h0_map(P_F), self.h0_map(P_G)
                 F_DF = torch.where(h_DF <= h0_DF, F_DF, torch.zeros_like(F_DF))
