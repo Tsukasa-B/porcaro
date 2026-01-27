@@ -41,4 +41,4 @@ class RewardsCfg:
     target_force_fd: float = 20.0 # 基準となる力
     sigma_force: float = 15.0      # 許容誤差の幅
     
-    limit_wrist_range: tuple[float, float] = (-80.0, 30.0)
+    limit_wrist_range: tuple[float, float] = (-30.0, 80.0)
