@@ -200,8 +200,8 @@ class PorcaroRLEnv(DirectRLEnv):
     # ----------------------------------------------------------------------
     def _get_corrected_joint_state(self):
         """
-        Sim(下=正) から取得した関節状態を、プロジェクト仕様(上=正)に変換して返す。
-        戻り値: (q_corrected, qd_corrected) ※対象DOFのみ抽出済み
+        Sim(負方向=正) から取得した関節状態を、プロジェクト仕様(正方向=正)に変換して返す。
+        対象: 手首(0) と グリップ(1) 両方の符号を反転。
         """
         # 全関節を取得
         q_full = self.robot.data.joint_pos
@@ -211,23 +211,21 @@ class PorcaroRLEnv(DirectRLEnv):
         q = q_full[:, self.dof_idx].clone()
         qd = qd_full[:, self.dof_idx].clone()
         
-        # 手首 (Index 0) の符号を反転 (Down+ -> Up+)
-        q[:, 0] *= -1.0
-        qd[:, 0] *= -1.0
+        # ★修正: 全ての対象軸(0, 1)の符号を反転
+        q *= -1.0
+        qd *= -1.0
         
         return q, qd
 
     def _get_corrected_full_state(self):
-        """
-        コントローラやログ用に、全関節配列(q_full)の手首だけ反転したものを返す
-        """
+        """コントローラやログ用に、全関節配列(q_full)の対象軸だけ反転したものを返す"""
         q_full = self.robot.data.joint_pos.clone()
         qd_full = self.robot.data.joint_vel.clone()
         
-        # 手首のIndexを特定して反転
-        wrist_idx = self.dof_idx[0]
-        q_full[:, wrist_idx] *= -1.0
-        qd_full[:, wrist_idx] *= -1.0
+        # ★修正: 対象軸のインデックス全てで反転
+        wrist_idx, grip_idx = self.joint_ids_tuple
+        q_full[:, [wrist_idx, grip_idx]] *= -1.0
+        qd_full[:, [wrist_idx, grip_idx]] *= -1.0
         
         return q_full, qd_full
 
@@ -437,12 +435,12 @@ class PorcaroRLEnv(DirectRLEnv):
              # 手首: 屈曲(F) - 背屈(DF)  ※注: torque.py の修正と合わせるなら符号に注意
              # ここでは「DFが引くと正(上)」となる定義と仮定
              tau_wrist = r * (force[:, 0] - force[:, 1]) # DF - F
-             tau_grip  = r * force[:, 2]
+             tau_grip  = r * (- force[:, 2])
              
              torques = torch.stack([tau_wrist, tau_grip], dim=1)
 
             # ★重要: Simに書き込む直前に手首トルクを反転 (Simは上が負なので、正のトルクを伝えるには負にする)
-             torques[:, 0] *= -1.0
+             torques *= -1.0
              
              # ロボットへ適用 (Model Cの場合はここで終了)
              self.robot.set_joint_effort_target(torques, joint_ids=self.joint_ids_tuple)
@@ -533,7 +531,7 @@ class PorcaroRLEnv(DirectRLEnv):
         
         # ★修正: Simへの書き込みなので、符号を反転させる (Code(Up+) -> Sim(Down+))
         q_target[:, wrist_idx] = -val_wrist # <--- 反転
-        q_target[:, grip_idx]  = val_grip
+        q_target[:, grip_idx]  = -val_grip
         qd_target[:] = 0.0
         
         # 3. 物理エンジンへの書き込み
