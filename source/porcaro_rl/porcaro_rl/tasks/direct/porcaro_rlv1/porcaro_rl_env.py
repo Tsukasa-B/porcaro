@@ -195,6 +195,42 @@ class PorcaroRLEnv(DirectRLEnv):
         all_ids = torch.arange(self.num_envs, device=self.device)
         self.rhythm_generator.reset(all_ids)
 
+    # ----------------------------------------------------------------------
+    # [New] 座標系変換ヘルパー (Sim:Down+ <-> Project:Up+)
+    # ----------------------------------------------------------------------
+    def _get_corrected_joint_state(self):
+        """
+        Sim(下=正) から取得した関節状態を、プロジェクト仕様(上=正)に変換して返す。
+        戻り値: (q_corrected, qd_corrected) ※対象DOFのみ抽出済み
+        """
+        # 全関節を取得
+        q_full = self.robot.data.joint_pos
+        qd_full = self.robot.data.joint_vel
+        
+        # 対象DOFを抽出 [Batch, 2]
+        q = q_full[:, self.dof_idx].clone()
+        qd = qd_full[:, self.dof_idx].clone()
+        
+        # 手首 (Index 0) の符号を反転 (Down+ -> Up+)
+        q[:, 0] *= -1.0
+        qd[:, 0] *= -1.0
+        
+        return q, qd
+
+    def _get_corrected_full_state(self):
+        """
+        コントローラやログ用に、全関節配列(q_full)の手首だけ反転したものを返す
+        """
+        q_full = self.robot.data.joint_pos.clone()
+        qd_full = self.robot.data.joint_vel.clone()
+        
+        # 手首のIndexを特定して反転
+        wrist_idx = self.dof_idx[0]
+        q_full[:, wrist_idx] *= -1.0
+        qd_full[:, wrist_idx] *= -1.0
+        
+        return q_full, qd_full
+
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
         self.drum = RigidObject(self.cfg.drum_cfg)
@@ -267,11 +303,14 @@ class PorcaroRLEnv(DirectRLEnv):
                      nan_tensor = torch.full((self.num_envs, 3), float('nan'), device=self.device)
                      if "P_cmd" not in telemetry: telemetry["P_cmd"] = nan_tensor
                      if "P_out" not in telemetry: telemetry["P_out"] = nan_tensor
+
+                # ★修正: ログには補正後の値を渡す
+                q_log, qd_log = self._get_corrected_full_state()
                 
                 # バッファに追加
                 self.logging_manager.buffer_step_data(
-                    q_full=self.robot.data.joint_pos,
-                    qd_full=self.robot.data.joint_vel,
+                    q_full=q_log,   # <--- 修正
+                    qd_full=qd_log, # <--- 修正
                     telemetry=telemetry,
                     actions=self.actions,
                     current_sim_time=self.sim.current_time,
@@ -382,8 +421,8 @@ class PorcaroRLEnv(DirectRLEnv):
                  # 例: raw_cmd がそのまま圧力比率なら Pmax を掛けるなど
                  p_cmd_3d = torch.zeros((self.num_envs, 3), device=self.device)
             
-             theta = self.robot.data.joint_pos[:, self.dof_idx]
-             theta_dot = self.robot.data.joint_vel[:, self.dof_idx]
+             # ★修正: ヘルパーを使って「上=正」の状態を取得
+             theta, theta_dot = self._get_corrected_joint_state()
              
              # 推論実行: (P_cmd, P_prev, Theta, Theta_dot) -> (Force, P_est)
              force, p_est = self.actuator_net(p_cmd_3d, self.last_pressure_est, theta, theta_dot)
@@ -395,12 +434,15 @@ class PorcaroRLEnv(DirectRLEnv):
              # Index: 0=DF, 1=F, 2=G (cfg/actuator_net_cfg.py の定義に準拠)
              r = self.action_controller.cfg.r
              
-             # 手首: 屈曲(F) - 背屈(DF)
-             tau_wrist = r * (force[:, 1] - force[:, 0])
-             # グリップ: 把持(G)
+             # 手首: 屈曲(F) - 背屈(DF)  ※注: torque.py の修正と合わせるなら符号に注意
+             # ここでは「DFが引くと正(上)」となる定義と仮定
+             tau_wrist = r * (force[:, 0] - force[:, 1]) # DF - F
              tau_grip  = r * force[:, 2]
              
              torques = torch.stack([tau_wrist, tau_grip], dim=1)
+
+            # ★重要: Simに書き込む直前に手首トルクを反転 (Simは上が負なので、正のトルクを伝えるには負にする)
+             torques[:, 0] *= -1.0
              
              # ロボットへ適用 (Model Cの場合はここで終了)
              self.robot.set_joint_effort_target(torques, joint_ids=self.joint_ids_tuple)
@@ -418,19 +460,19 @@ class PorcaroRLEnv(DirectRLEnv):
         processed_actions = torch.clamp(processed_actions, -1.0, 1.0)
 
         # 6. トルク計算・適用
-        q_full = self.robot.data.joint_pos 
+        # ★修正: コントローラには「上=正」に補正した full_q を渡す
+        q_full_corrected, _ = self._get_corrected_full_state()
         
         self.action_controller.apply(
             actions=processed_actions,
-            q=q_full,
+            q=q_full_corrected,
             joint_ids=self.joint_ids_tuple,
             robot=self.robot
         )
 
 
     def _get_observations(self) -> dict:
-        q = self.robot.data.joint_pos[:, self.dof_idx]
-        qd = self.robot.data.joint_vel[:, self.dof_idx]
+        q, qd = self._get_corrected_joint_state()
         
         current_steps = self.episode_length_buf
         bpm_obs = self.rhythm_generator.current_bpms.view(self.num_envs, 1) / 180.0
@@ -453,9 +495,12 @@ class PorcaroRLEnv(DirectRLEnv):
             val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
             target_ref = torch.full((self.num_envs,), val, device=self.device)
 
+        # ★修正: joint_pos に補正済みの値を渡す
+        q_corr, _ = self._get_corrected_joint_state()
+
         total_reward, reward_terms = self.reward_manager.compute_rewards(
             actions=self.actions,
-            joint_pos=self.robot.data.joint_pos[:, self.dof_idx],
+            joint_pos=q_corr,
             force_z=force_max, 
             target_force_trace=target_trace, 
             target_force_ref=target_ref,
@@ -486,7 +531,8 @@ class PorcaroRLEnv(DirectRLEnv):
         wrist_idx = self.dof_idx[0]
         grip_idx  = self.dof_idx[1]
         
-        q_target[:, wrist_idx] = val_wrist
+        # ★修正: Simへの書き込みなので、符号を反転させる (Code(Up+) -> Sim(Down+))
+        q_target[:, wrist_idx] = -val_wrist # <--- 反転
         q_target[:, grip_idx]  = val_grip
         qd_target[:] = 0.0
         
