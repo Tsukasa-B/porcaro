@@ -31,7 +31,7 @@ class RewardsCfg:
     max_contact_duration_s: float = 0.06
 
     # 4. 関節制限 (Joint Limits)
-    weight_joint_limits: float = -1.0
+    weight_joint_limits: float = 0.0
 
     # 5. アクションの滑らかさ/省エネ
     weight_action_rate: float = 0.0
@@ -41,4 +41,4 @@ class RewardsCfg:
     target_force_fd: float = 20.0 # 基準となる力
     sigma_force: float = 15.0      # 許容誤差の幅
     
-    limit_wrist_range: tuple[float, float] = (-30.0, 80.0)
+    limit_wrist_range: tuple[float, float] = (-100.0, 120.0)#使わないので範囲外に出してる

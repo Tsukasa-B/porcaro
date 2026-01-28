@@ -9,7 +9,7 @@ class SimpleRhythmGenerator:
     固定パターン（Rudiments）を繰り返し生成し、基礎動作の習得を確認する。
     """
     def __init__(self, num_envs, device, dt, max_episode_length, 
-                 mode="single", bpm=60.0, target_force=20.0):
+                 mode="single", bpm=60.0, target_force=50.0):
         
         self.num_envs = num_envs
         self.device = device

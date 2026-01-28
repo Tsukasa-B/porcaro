@@ -1,7 +1,7 @@
 # scripts/verification/run_manual_verification.py
 """
 Porcaro Robot: Multi-Model Manual Verification Script
-GUI Crash Fix Included
+GUI Crash Fix Included & Time-Sync Logic Improved
 """
 import argparse
 import sys
@@ -9,12 +9,9 @@ import os
 
 # =============================================================================
 # ★最重要修正: GUIクラッシュ対策
-# Isaac Sim (Kit) のGUIと競合しないよう、Matplotlibを非表示モードに強制設定します。
-# これを他のあらゆるimportより先に書く必要があります。
 # =============================================================================
 import matplotlib
 matplotlib.use('Agg') 
-#import matplotlib.pyplot as plt
 
 # -----------------------------------------------------------------------------
 # 1. 引数定義
@@ -91,12 +88,13 @@ class SignalGeneratorAgent:
             self._init_pattern_mode(args)
 
     def _init_replay(self, csv_filename):
+        # パス解決ロジック
         candidates = [
             csv_filename,
-            os.path.join("external_data", "jetson_project", csv_filename),
-            os.path.join("porcaro_rl", "external_data", "jetson_project", csv_filename),
-            os.path.join("source", "porcaro_rl", "external_data", "jetson_project", csv_filename),
-            os.path.join("..", "external_data", "jetson_project", csv_filename)
+            os.path.join("IROS", "test_signals", csv_filename),
+            os.path.join("external_data", "jetson_project", "IROS", "test_signals", csv_filename),
+            os.path.join("porcaro_rl", "external_data", "jetson_project", "IROS", "test_signals", csv_filename),
+            os.path.join("..", "external_data", "jetson_project", "IROS", "test_signals", csv_filename)
         ]
         final_path = None
         for path in candidates:
@@ -106,25 +104,44 @@ class SignalGeneratorAgent:
         
         if final_path is None:
             print(f"\n[ERROR] CSV File not found: {csv_filename}")
+            print(f"Searched in: {candidates}")
             sys.exit(1)
 
         print(f"\n[Agent] REPLAY MODE: Loading {final_path} ...")
         try:
             df = pd.read_csv(final_path)
-            df = df.sort_values(by='timestamp')
-            df = df.drop_duplicates(subset='timestamp', keep='first')
             
-            t_real = df['timestamp'].values
+            # --- 修正箇所: 時間カラムの判定 (time or timestamp) ---
+            time_col = None
+            if 'time' in df.columns:
+                time_col = 'time'
+            elif 'timestamp' in df.columns:
+                time_col = 'timestamp'
+            else:
+                raise ValueError("CSV must contain 'time' or 'timestamp' column.")
+
+            # 時間順にソート
+            df = df.sort_values(by=time_col)
+            # 重複削除
+            df = df.drop_duplicates(subset=time_col, keep='first')
+            
+            # Simのt=0に合わせて時間を正規化
+            t_real = df[time_col].values
             t_real = t_real - t_real[0]
             
-            cmd_data = df[['cmd_DF', 'cmd_F', 'cmd_G']].values
+            # Sim制御周期(50Hz) < CSV記録周期(100Hz) の場合もあるため、
+            # 線形補間を作成して、Simのステップ時間(self.t)に厳密に合わせる
+            cmd_data = df[['cmd_pressure_DF', 'cmd_pressure_F', 'cmd_pressure_G']].values if 'cmd_pressure_DF' in df.columns else df[['cmd_DF', 'cmd_F', 'cmd_G']].values
 
             self.replay_interpolator = interp1d(
                 t_real, cmd_data, axis=0, kind='linear', 
                 bounds_error=False, fill_value=(cmd_data[0], cmd_data[-1])
             )
             self.max_replay_time = t_real[-1]
+            
             print(f" -> Loaded {len(df)} rows. Duration: {self.max_replay_time:.2f}s")
+            print(f" -> Time Column: '{time_col}'")
+            print(f" -> Sim Control DT: {self.dt:.4f}s")
             
         except Exception as e:
             print(f"[Agent] Error loading CSV: {e}")
@@ -138,6 +155,7 @@ class SignalGeneratorAgent:
         print(f"\n[Agent] Mode: {args.mode}")
 
     def _pressure_to_action(self, p_mpa):
+        # 0.0~0.6MPa -> -1.0~1.0 (Normalized Action)
         p = np.clip(p_mpa, 0.0, self.P_MAX)
         return 2.0 * (p / self.P_MAX) - 1.0
 
@@ -148,6 +166,8 @@ class SignalGeneratorAgent:
             if self.t > self.max_replay_time + 0.5:
                 self.replay_finished = True
                 return torch.zeros((self.num_envs, 3), device=self.device)
+            
+            # 現在のシミュレーション時刻(self.t)における正確な指令値を補間取得
             cmds = self.replay_interpolator(self.t)
             p_df, p_f, p_g = cmds[0], cmds[1], cmds[2]
 
@@ -185,6 +205,7 @@ class SignalGeneratorAgent:
         actions[:, 1] = self._pressure_to_action(p_f)
         actions[:, 2] = self._pressure_to_action(p_g)
         
+        # 次のステップへ時間を進める (Sim制御周期分)
         self.t += self.dt
         return actions
 
@@ -213,10 +234,14 @@ def main():
             env_cfg.terminations = None
             
         if args.no_drum:
-            if hasattr(env_cfg, "drum_cfg"):
-                env_cfg.drum_cfg.init_state.pos = (0.0, 0.0, -10.0)
-            elif hasattr(env_cfg.scene, "drum"):
-                env_cfg.scene.drum.init_state.pos = (0.0, 0.0, -10.0)
+            # ドラム位置の退避処理
+            try:
+                if hasattr(env_cfg, "drum_cfg"):
+                    env_cfg.drum_cfg.init_state.pos = (0.0, 0.0, -10.0)
+                elif hasattr(env_cfg.scene, "drum"):
+                    env_cfg.scene.drum.init_state.pos = (0.0, 0.0, -10.0)
+            except:
+                pass
 
         dr_str = "DR" if args.dr else "Ideal"
         if args.replay_csv:
@@ -234,30 +259,34 @@ def main():
         # 環境の初期化
         env = PorcaroRLEnv(cfg=env_cfg)
         
+        # --- 修正: DTの計算 ---
+        # Sim Physics (200Hz) -> Decimation (4) -> Control (50Hz)
         if hasattr(env, "step_dt"):
              dt_step = env.step_dt
         else:
-             sim_dt = env.cfg.sim.dt
+             sim_dt = env.cfg.sim.dt # 0.005
              decimation = getattr(env.cfg, "decimation", 4)
              dt_step = sim_dt * decimation
-             print(f"[System] Calculated dt: {dt_step:.5f}s")
+             print(f"[System] Calculated dt: {dt_step:.5f}s (Freq: {1/dt_step:.1f}Hz)")
 
-        if dt_step < 0.01:
-            print(f"[WARNING] dt_step too small. Forcing 0.02s.")
-            dt_step = 0.02
-
+        if dt_step < 0.001:
+            print(f"[WARNING] dt_step too small ({dt_step}). Check config.")
+            
+        # エージェント初期化
         agent = SignalGeneratorAgent(env.num_envs, dt_step, env.device, args)
         
         obs, _ = env.reset()
         print("[System] Simulation Loop Started...")
 
         while simulation_app.is_running():
+            # 現在時刻(self.t)に基づきアクション決定
             actions = agent.get_action(obs)
             
             if agent.is_replay and agent.replay_finished:
                 print("[System] Replay finished.")
                 break
 
+            # ステップ実行 (ここで物理時間がdt_step分進む)
             obs, rew, terminated, truncated, info = env.step(actions)
             
     except KeyboardInterrupt:

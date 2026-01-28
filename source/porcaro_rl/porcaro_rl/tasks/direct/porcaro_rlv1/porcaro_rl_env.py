@@ -140,7 +140,7 @@ class PorcaroRLEnv(DirectRLEnv):
         # =========================================================
         self.dt_ctrl_step = self.cfg.sim.dt * self.cfg.decimation
         use_simple = getattr(self.cfg, "use_simple_rhythm", False)
-        target_force_val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
+        target_force_val = getattr(self.cfg, "target_hit_force", 50.0)
 
         if use_simple:
             mode = getattr(self.cfg, "simple_rhythm_mode", "single")
@@ -170,7 +170,8 @@ class PorcaroRLEnv(DirectRLEnv):
                 max_episode_length=self.max_episode_length,
                 bpm_range=bpm_range,
                 prob_rest=prob_rest,
-                prob_double=prob_double
+                prob_double=prob_double,
+                target_force=target_force_val
             )
         
         lookahead_horizon = getattr(self.cfg, "lookahead_horizon", 0.5)
@@ -401,7 +402,7 @@ class PorcaroRLEnv(DirectRLEnv):
         """アクションの適用 (モデルの切り替えロジックを含む)"""
         
         # 1. 基本のアクション
-        raw_cmd = (self.actions + 1.0) / 2.0
+        raw_cmd = (self.actions + 1.0) / 2.0        # -1~1を0~1に変換
         
         # P_cmd (3ch) の取得
         # TorqueActionController の compute_pressure が [Batch, 3] を返すと仮定
@@ -427,6 +428,19 @@ class PorcaroRLEnv(DirectRLEnv):
              
              # 状態更新
              self.last_pressure_est = p_est.detach()
+
+             # =========================================================
+             # ★追加: Model C 使用時もログ用にテレメトリを更新する
+             # =========================================================
+             # ActuatorNetの推定内圧 (p_est) を P_out としてログに残す
+             if self.action_controller is not None:
+                 self.action_controller._last_telemetry = {
+                     "P_cmd": p_cmd_3d.clone(),
+                     "P_out": p_est.clone(),     # <--- これでログに反映されます
+                     # 以下は必須ではないが形式を合わせるためのプレースホルダ
+                     "tau_w": torch.zeros_like(p_est[:,0]), 
+                     "tau_g": torch.zeros_like(p_est[:,0])
+                 }
              
              # トルク計算: Tau = r * (Pull_F - Pull_DF)
              # Index: 0=DF, 1=F, 2=G (cfg/actuator_net_cfg.py の定義に準拠)
@@ -449,16 +463,9 @@ class PorcaroRLEnv(DirectRLEnv):
         # --- 以下、既存の Model A/B ロジック (Model Cじゃない場合のみ実行) ---
 
         
-        # 4. 遅れモデル (Model A/B)
-        if self.pam_delay is not None:
-            raw_cmd = self.pam_delay(raw_cmd)
+        processed_actions = self.actions
 
-        # 5. 指令値をコントローラ用に戻す
-        processed_actions = (raw_cmd * 2.0) - 1.0
-        processed_actions = torch.clamp(processed_actions, -1.0, 1.0)
-
-        # 6. トルク計算・適用
-        # ★修正: コントローラには「上=正」に補正した full_q を渡す
+        # コントローラに渡す座標系の補正 (Sim:Down+ -> Real:Up+)
         q_full_corrected, _ = self._get_corrected_full_state()
         
         self.action_controller.apply(

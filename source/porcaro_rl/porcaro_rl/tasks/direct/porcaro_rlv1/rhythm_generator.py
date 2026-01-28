@@ -12,12 +12,13 @@ class RhythmGenerator:
     - 波形生成に「1次元畳み込み (Conv1d)」を使用し、全環境分を一括計算。
     """
     def __init__(self, num_envs, device, dt, max_episode_length, 
-                 bpm_range=(60, 160), prob_rest=0.2, prob_double=0.3):
+                 bpm_range=(60, 160), prob_rest=0.2, prob_double=0.3,target_force=20.0):
         
         self.num_envs = num_envs
         self.device = device
         self.dt = dt
         self.max_steps = max_episode_length
+        self.target_peak_force = target_force
         
         # --- 基本設定 ---
         self.base_bpm_min = bpm_range[0]
@@ -45,7 +46,7 @@ class RhythmGenerator:
         t_vals = torch.arange(-kernel_radius, kernel_radius + 1, device=device, dtype=torch.float32) * dt
         
         # ガウス関数
-        kernel = 20.0 * torch.exp(-0.5 * (t_vals / sigma) ** 2)
+        kernel = self.target_peak_force * torch.exp(-0.5 * (t_vals / sigma) ** 2)
         # Conv1d用に形状を整える: [Out_channels, In_channels, Kernel_size] -> [1, 1, K]
         self.kernel = kernel.view(1, 1, -1)
         self.kernel_padding = kernel_radius # sameパディング用

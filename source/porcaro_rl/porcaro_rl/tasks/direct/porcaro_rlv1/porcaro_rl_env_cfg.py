@@ -86,6 +86,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
         natural_length=0.150
     )
     # --------------------------
+    
 
     # ===================================================
     # ★ 追加箇所: シンプルリズム生成設定
@@ -93,6 +94,8 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     use_simple_rhythm: bool = True   # TrueにするとSimpleRhythmGeneratorを使用
     simple_rhythm_mode: str = "double" # "single", "double", "steady"
     simple_rhythm_bpm: float = 160.0    # steadyモード時のBPM
+
+    target_hit_force: float = 50.0  # [N] 目標とする打撃力
 
     # --- 追加設定 ---
     lookahead_horizon: float = 0.5
@@ -105,6 +108,13 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     
     # DR設定用のスロット (デフォルトはNone)
     events: PorcaroEventCfg | None = None
+
+def __post_init__(self):
+        """設定の整合性を保つための後処理"""
+        super().__post_init__()
+        # Rewards設定にある target_force_fd を、ここで設定した値で上書きする
+        if hasattr(self.rewards, "target_force_fd"):
+            self.rewards.target_force_fd = self.target_hit_force
 
 
 @configclass

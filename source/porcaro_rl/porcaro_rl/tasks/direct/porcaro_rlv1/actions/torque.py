@@ -15,7 +15,7 @@ from ..cfg.actuator_cfg import PamGeometricCfg
 class TorqueActionController(ActionController):
     def __init__(self,
                  dt_ctrl: float,
-                 control_mode: str = "ep", 
+                 control_mode: str = "pressure", 
                  r: float = 0.014, L: float = 0.150,
                  theta_t_DF_deg: float = 0.0,
                  theta_t_F_deg:  float = 70.0,
@@ -270,8 +270,12 @@ class TorqueActionController(ActionController):
         tau_full[:, gid] = -tau_g
         robot.set_joint_effort_target(tau_full)
 
+        # P_DF, P_F, P_G は self.ch_*.step() の戻り値（遅延計算後の値）です
+        P_act_stack = torch.stack([P_DF, P_F, P_G], dim=1)
+
         self._last_telemetry = {
-            "P_out": P_cmd_stack.clone(),
+            "P_cmd": P_cmd_stack.clone(),
+            "P_out": P_act_stack.clone(),
             "tau_w": tau_w.clone(),
             "tau_g": tau_g.clone()
         }
