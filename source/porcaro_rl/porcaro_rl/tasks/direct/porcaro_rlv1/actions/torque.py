@@ -18,19 +18,19 @@ class TorqueActionController(ActionController):
                  control_mode: str = "ep", 
                  r: float = 0.014, L: float = 0.150,
                  theta_t_DF_deg: float = 0.0,
-                 theta_t_F_deg:  float = 90.0,
+                 theta_t_F_deg:  float = 70.0,
                  theta_t_G_deg:  float = 45.0,
                  Pmax: float = 0.6,
                  tau: float = 0.09, dead_time: float = 0.03,
                  N: float = 630.0,
-                 pam_viscosity: float = 800.0,
+                 pam_viscosity: float = 200.0,
                  force_map_csv: str | None = None,
                  force_scale: float = 1.0,
                  h0_map_csv: str | None = None,
                  use_pressure_dependent_tau: bool = True,
                  geometric_cfg: PamGeometricCfg | None = None,
                  pressure_shrink_gain: float = 0.02, 
-                 engagement_smoothness: float = 130.0):
+                 engagement_smoothness: float = 150.0):
 
         self.dt_ctrl = float(dt_ctrl)
         self.control_mode = control_mode

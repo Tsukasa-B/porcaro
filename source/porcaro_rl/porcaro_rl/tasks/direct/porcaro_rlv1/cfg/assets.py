@@ -12,7 +12,7 @@ from isaaclab.sim.schemas import MassPropertiesCfg
 
 # --- 定数 ---
 WRIST_J0       = math.radians(0.0)
-GRIP_J0        = math.radians(0)#8.1)
+GRIP_J0        = math.radians(-8.1)
 
 # --- ヘルパー関数 ---
 def quat_from_euler_zyx(yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
@@ -121,14 +121,14 @@ ROBOT_CFG = ArticulationCfg(
         "wrist": ImplicitActuatorCfg(
             joint_names_expr=[".*Base_link_Wrist_joint"],
             stiffness=0.00573,
-            damping=0.13,
+            damping=0.2,
             effort_limit_sim=500.0,
-            friction=0.02,
+            friction=0.05,
         ),
         "grip": ImplicitActuatorCfg(
             joint_names_expr=[".*Hand_link_Grip_joint"],
             stiffness=0.0001,
-            damping=0.001,
+            damping=0.01,
             effort_limit_sim=500.0,
             friction=0.001,
         ),
