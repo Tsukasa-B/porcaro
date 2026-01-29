@@ -18,7 +18,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     
     # ★変更: 150 -> 1500
     # 長時間のエピソードで安定したリズムを習得するため、試行回数を増やします。
-    max_iterations = 1500
+    max_iterations = 3000
     
     save_interval = 50
     experiment_name = "porcaro_rslrl_lstm_v1" # 名前を変えておくと管理しやすいです

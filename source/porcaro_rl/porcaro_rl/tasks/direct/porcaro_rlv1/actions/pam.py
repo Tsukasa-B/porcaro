@@ -163,9 +163,11 @@ def Fpam_quasi_static(P: torch.Tensor, h: torch.Tensor, N: float = 1200.0, Pmax:
     return N * P * eff
 
 class PAMChannel:
-    def __init__(self, dt_ctrl: float, tau: float = 0.09, dead_time: float = 0.03, Pmax: float = 0.6,
+    def __init__(self, dt_ctrl: float, tau: float = 1.09, dead_time: float = 0.03, Pmax: float = 0.6,
                  tau_lut: tuple[list[float], list[float]] | None = None,
-                 use_table_i: bool = True):
+                 use_table_i: bool = True,
+                 use_2d_dynamics: bool = False):
+        
         self.dt = dt_ctrl
         self.dead_time = float(dead_time)
         self.tau = float(tau)
@@ -177,7 +179,7 @@ class PAMChannel:
         self.p_start_latch = None 
         self.prev_target = None
         
-        self.use_2d_dynamics = True
+        self.use_2d_dynamics = use_2d_dynamics
         self.use_table_i = use_table_i
         self._tau_2d, self._dead_2d, self._p_axis_2d = None, None, None
         self._L_prev = None
@@ -228,23 +230,20 @@ class PAMChannel:
     def step(self, P_cmd: torch.Tensor) -> torch.Tensor:
         P_cmd = torch.clamp(P_cmd, 0.0, self.Pmax)
         
-        # === ★修正: Change Detection & Latch Logic (pam_dynamicsと同じにする) ===
+        # === Change Detection & Latch Logic ===
         if self.P_state is None:
-             # 初回呼び出し時の安全策
              self.P_state = torch.zeros_like(P_cmd)
              self.p_start_latch = torch.zeros_like(P_cmd)
              self.prev_target = torch.zeros_like(P_cmd)
 
-        # ターゲット変化検知
         change_mask = torch.abs(P_cmd - self.prev_target) > 1e-4
         if change_mask.any():
-            # 変化した環境だけ、現在の圧力を「開始圧力」として記憶
             self.p_start_latch[change_mask] = self.P_state[change_mask].detach()
             self.prev_target[change_mask] = P_cmd[change_mask]
-        # ====================================================================
+        # ======================================
 
         if self.use_2d_dynamics and self._tau_2d is not None:
-            # ★修正: y_query を P_state (現在値) から self.p_start_latch (記憶値) に変更
+            # Model B: 2D Dynamics (変更なし)
             tau_now = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._tau_2d, 
                                       x_query=P_cmd, y_query=self.p_start_latch)
             L_cmd   = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._dead_2d, 
@@ -252,11 +251,22 @@ class PAMChannel:
             
         elif self.use_table_i:
             if self._tau_x is None:
-                tau_now, L_cmd = tau_L_from_pressure(P_cmd)
+                # === [修正箇所] Model A対応 ===
+                # 元コード: tau_now, L_cmd = tau_L_from_pressure(P_cmd)
+                # 理由: Model Aの要件「時定数0.09固定、むだ時間は1Dテーブル」を満たすため、
+                #      テーブルから取得したtauを無視し、self.tau(固定値)を使用する。
+                
+                _, L_table_val = tau_L_from_pressure(P_cmd) # Table IからLだけ取得
+                
+                tau_now = torch.full_like(P_cmd, self.tau)  # 時定数は固定 (0.09)
+                L_cmd   = L_table_val                       # むだ時間はテーブル値
+                # ==============================
             else:
+                # カスタム1Dテーブル (変更なし)
                 tau_now = interp1d_clamp_torch(self._tau_x, self._tau_y, P_cmd)
                 L_cmd = torch.full_like(P_cmd, self.dead_time)
         else:
+            # 完全固定モデル (変更なし)
             tau_now = torch.full_like(P_cmd, self.tau)
             L_cmd   = torch.full_like(P_cmd, self.dead_time)
 

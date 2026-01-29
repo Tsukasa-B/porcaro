@@ -23,7 +23,7 @@ class TorqueActionController(ActionController):
                  Pmax: float = 0.6,
                  tau: float = 0.09, dead_time: float = 0.03,
                  N: float = 630.0,
-                 pam_viscosity: float = 200.0,
+                 pam_viscosity: float = 0.0,
                  force_map_csv: str | None = None,
                  force_scale: float = 1.0,
                  h0_map_csv: str | None = None,

@@ -191,9 +191,10 @@ class PorcaroRLEnvCfg_ModelA(PorcaroRLEnvCfg):
         self.actuator_net_cfg = None
 
         # コントローラ側の遅れは無効化 (二重適用防止)
-        self.controller.tau = 0.0
+        self.controller.tau = 0.09
         self.controller.dead_time = 0.0
-        self.controller.use_pressure_dependent_tau = False
+        self.controller.use_pressure_dependent_tau = True
+        
 
 @configclass
 class PorcaroRLEnvCfg_ModelA_DR(PorcaroRLEnvCfg_ModelA):
