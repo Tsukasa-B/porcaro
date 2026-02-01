@@ -16,8 +16,7 @@ from isaaclab.managers import EventManager
 # Porcaro RL imports
 from .porcaro_rl_env_cfg import PorcaroRLEnvCfg
 from .actions.base import ActionController
-from .cfg.actuator_cfg import PamDelayModelCfg, ActuatorNetModelCfg
-from .actions.pam_dynamics import PamDelayModel, ActuatorNetModel
+from .actions.pam_dynamics import ActuatorNetModel
 from .actions.torque import TorqueActionController
 from .logging.logging_manager import LoggingManager
 from .rewards.reward import RewardManager
@@ -46,7 +45,6 @@ class PorcaroRLEnv(DirectRLEnv):
         self.reward_manager: RewardManager = None
         
         # ActuatorNet / Dynamics モデル（Noneで初期化）
-        self.pam_delay: PamDelayModel | None = None
         self.actuator_net: ActuatorNetModel | None = None
 
         # 親クラスの __init__ を呼ぶ
@@ -95,9 +93,7 @@ class PorcaroRLEnv(DirectRLEnv):
         )
         self.action_controller.reset(self.num_envs, self.device)
 
-        # ★★★ ActuatorNet / PAM Dynamics の初期化 ★★★
-        if hasattr(self.cfg, "pam_delay_cfg") and self.cfg.pam_delay_cfg is not None:
-             self.pam_delay = PamDelayModel(self.cfg.pam_delay_cfg, dt_ctrl, self.device)
+
         
 
 
@@ -555,8 +551,6 @@ class PorcaroRLEnv(DirectRLEnv):
         if hasattr(self, "rhythm_generator"):
             self.rhythm_generator.reset(env_ids)
             
-        if self.pam_delay is not None:
-            self.pam_delay.reset_idx(env_ids)
 
         # --- [追加] Model C用のリセット ---
         if hasattr(self, "last_pressure_est"):

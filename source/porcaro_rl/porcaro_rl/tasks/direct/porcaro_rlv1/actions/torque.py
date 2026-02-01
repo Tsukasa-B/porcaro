@@ -6,7 +6,6 @@ from .pam import (
     PAMChannel, contraction_ratio_from_angle, calculate_effective_contraction,
     Fpam_quasi_static, PamForceMap, H0Map,
     apply_soft_engagement,
-    # --- 追加: Model A用関数 ---
     calculate_absolute_contraction,
     apply_model_a_force
 )
@@ -44,7 +43,7 @@ class TorqueActionController(ActionController):
         self.force_scale = float(force_scale)
         self.engagement_smoothness = float(engagement_smoothness)
 
-        # === ForceMap読み込み ===
+        # Force Mapの読み込み
         print("-" * 60)
         print(f"[TorqueActionController] Initializing PAM Force Model...")
         if force_map_csv:
@@ -61,30 +60,33 @@ class TorqueActionController(ActionController):
         
         self.h0_map = H0Map.from_csv(h0_map_csv) if h0_map_csv else None
 
-        # --- 幾何学補正設定 & Model A判定 ---
+        # --- Model A/B 切り替え設定 ---
         if geometric_cfg is not None:
             self.use_effective_contraction = geometric_cfg.enable_slack_compensation
             self.slack_offsets = torch.tensor(geometric_cfg.wire_slack_offsets)
             self.L0_sim = geometric_cfg.natural_length
-            
-            # ★ Model A フラグの取得 (デフォルトはFalse)
             self.use_absolute_geometry = getattr(geometric_cfg, "use_absolute_geometry", False)
         else:
             self.use_effective_contraction = False
             self.slack_offsets = torch.zeros(3)
             self.L0_sim = self.L
             self.use_absolute_geometry = False
-        # ---------------------
-
+        
+        # Model Aの場合は2Dダイナミクスを使わない、Model Bなら使う
+        use_2d = not self.use_absolute_geometry
+        
         tau_lut = None
         if use_pressure_dependent_tau:
             tau_P_axis = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
             tau_vals   = [0.043,0.045,0.060,0.066,0.094,0.131]
             tau_lut = (tau_P_axis, tau_vals)
 
-        self.ch_DF = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut)
-        self.ch_F  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut)
-        self.ch_G  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut)
+        # PAMChannel 初期化
+        # Model A (use_absolute=True) -> use_2d_dynamics=False -> use_table_i=True (tau固定/L可変)
+        # Model B (use_absolute=False) -> use_2d_dynamics=True
+        self.ch_DF = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut, use_2d_dynamics=use_2d)
+        self.ch_F  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut, use_2d_dynamics=use_2d)
+        self.ch_G  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut, use_2d_dynamics=use_2d)
         
         self._last_telemetry: dict | None = None
         self.pressure_shrink_gain = float(pressure_shrink_gain)
@@ -95,6 +97,7 @@ class TorqueActionController(ActionController):
         self.ch_G.reset(n_envs, device)
         if self.force_map is not None: self.force_map.to(device)
         if self.h0_map is not None: self.h0_map.to(device)
+        self.slack_offsets = self.slack_offsets.to(device)
         self._last_telemetry = None
 
     def reset_idx(self, env_ids: torch.Tensor):
@@ -124,7 +127,6 @@ class TorqueActionController(ActionController):
         else:
             P_cmd_stack = torch.zeros_like(actions) 
         
-        # 量子化 (Quantization)
         STEP_SIZE = 0.05
         P_cmd_quantized = torch.round(P_cmd_stack / STEP_SIZE) * STEP_SIZE
         return torch.clamp(P_cmd_quantized, 0.0, self.Pmax)
@@ -135,10 +137,8 @@ class TorqueActionController(ActionController):
         wid, gid = joint_ids
         n_envs = int(q.shape[0])
 
-        # 速度取得
-        # robot.data.joint_vel はSim生データ(下=正)なので、そのまま使うと逆になる
+        # 速度取得 (Sim生:下=正 -> Code:上=正 へ変換)
         dq_sim = robot.data.joint_vel  
-        # Code座標系(上=正) に合わせるために -1.0 を掛ける
         dq_wrist = -torch.rad2deg(dq_sim[:, wid]) 
         dq_grip  = -torch.rad2deg(dq_sim[:, gid])
 
@@ -152,7 +152,7 @@ class TorqueActionController(ActionController):
         # 1) 指令値計算
         P_cmd_stack = self._compute_command_pressure(actions)
 
-        # 2) 遅れ計算 (Dynamics)
+        # 2) 遅れ計算 (Dynamics) - ここが計算の本体
         P_DF = self.ch_DF.step(P_cmd_stack[:, 0])
         P_F  = self.ch_F.step(P_cmd_stack[:, 1])
         P_G  = self.ch_G.step(P_cmd_stack[:, 2])
@@ -160,30 +160,17 @@ class TorqueActionController(ActionController):
         q_wrist = torch.rad2deg(q[:, joint_ids[0]])
         q_grip  = torch.rad2deg(q[:, joint_ids[1]])
 
-        # ---------------------------------------------------------------
-        # Model A (Ideal) vs Model B (Physics-Informed) の分岐
-        # ---------------------------------------------------------------
-        # ---------------------------------------------------------------
-        # Model A / B 共通修正
-        # ---------------------------------------------------------------
-        # ---------------------------------------------------------------
-        # 収縮率計算 (Signの定義: Code座標系での動作方向に対する筋肉の伸縮)
-        # ---------------------------------------------------------------
-        # Code座標系:
-        #   Wrist: 上(正)に動くと -> DF縮む(sign=1.0), F伸びる(sign=-1.0)
-        #   Grip : 上(正)に動くと -> G伸びる(sign=-1.0)
-        SIGN_DF =  1.0      # 上が正 → 上がると縮む
-        SIGN_F  = -1.0      # 上が正 → 上がると伸びる
-        SIGN_G  = -1.0      # 上が正　→　上がるとの伸びる
+        # 動作方向 (Code座標系: 上=正)
+        SIGN_DF =  1.0      # 上がると縮む
+        SIGN_F  = -1.0      # 上がると伸びる
+        SIGN_G  = -1.0      # 上がると伸びる
 
         if self.use_absolute_geometry:
             # === [Model A] ===
-            # 絶対値を取るため sign は直接影響しないが、theta_t の解釈に関わるため一貫性を保つ
             eps_DF = calculate_absolute_contraction(q_wrist, self.theta_t["DF"], self.r, self.L0_sim)
             eps_F  = calculate_absolute_contraction(q_wrist, self.theta_t["F"],  self.r, self.L0_sim)
             eps_G  = calculate_absolute_contraction(q_grip,  self.theta_t["G"],  self.r, self.L0_sim)
             
-            # ... (力の計算ロジックは変更なし) ...
             if self.force_map is not None and self.h0_map is not None:
                 F_DF = apply_model_a_force(self.force_map, self.h0_map, P_DF, eps_DF) * self.force_scale
                 F_F  = apply_model_a_force(self.force_map, self.h0_map, P_F,  eps_F)  * self.force_scale
@@ -196,7 +183,6 @@ class TorqueActionController(ActionController):
         else:
             # === [Model B] ===
             if self.use_effective_contraction:
-                # ★修正: sign引数を変更
                 h_DF = calculate_effective_contraction(
                     q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0], 
                     pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_DF) 
@@ -206,16 +192,14 @@ class TorqueActionController(ActionController):
                 h_G = calculate_effective_contraction(
                     q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2], 
                     pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_G)
-                
                 raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
             else:
-                # Legacy Mode
                 h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L, sign=SIGN_DF)
                 h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"],  self.r, self.L, sign=SIGN_F)
                 h_G  = contraction_ratio_from_angle(q_grip,  self.theta_t["G"],  self.r, self.L, sign=SIGN_G)
                 raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
 
-            # 4) 静的力 (Static Force)
+            # 静的力
             if self.force_map is not None:
                 F_DF_static = self.force_map(P_DF, h_DF) * self.force_scale
                 F_F_static  = self.force_map(P_F,  h_F)  * self.force_scale
@@ -225,22 +209,21 @@ class TorqueActionController(ActionController):
                 F_F_static  = Fpam_quasi_static(P_F,  torch.clamp(h_F, min=0),  N=self.N, Pmax=self.Pmax) * self.force_scale
                 F_G_static  = Fpam_quasi_static(P_G,  torch.clamp(h_G, min=0),  N=self.N, Pmax=self.Pmax) * self.force_scale
 
-            # 5) 粘性力 (Viscous Force)
+            # 粘性力
             def calculate_viscous_force(dq_deg, r, sign, viscosity_coeff):
                 dq_rad = torch.deg2rad(dq_deg)
                 v_muscle = -1.0 * sign * r * dq_rad
                 return viscosity_coeff * v_muscle
             
-            # ★修正: 粘性も新しい sign を使用
             visc_DF = calculate_viscous_force(dq_wrist, self.r, SIGN_DF, self.pam_viscosity)
             visc_F  = calculate_viscous_force(dq_wrist, self.r, SIGN_F,  self.pam_viscosity)
             visc_G  = calculate_viscous_force(dq_grip,  self.r, SIGN_G,  self.pam_viscosity)
 
-            # 6) 合算 & Soft Engagement (変更なし)
             F_DF_total_raw = F_DF_static + visc_DF
             F_F_total_raw  = F_F_static  + visc_F
             F_G_total_raw  = F_G_static  + visc_G
 
+            # Soft Engagement
             if self.use_effective_contraction:
                 F_DF = apply_soft_engagement(F_DF_total_raw, raw_eps_DF, self.engagement_smoothness)
                 F_F  = apply_soft_engagement(F_F_total_raw,  raw_eps_F,  self.engagement_smoothness)
@@ -250,29 +233,24 @@ class TorqueActionController(ActionController):
                 F_F  = torch.clamp(F_F_total_raw,  min=0.0)
                 F_G  = torch.clamp(F_G_total_raw,  min=0.0)
 
-            # 7) H0による完全カットオフ (変更なし)
+            # H0 Cutoff
             if self.h0_map is not None:
                 h0_DF, h0_F, h0_G = self.h0_map(P_DF), self.h0_map(P_F), self.h0_map(P_G)
                 F_DF = torch.where(h_DF <= h0_DF, F_DF, torch.zeros_like(F_DF))
                 F_F  = torch.where(h_F  <= h0_F,  F_F,  torch.zeros_like(F_F))
                 F_G  = torch.where(h_G  <= h0_G,  F_G,  torch.zeros_like(F_G))
 
-        # ---------------------------------------------------------------
-        # 共通: トルク変換 & 適用
-        # ---------------------------------------------------------------
-        # 現実ベース F_DFは上向きの力 F_FとF_Gは下向きの力
+        # トルク計算 (F_DF: 上向き力, F_F: 下向き力)
         tau_w = self.r * (F_DF - F_F)
         tau_g = self.r * (- F_G)
 
         tau_full = torch.zeros(n_envs, robot.num_joints, device=q.device, dtype=q.dtype)
-        # ★重要: Sim(下=正)に送るため、ここでトルクを反転させる (Code:Up+ -> Sim:Down+) 現実ベースと反転させるために負にする
-        tau_full[:, wid] = -tau_w # <--- 反転
+        # Code(上=正) -> Sim(下=正) 変換のため符号反転
+        tau_full[:, wid] = -tau_w
         tau_full[:, gid] = -tau_g
         robot.set_joint_effort_target(tau_full)
 
-        # P_DF, P_F, P_G は self.ch_*.step() の戻り値（遅延計算後の値）です
         P_act_stack = torch.stack([P_DF, P_F, P_G], dim=1)
-
         self._last_telemetry = {
             "P_cmd": P_cmd_stack.clone(),
             "P_out": P_act_stack.clone(),

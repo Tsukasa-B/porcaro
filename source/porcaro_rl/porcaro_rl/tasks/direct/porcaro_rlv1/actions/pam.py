@@ -4,9 +4,9 @@ import math
 import torch
 import torch.nn as nn
 import csv
+from typing import Sequence
 
-# ★重要: ここで torque や pam_dynamics をインポートすると循環参照になります。
-# 許されるのは pneumatic や util 系のみです。
+# 循環参照回避のため、pneumaticのみインポート
 from .pneumatic import(
     tau_L_from_pressure,
     first_order_lag,
@@ -16,7 +16,7 @@ from .pneumatic import(
     get_2d_tables,
 )
 
-# === Model A 用の計算ロジックを追加 ===
+# === Model A 用の計算ロジック ===
 
 def calculate_absolute_contraction(theta_deg, theta_t_deg, r, L0, clamp: bool = True):
     """
@@ -49,15 +49,13 @@ def apply_model_a_force(force_map: PamForceMap, h0_map: H0Map, pressure: torch.T
     force = force_map(pressure, epsilon_geo)
     
     # 3. ハードカットオフ (Soft Engagementなし)
-    # 収縮率が h0 を超えている(縮みすぎ)場合は張力ゼロ
     mask = (epsilon_geo <= h0).float()
     
     return force * mask
 
-# === 以下、既存のクラス定義 ===
+# === 以下、既存クラス定義 ===
 
 class PamForceMap(nn.Module):
-    # ... (既存コード: __init__, from_csv, forward) ...
     def __init__(self, P_axis, h_axis, F_table):
         super().__init__()
         self.register_buffer('P', torch.as_tensor(P_axis, dtype=torch.float32))
@@ -87,7 +85,6 @@ class PamForceMap(nn.Module):
         return interp2d_bilinear(P_axis, h_axis, Ftab.T, P_in, h_in)
 
 class H0Map(nn.Module):
-    # ... (既存コード: __init__, from_csv, forward) ...
     def __init__(self, P_axis, h0_axis):
         super().__init__()
         self.register_buffer('P', torch.as_tensor(P_axis, dtype=torch.float32))
@@ -124,36 +121,18 @@ def calculate_effective_contraction(theta_deg, theta_t_deg, r, L0,
     theta_t_rad = math.radians(theta_t_deg)
     delta_geo = r * sign * (theta_rad - theta_t_rad)
     L_geo = L0 - delta_geo
-    dynamic_offset = slack_offset - (shrink_gain * pressure)     # たるませるならoffsetを正でいれる圧力の入力でoffsetが消える
-    L_eff = L_geo - dynamic_offset      # たるませるならoffsetを正でいれる
+    dynamic_offset = slack_offset - (shrink_gain * pressure)
+    L_eff = L_geo - dynamic_offset
     epsilon = (L0 - L_eff) / L0
     if clamp:
         return torch.clamp(epsilon, min=0.0)
     return epsilon
 
 def apply_soft_engagement(force: torch.Tensor, epsilon: torch.Tensor, smoothness: float = 100.0) -> torch.Tensor:
-    """
-    [修正版v3] 正しいSoft Engagement
-    - epsilon <= 0 (伸び/張っている): Mask = 1.0 (そのまま)
-    - epsilon > 0  (縮み/たるみ): epsilonが増えるほど Mask -> 0.0 になる
-    """
-    # 1. 伸びている時(負)は常に1.0
-    # 2. たるんでいる時(正)は、0付近なら通し、離れると0にする
-    
-    # たるみ量 (正の値)
     slack_amount = torch.clamp(epsilon, min=0.0)
-    
-    # たるみが大きいほど x は大きくなる
     x = slack_amount * smoothness
-    
-    # x=0(張り始め) -> mask=1.0
-    # x=1(たるみ大) -> mask=0.0
-    # ReLU(1-x) を使って線形減衰、あるいはSigmoid等
     mask_val = torch.clamp(1.0 - x, min=0.0)
-    
-    # 2乗でスムーズに立ち上がり (0付近の連続性確保)
     mask_val = mask_val * mask_val
-    
     return force * mask_val
 
 @torch.no_grad()
@@ -163,19 +142,19 @@ def Fpam_quasi_static(P: torch.Tensor, h: torch.Tensor, N: float = 1200.0, Pmax:
     return N * P * eff
 
 class PAMChannel:
-    def __init__(self, dt_ctrl: float, tau: float = 1.09, dead_time: float = 0.03, Pmax: float = 0.6,
+    def __init__(self, dt_ctrl: float, tau: float = 0.09, dead_time: float = 0.03, Pmax: float = 0.6,
                  tau_lut: tuple[list[float], list[float]] | None = None,
                  use_table_i: bool = True,
                  use_2d_dynamics: bool = False):
         
         self.dt = dt_ctrl
         self.dead_time = float(dead_time)
-        self.tau = float(tau)
+        self.tau = float(tau) # 修正: デフォルト値を 1.09 -> 0.09 へ
         self.Pmax = float(Pmax)
         self.delay = FractionalDelay(dt_ctrl, L_max=0.20)
         
         self.P_state = None
-        # ★追加: ラッチ用変数の初期化
+        # Latch用
         self.p_start_latch = None 
         self.prev_target = None
         
@@ -196,7 +175,6 @@ class PAMChannel:
         z = torch.zeros(n_envs, device=dev, dtype=torch.float32)
         self.P_state = z.clone()
         
-        # ★追加: リセット処理
         self.p_start_latch = z.clone()
         self.prev_target = z.clone()
         
@@ -213,8 +191,7 @@ class PAMChannel:
     def reset_idx(self, env_ids: torch.Tensor | Sequence[int]):
         if self.P_state is not None:
             self.P_state[env_ids] = 0.0
-            
-        # ★追加: リセットidx処理
+        
         if self.p_start_latch is not None:
             self.p_start_latch[env_ids] = 0.0
         if self.prev_target is not None:
@@ -243,30 +220,30 @@ class PAMChannel:
         # ======================================
 
         if self.use_2d_dynamics and self._tau_2d is not None:
-            # Model B: 2D Dynamics (変更なし)
+            # Model B: 2D Dynamics
             tau_now = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._tau_2d, 
                                       x_query=P_cmd, y_query=self.p_start_latch)
             L_cmd   = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._dead_2d, 
                                       x_query=P_cmd, y_query=self.p_start_latch)
             
         elif self.use_table_i:
+            # ★修正箇所: Model A/Default Logic
+            # use_table_i が True なら、むだ時間(L)は常に1Dテーブル(tau_L_from_pressure)から取得する。
+            # これにより、ConfigでLUTが指定されている場合でも、むだ時間の計算はテーブルに従う。
+            
+            # 1. むだ時間の決定 (Table I Logic)
+            _, L_table_val = tau_L_from_pressure(P_cmd)
+            L_cmd = L_table_val
+
+            # 2. 時定数の決定
             if self._tau_x is None:
-                # === [修正箇所] Model A対応 ===
-                # 元コード: tau_now, L_cmd = tau_L_from_pressure(P_cmd)
-                # 理由: Model Aの要件「時定数0.09固定、むだ時間は1Dテーブル」を満たすため、
-                #      テーブルから取得したtauを無視し、self.tau(固定値)を使用する。
-                
-                _, L_table_val = tau_L_from_pressure(P_cmd) # Table IからLだけ取得
-                
-                tau_now = torch.full_like(P_cmd, self.tau)  # 時定数は固定 (0.09)
-                L_cmd   = L_table_val                       # むだ時間はテーブル値
-                # ==============================
+                # Model A (Ideal): 固定時定数
+                tau_now = torch.full_like(P_cmd, self.tau)
             else:
-                # カスタム1Dテーブル (変更なし)
+                # Custom LUTが提供されている場合 (Configで use_pressure_dependent_tau=True の場合)
                 tau_now = interp1d_clamp_torch(self._tau_x, self._tau_y, P_cmd)
-                L_cmd = torch.full_like(P_cmd, self.dead_time)
         else:
-            # 完全固定モデル (変更なし)
+            # 完全固定モデル
             tau_now = torch.full_like(P_cmd, self.tau)
             L_cmd   = torch.full_like(P_cmd, self.dead_time)
 

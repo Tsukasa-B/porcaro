@@ -49,7 +49,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.01, # 探索がすぐ収束してしまうようなら 0.01 -> 0.02 に上げる
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=3.0e-3,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
