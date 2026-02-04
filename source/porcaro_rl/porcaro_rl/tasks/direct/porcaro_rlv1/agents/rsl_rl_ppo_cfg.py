@@ -25,7 +25,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     
     # 💡 修正点2: PolicyクラスをRecurrentバージョンに変更
     policy = RslRlPpoActorCriticRecurrentCfg(
-        init_noise_std=1.0,
+        init_noise_std=1.5,
         # RNNを使う場合、観測の正規化をONにすることが推奨されます
         actor_obs_normalization=True, 
         critic_obs_normalization=True, 

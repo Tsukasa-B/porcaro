@@ -38,8 +38,11 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     """Porcaro 環境用の設定クラス (基本構成 - DRなし)"""
 
     # --- RL 設定 ---
-    decimation: int = 10 # 20ms (50Hz) sim.dt * decimation = 1/1000 *20
-    episode_length_s: float = 8.0
+    decimation: int = 10 
+    
+    # [変更]: 4小節構造 (BPM60時) に耐えられるよう十分な長さを確保
+    # 実際のエピソード終了は BPM に基づき動的に判定されます
+    episode_length_s: float = 20.0
     
     # --- シミュレーション設定 ---
     sim: SimulationCfg = SimulationCfg(
@@ -73,7 +76,8 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     drum_contact_cfg: ContactSensorCfg = drum_vs_stick_cfg
     
     action_space: int = 3
-    observation_space: int = 30
+    # q(2) + qd(2) + last_act(2) + phase(2) + bpm(1) + lookahead(25) = 34
+    observation_space: int = 35
     state_space: int = 0
     
     dof_names: list[str] = ["Base_link_Wrist_joint", "Hand_link_Grip_joint"]
@@ -87,12 +91,17 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     )
 
     # --- シンプルリズム生成設定 ---
+    # [変更]: 統合された RhythmGenerator を使うため、モード指定等は維持しつつ
+    # BPM範囲などを明示的に定義
     use_simple_rhythm: bool = True   
-    simple_rhythm_mode: str = "double" 
-    simple_rhythm_bpm: float = 160.0    
-    target_hit_force: float = 50.0
+    simple_rhythm_mode: str = "single" 
+    simple_rhythm_bpm: float = 60.0    
+    target_hit_force: float = 30.0
 
     lookahead_horizon: float = 0.5
+    
+    # [追加]: ランダム時のBPM範囲
+    bpm_range: tuple[float, float] = (30.0, 160.0)
 
     # --- モジュール別設定 ---
     controller: TorqueControllerCfg = TorqueControllerCfg()
@@ -123,7 +132,7 @@ def apply_domain_randomization(cfg: PorcaroRLEnvCfg):
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "mass_distribution_params": (0.8, 1.2),
+            "mass_distribution_params": (0.9, 1.05),
             "operation": "scale",
         },
     )
@@ -143,8 +152,8 @@ def apply_domain_randomization(cfg: PorcaroRLEnvCfg):
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "position_range": (0.9, 1.1),
-            "velocity_range": (-0.1, 0.1),
+            "position_range": (0.95, 1.05),
+            "velocity_range": (0, 0),
         },
     )
 

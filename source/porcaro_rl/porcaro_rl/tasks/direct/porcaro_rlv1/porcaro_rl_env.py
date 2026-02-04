@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import torch
+import math
 from collections.abc import Sequence
 
 # Isaac Lab imports
@@ -21,7 +22,6 @@ from .actions.torque import TorqueActionController
 from .logging.logging_manager import LoggingManager
 from .rewards.reward import RewardManager
 from .rhythm_generator import RhythmGenerator
-from .simple_rhythm_generator import SimpleRhythmGenerator
 from .cfg.assets import WRIST_J0, GRIP_J0
 from .cfg.actuator_net_cfg import CascadedActuatorNetCfg # <--- 追加
 from .actions.actuator_net import CascadedActuatorNet
@@ -62,10 +62,17 @@ class PorcaroRLEnv(DirectRLEnv):
         # アクションバッファの初期化
         self.actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
 
+        self.prev_actions = torch.zeros_like(self.actions)
+
         # =========================================================
         # ★ [維持] サブステップ間の最大力を保持するバッファ
         # =========================================================
         self.max_force_z_buffer = torch.zeros(self.num_envs, device=self.device)
+        # [追加]: 平均力計算用の積算バッファ
+        self.force_sum_buffer = torch.zeros(self.num_envs, device=self.device)
+
+        # [追加]: 動的エピソード長管理用 (BPMに応じて終了ステップが変わる)
+        self.episode_duration_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
 
         # ---------------------------------------------------------
         # 2. アクションコントローラの初期化
@@ -135,40 +142,27 @@ class PorcaroRLEnv(DirectRLEnv):
         # リズム生成器の切り替えロジック (維持)
         # =========================================================
         self.dt_ctrl_step = self.cfg.sim.dt * self.cfg.decimation
-        use_simple = getattr(self.cfg, "use_simple_rhythm", False)
-        target_force_val = getattr(self.cfg, "target_hit_force", 50.0)
+        self.target_hit_force = getattr(self.cfg, "target_hit_force", 50.0)
 
+        self.rhythm_generator = RhythmGenerator(
+            num_envs=self.num_envs,
+            device=self.device,
+            dt=self.dt_ctrl_step,
+            max_episode_length=self.max_episode_length, # Configで確保した最大長(20s分)
+            bpm_range=self.cfg.bpm_range,
+            target_force=self.target_hit_force
+        )
+
+        # Config設定に基づきモード（学習用/検証用）を切り替え
+        use_simple = getattr(self.cfg, "use_simple_rhythm", False)
         if use_simple:
-            mode = getattr(self.cfg, "simple_rhythm_mode", "single")
-            bpm = getattr(self.cfg, "simple_rhythm_bpm", 60.0)
-            print(f"[INFO] SimpleRhythmGenerator (Mode: {mode}, BPM: {bpm}, Force: {target_force_val})")
-            self.rhythm_generator = SimpleRhythmGenerator(
-                num_envs=self.num_envs,
-                device=self.device,
-                dt=self.dt_ctrl_step,
-                max_episode_length=self.max_episode_length,
-                mode=mode,
-                bpm=bpm,
-                target_force=target_force_val
-            )
+            mode = getattr(self.cfg, "simple_rhythm_mode", "double")
+            bpm = getattr(self.cfg, "simple_rhythm_bpm", 160.0)
+            print(f"[INFO] RhythmGenerator: Test Mode Enabled (Pattern: {mode}, BPM: {bpm})")
+            self.rhythm_generator.set_test_mode(enabled=True, bpm=bpm, pattern=mode)
         else:
-            bpm_range = (
-                getattr(self.cfg.rewards, "bpm_min", 60.0),
-                getattr(self.cfg.rewards, "bpm_max", 160.0)
-            )
-            prob_rest = getattr(self.cfg.rewards, "prob_rest", 0.3)
-            prob_double = getattr(self.cfg.rewards, "prob_double", 0.2)
-            
-            self.rhythm_generator = RhythmGenerator(
-                num_envs=self.num_envs,
-                device=self.device,
-                dt=self.dt_ctrl_step,
-                max_episode_length=self.max_episode_length,
-                bpm_range=bpm_range,
-                prob_rest=prob_rest,
-                prob_double=prob_double,
-                target_force=target_force_val
-            )
+            print(f"[INFO] RhythmGenerator: Training Mode (Random BPM & Rudiments)")
+            self.rhythm_generator.set_test_mode(enabled=False)
         
         lookahead_horizon = getattr(self.cfg, "lookahead_horizon", 0.5)
         self.lookahead_steps = int(lookahead_horizon / self.dt_ctrl_step)
@@ -279,8 +273,13 @@ class PorcaroRLEnv(DirectRLEnv):
 
             force_history_list.append(current_force_vec.clone())
             
-            current_force_z = current_force_vec[:, 2].clamp(min=0.0)
-            self.max_force_z_buffer = torch.max(self.max_force_z_buffer, current_force_z)
+            # 以前: current_force_z = current_force_vec[:, 2].clamp(min=0.0)
+            current_force_mag = torch.norm(current_force_vec, dim=-1)
+            
+            self.max_force_z_buffer = torch.max(self.max_force_z_buffer, current_force_mag)
+            
+            # [追加]: 平均計算用に積算
+            self.force_sum_buffer += current_force_mag
 
             # 4. ★ログバッファリング (ここで一本化)
             if self.logging_manager.enable_logging:
@@ -321,11 +320,9 @@ class PorcaroRLEnv(DirectRLEnv):
         
         obs = self._get_observations()
         
-        target_force_val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
-        target_force_tensor = torch.full((self.num_envs,), target_force_val, device=self.device)
+        target_force_tensor = torch.full((self.num_envs,), self.target_hit_force, device=self.device)
         rew, reward_terms = self._get_rewards(force_max=self.max_force_z_buffer, target_ref=target_force_tensor)
         
-        self.reset_time_outs = self.episode_length_buf >= self.max_episode_length
         self.reset_terminated[:] = False
         terminated, time_outs = self._get_dones()
         
@@ -391,6 +388,8 @@ class PorcaroRLEnv(DirectRLEnv):
              if self.logging_manager.logger is not None:
                  self.logging_manager.logger.save()
 
+        self.prev_actions[:] = self.actions
+
         return obs, rew, terminated, time_outs, self.extras
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -399,9 +398,6 @@ class PorcaroRLEnv(DirectRLEnv):
 
     def _apply_action(self) -> None:
         """アクションの適用 (モデルの切り替えロジックを含む)"""
-        
-        # 1. 基本のアクション
-        raw_cmd = (self.actions + 1.0) / 2.0        # -1~1を0~1に変換
         
         # P_cmd (3ch) の取得
         # TorqueActionController の compute_pressure が [Batch, 3] を返すと仮定
@@ -478,13 +474,25 @@ class PorcaroRLEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         q, qd = self._get_corrected_joint_state()
         
-        current_steps = self.episode_length_buf
-        bpm_obs = self.rhythm_generator.current_bpms.view(self.num_envs, 1) / 180.0
-        rhythm_buf = self.rhythm_generator.get_lookahead(current_steps, self.lookahead_steps)
-        target_force = getattr(self.cfg.rewards, "target_force_fd", 20.0)
-        rhythm_buf = rhythm_buf / target_force
+        # [変更]: BPM正規化
+        bpm_val = self.rhythm_generator.current_bpms.view(-1, 1)
+        bpm_obs = bpm_val / 180.0
 
-        obs = torch.cat((q, qd, bpm_obs, rhythm_buf), dim=-1)
+        # [追加]: 位相信号 (Phase Signal)
+        # 1拍 = 0~2pi となる位相
+        time_s = self.episode_length_buf.float().unsqueeze(1) * self.dt_ctrl_step
+        phase = time_s * (bpm_val / 60.0) * (2 * math.pi)
+        sin_phase = torch.sin(phase)
+        cos_phase = torch.cos(phase)
+        
+        # 先読み情報
+        current_steps = self.episode_length_buf
+        rhythm_buf = self.rhythm_generator.get_lookahead(current_steps, self.lookahead_steps)
+        rhythm_buf = rhythm_buf / self.target_hit_force
+
+        # [変更]: 観測結合 (q, qd, prev_act, sin, cos, bpm, lookahead)
+        # 観測次元: q(2)+qd(2)+prev_act(3)+sin(1)+cos(1)+bpm(1)+lookahead(25) = 35次元
+        obs = torch.cat((q, qd, self.prev_actions, sin_phase, cos_phase, bpm_obs, rhythm_buf), dim=-1)
         return {"policy": obs}
 
     def _get_rewards(self, force_max: torch.Tensor = None, target_ref: torch.Tensor = None) -> torch.Tensor:
@@ -496,8 +504,7 @@ class PorcaroRLEnv(DirectRLEnv):
         target_trace = self.rhythm_generator.get_current_target(current_steps).view(-1)
         
         if target_ref is None:
-            val = getattr(self.cfg.rewards, "target_force_fd", 20.0)
-            target_ref = torch.full((self.num_envs,), val, device=self.device)
+            target_ref = torch.full((self.num_envs,), self.target_hit_force, device=self.device)
 
         # ★修正: joint_pos に補正済みの値を渡す
         q_corr, _ = self._get_corrected_joint_state()
@@ -516,7 +523,15 @@ class PorcaroRLEnv(DirectRLEnv):
         return total_reward, reward_terms
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.reset_terminated, self.reset_time_outs
+        # [変更]: 動的タイムアウト判定
+        # BPMに基づく「4小節終了ステップ数」を超えたらタイムアウト
+        time_outs = self.episode_length_buf >= self.episode_duration_steps
+        
+        # 安全策: バッファ溢れ防止
+        time_outs |= (self.episode_length_buf >= self.max_episode_length - 1)
+
+        self.reset_terminated[:] = False
+        return self.reset_terminated, time_outs
 
     def _reset_idx(self, env_ids: torch.Tensor) -> None:
         super()._reset_idx(env_ids)
@@ -546,6 +561,21 @@ class PorcaroRLEnv(DirectRLEnv):
             velocity=qd_target, 
             env_ids=env_ids
         )
+
+        # [追加]: リズムリセット & エピソード長再計算
+        if hasattr(self, "rhythm_generator"):
+            self.rhythm_generator.reset(env_ids)
+            
+            # 4小節 = 16拍分の時間 [s]
+            bpms = self.rhythm_generator.current_bpms[env_ids]
+            durations_s = 16.0 * (60.0 / bpms)
+            
+            # ステップ数に換算
+            steps = (durations_s / self.dt_ctrl_step).long()
+            self.episode_duration_steps[env_ids] = steps
+            
+        # [追加]: 前回アクションのリセット
+        self.prev_actions[env_ids] = 0.0
 
         if hasattr(self, "reward_manager"):
             self.reward_manager.reset_idx(env_ids)

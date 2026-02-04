@@ -126,14 +126,14 @@ ROBOT_CFG = ArticulationCfg(
         "wrist": ImplicitActuatorCfg(
             joint_names_expr=[".*Base_link_Wrist_joint"],
             stiffness=0.0,
-            damping=0.2,
+            damping=0.23,
             effort_limit_sim=500.0,
             friction=0.05,
         ),
         "grip": ImplicitActuatorCfg(
             joint_names_expr=[".*Hand_link_Grip_joint"],
             stiffness=0.0,
-            damping=0.01,
+            damping=0.1,
             effort_limit_sim=500.0,
             friction=0.05,
         ),
