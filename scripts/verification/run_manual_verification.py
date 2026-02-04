@@ -238,7 +238,7 @@ def main():
              dt_step = env.step_dt
         else:
              sim_dt = env.cfg.sim.dt
-             decimation = getattr(env.cfg, "decimation", 4)
+             decimation = getattr(env.cfg, "decimation", 1)
              dt_step = sim_dt * decimation
              print(f"[System] Calculated dt: {dt_step:.5f}s")
 

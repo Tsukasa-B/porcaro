@@ -268,12 +268,15 @@ class PorcaroRLEnv(DirectRLEnv):
             self.sim.step()
             self.scene.update(dt=self.cfg.sim.dt)
             
-            # 3. センサーデータ取得
+            # 3. センサーデータ取得 (修正箇所)
             if self.stick_sensor.data.net_forces_w.dim() == 3:
-                current_force_vec = self.stick_sensor.data.net_forces_w[:, 0, :] 
+                # [NumEnvs, 1, 3] -> [NumEnvs, 3]
+                raw_impulse_vec = self.stick_sensor.data.net_forces_w[:, 0, :] 
             else:
-                current_force_vec = self.stick_sensor.data.net_forces_w 
+                raw_impulse_vec = self.stick_sensor.data.net_forces_w
             
+            current_force_vec = raw_impulse_vec #/ sim_dt
+
             force_history_list.append(current_force_vec.clone())
             
             current_force_z = current_force_vec[:, 2].clamp(min=0.0)

@@ -36,13 +36,17 @@ from .cfg.actuator_net_cfg import CascadedActuatorNetCfg
 @configclass
 class PorcaroRLEnvCfg(DirectRLEnvCfg):
     """Porcaro 環境用の設定クラス (基本構成 - DRなし)"""
+
+    # --- RL 設定 ---
+    decimation: int = 10 # 20ms (50Hz) sim.dt * decimation = 1/1000 *20
+    episode_length_s: float = 8.0
     
     # --- シミュレーション設定 ---
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 200,     # 5ms
-        render_interval=4,
+        dt=1 / 500,     # 1ms
+        render_interval=decimation, # ここは絶対に変えてはいけない
         physics_material=sim_utils.RigidBodyMaterialCfg(
-            static_friction=0.4, dynamic_friction=0.4, restitution=0.5
+            static_friction=0.0, dynamic_friction=0.0, restitution=0.0, # restitutionは０
         ),
     )
 
@@ -67,10 +71,6 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # --- センサ設定 ---
     stick_contact_cfg: ContactSensorCfg = contact_forces_stick_at_drum_cfg
     drum_contact_cfg: ContactSensorCfg = drum_vs_stick_cfg
-    
-    # --- RL 設定 ---
-    decimation: int = 4 # 20ms (50Hz)
-    episode_length_s: float = 8.0
     
     action_space: int = 3
     observation_space: int = 30

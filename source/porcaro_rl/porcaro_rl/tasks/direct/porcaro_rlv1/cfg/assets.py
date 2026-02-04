@@ -108,6 +108,11 @@ ROBOT_CFG = ArticulationCfg(
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             ),
+        collision_props=sim_utils.CollisionPropertiesCfg(
+            collision_enabled=True,
+            contact_offset=0.02,  # 20mm: これを小さくしないと打撃感がフワフワします
+            rest_offset=0.0,
+        ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.11348, -0.34041, 0.0),
@@ -120,17 +125,17 @@ ROBOT_CFG = ArticulationCfg(
     actuators={
         "wrist": ImplicitActuatorCfg(
             joint_names_expr=[".*Base_link_Wrist_joint"],
-            stiffness=0.00573,
+            stiffness=0.0,
             damping=0.2,
             effort_limit_sim=500.0,
             friction=0.05,
         ),
         "grip": ImplicitActuatorCfg(
             joint_names_expr=[".*Hand_link_Grip_joint"],
-            stiffness=0.0001,
+            stiffness=0.0,
             damping=0.01,
             effort_limit_sim=500.0,
-            friction=0.001,
+            friction=0.05,
         ),
     },
 )
@@ -144,6 +149,11 @@ DRUM_CFG = RigidObjectCfg(
             kinematic_enabled=False,
             disable_gravity=False,
             ),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+            collision_enabled=True,
+            contact_offset=0.02,  # 20mm: これを小さくしないと打撃感がフワフワします
+            rest_offset=0.0,
+        ),
         activate_contact_sensors=True,
     ),
     init_state=RigidObjectCfg.InitialStateCfg(
