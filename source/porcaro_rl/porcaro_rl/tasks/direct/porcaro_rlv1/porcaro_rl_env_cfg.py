@@ -87,7 +87,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     pam_geometric_cfg: PamGeometricCfg = PamGeometricCfg(
         natural_length=0.150,
         use_absolute_geometry = False,
-        wire_slack_offsets=(0.00, 0.0, 0.0),
+        wire_slack_offsets=(0.0, 0.0, 0.0),
     )
 
     # --- シンプルリズム生成設定 ---
