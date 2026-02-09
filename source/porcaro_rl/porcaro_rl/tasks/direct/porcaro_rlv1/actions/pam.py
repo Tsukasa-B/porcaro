@@ -72,8 +72,7 @@ class PamForceMap(nn.Module):
             if not r or r[0] == "": continue
             P_axis.append(float(r[0]))
             F.append([float(x) for x in r[1:1+len(h_axis)]])
-        if max(h_axis) > 1.0:
-            h_axis = [x / 100.0 for x in h_axis]
+        h_axis = [x / 100.0 for x in h_axis]
         return PamForceMap(P_axis, h_axis, F)
 
     def forward(self, P_in: torch.Tensor, h_in: torch.Tensor) -> torch.Tensor:
@@ -101,7 +100,7 @@ class H0Map(nn.Module):
                 P_axis.append(float(r[0]))
                 h0_axis.append(float(r[1]))
             except Exception: pass
-        if max(h0_axis) > 1.0: h0_axis = [x / 100.0 for x in h0_axis]
+        h0_axis = [x / 100.0 for x in h0_axis]
         return H0Map(P_axis, h0_axis)
 
     def forward(self, P_in: torch.Tensor) -> torch.Tensor:
@@ -109,37 +108,81 @@ class H0Map(nn.Module):
         return interp1d_clamp_torch(self.P, self.h0, P_in)
 
 @torch.no_grad()
-def contraction_ratio_from_angle(theta: torch.Tensor, theta_t_deg: float, r: float, L: float, sign: float = 1.0) -> torch.Tensor:
-    theta_t = math.radians(theta_t_deg)
-    return (r / L) * sign * (theta - theta_t)
-
 def calculate_effective_contraction(theta_deg, theta_t_deg, r, L0, 
                                     slack_offset, pressure: torch.Tensor = 0.0, 
                                     shrink_gain: float = 0.0, clamp: bool = False,
                                     sign: float = 1.0):
     theta_rad = torch.deg2rad(theta_deg)
     theta_t_rad = math.radians(theta_t_deg)
+    
+    # 幾何学的な縮み量
     delta_geo = r * sign * (theta_rad - theta_t_rad)
     L_geo = L0 - delta_geo
-    dynamic_offset = slack_offset - (shrink_gain * pressure)
+    
+    # --- 修正箇所: dynamic_offset の計算 ---
+    
+    # 1. 圧力による「たるみ取り」量 (常に正)
+    slack_removal = shrink_gain * pressure
+    
+    # 2. オフセットの適用ロジック
+    # slack_offset > 0 (たるみあり): (Offset - Removal) を計算し、0で止める (張りには移行させない)
+    # slack_offset <= 0 (張りあり):  Removalの影響を受けず、そのままの値を使う
+    
+    # ※ slack_offset が Tensor か float かで処理を統一するため torch.as_tensor を使用
+    s_off = torch.as_tensor(slack_offset, device=pressure.device, dtype=pressure.dtype)
+    
+    dynamic_offset = torch.where(
+        s_off > 0.0,                            # 条件: 元々たるんでいるか？
+        torch.clamp(s_off - slack_removal, min=0.0), # Yes: たるみを取る(0まで)
+        s_off                                   # No:  元々の張り(マイナス)を維持
+    )
+    # ---------------------------------------
+    
+    # 有効長さ L_eff = L_geo - dynamic_offset
+    #  -> dynamic_offset が正(たるみ)なら、ワイヤーは「まだ効かない」ので有効長は短くなる
+    #  -> dynamic_offset が負(張り)なら、  ワイヤーは「さらに引っ張られている」ので有効長は長くなる
     L_eff = L_geo - dynamic_offset
+    
     epsilon = (L0 - L_eff) / L0
+    
     if clamp:
         return torch.clamp(epsilon, min=0.0)
     return epsilon
 
-def apply_soft_engagement(force: torch.Tensor, epsilon: torch.Tensor, smoothness: float = 100.0) -> torch.Tensor:
-    slack_amount = torch.clamp(epsilon, min=0.0)
-    x = slack_amount * smoothness
-    mask_val = torch.clamp(1.0 - x, min=0.0)
-    mask_val = mask_val * mask_val
+def apply_soft_engagement(force: torch.Tensor, epsilon: torch.Tensor, h0: torch.Tensor, transition_width: float = 0.01) -> torch.Tensor:
+    """
+    修正版 Soft Engagement (Width指定):
+    
+    Logic:
+      tautness = h0 - epsilon (正の値ほど張っている)
+      
+      1. Slack (たるみ):
+         epsilon >= h0  -> tautness <= 0
+         => Mask = 0.0
+         
+      2. Transition (遷移領域):
+         h0 > epsilon > h0 - width
+         0 < tautness < width
+         => Mask = tautness / width (0.0 -> 1.0)
+         
+      3. Full Taut (完全張り):
+         epsilon <= h0 - width
+         tautness >= width
+         => Mask = 1.0
+    
+    Args:
+        transition_width: 0から1へ遷移する収縮率の幅。
+                          例: 0.01 なら、h0から1%(0.01)縮んだ時点で力が100%になる。
+    """
+    # 1. 境界からの食い込み量 (正なら張り方向)
+    tautness = h0 - epsilon
+    
+    # 2. 幅で正規化して 0~1 にクリップ
+    # tautnessが負なら0、widthを超えれば1、その間は線形補間
+    # ゼロ除算回避のため width に微小値を足すか、事前にチェック推奨（ここではシンプルに記述）
+    mask_val = torch.clamp(tautness / transition_width, min=0.0, max=1.0)
+    
     return force * mask_val
-
-@torch.no_grad()
-def Fpam_quasi_static(P: torch.Tensor, h: torch.Tensor, N: float = 1200.0, Pmax: float = 0.6) -> torch.Tensor:
-    h0 = 0.25 * (P / Pmax).clamp(0,1)
-    eff = torch.clamp(h0 - h, min=0.0)
-    return N * P * eff
 
 class PAMChannel:
     def __init__(self, dt_ctrl: float, tau: float = 0.09, dead_time: float = 0.03, Pmax: float = 0.6,

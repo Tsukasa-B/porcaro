@@ -39,9 +39,6 @@ class PamGeometricCfg:
     """
     PAMの幾何学的特性および有効収縮率 (Effective Contraction Ratio) の設定
     """
-    # True: 有効収縮率 (Slack補正あり) を使用 [新手法]
-    # False: 単純な幾何学的収縮率 (Slack無視) を使用 [既存手法]
-    enable_slack_compensation: bool = True
 
     # 各筋肉のワイヤー長さオフセット [m] (enable_slack_compensation=True の時のみ有効)
     # 正(+): たるみ (Slack) あり -> 力発生が遅れる (Sim-to-Realギャップの主因)
@@ -56,10 +53,8 @@ class PamGeometricCfg:
 @configclass
 class PamModelA_GeometricCfg(PamGeometricCfg):
     """Model A用: 絶対値幾何学、スラックなし"""
-    enable_slack_compensation: bool = False  # ワイヤーたるみ計算無効
     use_absolute_geometry: bool = True       # 符号無視・絶対値計算有効
     wire_slack_offsets: tuple[float, ...] = (0.0, 0.0, 0.0)
-
 @configclass
 class PamModelA_DynamicsCfg(PamDelayModelCfg):
     """Model A用: 固定時定数 + 1Dむだ時間"""

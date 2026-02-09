@@ -85,9 +85,9 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # --- 幾何学補正設定 ---
     # デフォルトは True (有効収縮率を使用: Model B相当)
     pam_geometric_cfg: PamGeometricCfg = PamGeometricCfg(
-        enable_slack_compensation=True,
-        wire_slack_offsets=(-0.001, 0.01057, 0.01057),
-        natural_length=0.150
+        natural_length=0.150,
+        use_absolute_geometry = False,
+        wire_slack_offsets=(0.00, 0.0, 0.0),
     )
 
     # --- シンプルリズム生成設定 ---
@@ -95,7 +95,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # BPM範囲などを明示的に定義
     use_simple_rhythm: bool = True   
     simple_rhythm_mode: str = "single" 
-    simple_rhythm_bpm: float = 60.0    
+    simple_rhythm_bpm: float = 20.0    
     target_hit_force: float = 30.0
 
     lookahead_horizon: float = 0.5
@@ -177,7 +177,7 @@ class PorcaroRLEnvCfg_ModelA(PorcaroRLEnvCfg):
         self.actuator_net_cfg = None
 
         # Model Aの設定: 固定時定数を使用
-        self.controller.tau = 0.01
+        self.controller.tau = 0.09
         self.controller.dead_time = 0.0 # むだ時間はTable参照されるので0でOK
         self.controller.use_pressure_dependent_tau = True # これをTrueにするとTable Iがロードされる
 
@@ -195,8 +195,6 @@ class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
         super().__post_init__()
         
         self.pam_delay_cfg = None
-        # Model Bは有効収縮率(Slackあり)を使う (デフォルト設定通り)
-        self.pam_geometric_cfg.enable_slack_compensation = True 
         self.actuator_net_cfg = None
 
         # Model Bの設定: 2D Dynamicsを使用
@@ -206,8 +204,7 @@ class PorcaroRLEnvCfg_ModelB(PorcaroRLEnvCfg):
         self.controller.tau = 0.09 
         self.controller.use_pressure_dependent_tau = False # 2D Mapを使うのでTable Iは不要
         
-        self.controller.pam_viscosity = 100.0 
-        self.controller.engagement_smoothness = 100.0
+        self.controller.pam_viscosity = 0.0 
 
 @configclass
 class PorcaroRLEnvCfg_ModelB_DR(PorcaroRLEnvCfg_ModelB):

@@ -3,8 +3,8 @@ from __future__ import annotations
 import torch
 from .base import ActionController, RobotLike
 from .pam import (
-    PAMChannel, contraction_ratio_from_angle, calculate_effective_contraction,
-    Fpam_quasi_static, PamForceMap, H0Map,
+    PAMChannel, calculate_effective_contraction,
+    PamForceMap, H0Map,
     apply_soft_engagement,
     calculate_absolute_contraction,
     apply_model_a_force
@@ -22,14 +22,16 @@ class TorqueActionController(ActionController):
                  Pmax: float = 0.6,
                  tau: float = 0.09, dead_time: float = 0.03,
                  N: float = 630.0,
-                 pam_viscosity: float = 0.0,
+                 pam_viscosity: float = 5.0,
+                 pam_hys_const: float = 5.0,
+                 pam_hys_coef_p: float = 20.0,
                  force_map_csv: str | None = None,
                  force_scale: float = 1.0,
                  h0_map_csv: str | None = None,
                  use_pressure_dependent_tau: bool = True,
                  geometric_cfg: PamGeometricCfg | None = None,
-                 pressure_shrink_gain: float = 0.02, 
-                 engagement_smoothness: float = 150.0):
+                 transition_width: float = 0.01,
+                 pressure_shrink_gain: float = 0.0,):
 
         self.dt_ctrl = float(dt_ctrl)
         self.control_mode = control_mode
@@ -40,8 +42,10 @@ class TorqueActionController(ActionController):
         self.Pmax = float(Pmax)
         self.N = float(N)
         self.pam_viscosity = float(pam_viscosity)
+        self.pam_hys_const = float(pam_hys_const)
+        self.pam_hys_coef_p = float(pam_hys_coef_p)
         self.force_scale = float(force_scale)
-        self.engagement_smoothness = float(engagement_smoothness)
+        self.transition_width = float(transition_width)
 
         # Force Mapの読み込み
         print("-" * 60)
@@ -58,16 +62,25 @@ class TorqueActionController(ActionController):
             print(f"  >>> WARNING: No CSV provided. Using Ideal Quasi-static Model")
         print("-" * 60)
         
-        self.h0_map = H0Map.from_csv(h0_map_csv) if h0_map_csv else None
+        if h0_map_csv:
+            try:
+                self.h0_map = H0Map.from_csv(h0_map_csv)
+                print(f"  >>> SUCCESS: Loaded Real h0 Map")
+            except Exception as e:
+                print(f"  >>> ERROR: Failed to load h0 Map: {e}")
+                raise e
+        else:
+            self.h0_map = None
+            print(f"  >>> WARNING: No CSV provided. Using Ideal Quasi-static Model")
+        print("-" * 60)
+        
 
         # --- Model A/B 切り替え設定 ---
         if geometric_cfg is not None:
-            self.use_effective_contraction = geometric_cfg.enable_slack_compensation
             self.slack_offsets = torch.tensor(geometric_cfg.wire_slack_offsets)
             self.L0_sim = geometric_cfg.natural_length
             self.use_absolute_geometry = getattr(geometric_cfg, "use_absolute_geometry", False)
         else:
-            self.use_effective_contraction = False
             self.slack_offsets = torch.zeros(3)
             self.L0_sim = self.L
             self.use_absolute_geometry = False
@@ -90,7 +103,6 @@ class TorqueActionController(ActionController):
         
         self._last_telemetry: dict | None = None
         self.pressure_shrink_gain = float(pressure_shrink_gain)
-
     def reset(self, n_envs: int, device: str | torch.device):
         self.ch_DF.reset(n_envs, device)
         self.ch_F.reset(n_envs, device)
@@ -142,6 +154,9 @@ class TorqueActionController(ActionController):
         dq_wrist = -torch.rad2deg(dq_sim[:, wid]) 
         dq_grip  = -torch.rad2deg(dq_sim[:, gid])
 
+        dq_wrist_rad = torch.deg2rad(dq_wrist)
+        dq_grip_rad  = torch.deg2rad(dq_grip)
+
         if self.slack_offsets.device != q.device:
             self.slack_offsets = self.slack_offsets.to(q.device)
 
@@ -175,70 +190,96 @@ class TorqueActionController(ActionController):
                 F_DF = apply_model_a_force(self.force_map, self.h0_map, P_DF, eps_DF) * self.force_scale
                 F_F  = apply_model_a_force(self.force_map, self.h0_map, P_F,  eps_F)  * self.force_scale
                 F_G  = apply_model_a_force(self.force_map, self.h0_map, P_G,  eps_G)  * self.force_scale
-            else:
-                F_DF = Fpam_quasi_static(P_DF, eps_DF, N=self.N, Pmax=self.Pmax) * self.force_scale
-                F_F  = Fpam_quasi_static(P_F,  eps_F,  N=self.N, Pmax=self.Pmax) * self.force_scale
-                F_G  = Fpam_quasi_static(P_G,  eps_G,  N=self.N, Pmax=self.Pmax) * self.force_scale
-
-        else:
-            # === [Model B] ===
-            if self.use_effective_contraction:
-                h_DF = calculate_effective_contraction(
-                    q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0], 
-                    pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_DF) 
-                h_F = calculate_effective_contraction(
-                    q_wrist, self.theta_t["F"], self.r, self.L0_sim, self.slack_offsets[1], 
-                    pressure=P_F, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_F)
-                h_G = calculate_effective_contraction(
-                    q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2], 
-                    pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_G)
-                raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
-            else:
-                h_DF = contraction_ratio_from_angle(q_wrist, self.theta_t["DF"], self.r, self.L, sign=SIGN_DF)
-                h_F  = contraction_ratio_from_angle(q_wrist, self.theta_t["F"],  self.r, self.L, sign=SIGN_F)
-                h_G  = contraction_ratio_from_angle(q_grip,  self.theta_t["G"],  self.r, self.L, sign=SIGN_G)
-                raw_eps_DF, raw_eps_F, raw_eps_G = h_DF, h_F, h_G
-
-            # 静的力
-            if self.force_map is not None:
-                F_DF_static = self.force_map(P_DF, h_DF) * self.force_scale
-                F_F_static  = self.force_map(P_F,  h_F)  * self.force_scale
-                F_G_static  = self.force_map(P_G,  h_G)  * self.force_scale
-            else:
-                F_DF_static = Fpam_quasi_static(P_DF, torch.clamp(h_DF, min=0), N=self.N, Pmax=self.Pmax) * self.force_scale
-                F_F_static  = Fpam_quasi_static(P_F,  torch.clamp(h_F, min=0),  N=self.N, Pmax=self.Pmax) * self.force_scale
-                F_G_static  = Fpam_quasi_static(P_G,  torch.clamp(h_G, min=0),  N=self.N, Pmax=self.Pmax) * self.force_scale
-
-            # 粘性力
-            def calculate_viscous_force(dq_deg, r, sign, viscosity_coeff):
-                dq_rad = torch.deg2rad(dq_deg)
-                v_muscle = -1.0 * sign * r * dq_rad
-                return viscosity_coeff * v_muscle
             
-            visc_DF = calculate_viscous_force(dq_wrist, self.r, SIGN_DF, self.pam_viscosity)
-            visc_F  = calculate_viscous_force(dq_wrist, self.r, SIGN_F,  self.pam_viscosity)
-            visc_G  = calculate_viscous_force(dq_grip,  self.r, SIGN_G,  self.pam_viscosity)
-
-            F_DF_total_raw = F_DF_static + visc_DF
-            F_F_total_raw  = F_F_static  + visc_F
-            F_G_total_raw  = F_G_static  + visc_G
-
-            # Soft Engagement
-            if self.use_effective_contraction:
-                F_DF = apply_soft_engagement(F_DF_total_raw, raw_eps_DF, self.engagement_smoothness)
-                F_F  = apply_soft_engagement(F_F_total_raw,  raw_eps_F,  self.engagement_smoothness)
-                F_G  = apply_soft_engagement(F_G_total_raw,  raw_eps_G,  self.engagement_smoothness)
-            else:
-                F_DF = torch.clamp(F_DF_total_raw, min=0.0)
-                F_F  = torch.clamp(F_F_total_raw,  min=0.0)
-                F_G  = torch.clamp(F_G_total_raw,  min=0.0)
-
             # H0 Cutoff
             if self.h0_map is not None:
                 h0_DF, h0_F, h0_G = self.h0_map(P_DF), self.h0_map(P_F), self.h0_map(P_G)
-                F_DF = torch.where(h_DF <= h0_DF, F_DF, torch.zeros_like(F_DF))
-                F_F  = torch.where(h_F  <= h0_F,  F_F,  torch.zeros_like(F_F))
-                F_G  = torch.where(h_G  <= h0_G,  F_G,  torch.zeros_like(F_G))
+                F_DF = torch.where(eps_DF <= h0_DF, F_DF, torch.zeros_like(F_DF))
+                F_F  = torch.where(eps_F  <= h0_F,  F_F,  torch.zeros_like(F_F))
+                F_G  = torch.where(eps_G  <= h0_G,  F_G,  torch.zeros_like(F_G))
+
+        else:
+            # === [Model B] ===
+            h_DF = calculate_effective_contraction(
+                    q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0], 
+                    pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_DF) 
+            h_F = calculate_effective_contraction(
+                    q_wrist, self.theta_t["F"], self.r, self.L0_sim, self.slack_offsets[1], 
+                    pressure=P_F, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_F)
+            h_G = calculate_effective_contraction(
+                    q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2], 
+                    pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_G)
+
+            # 静的力
+            F_DF_static = self.force_map(P_DF, h_DF) * self.force_scale
+            F_F_static  = self.force_map(P_F,  h_F)  * self.force_scale
+            F_G_static  = self.force_map(P_G,  h_G)  * self.force_scale# 3. 収縮速度 h_dot の計算 (dq [rad/s] を利用)
+            # h = (r * sign * (theta - theta_t)) / L0
+            # h_dot = (r * sign * dq) / L0
+            def calculate_h_dot(dq_rad, r, sign, L0):
+                return (r * sign * dq_rad) / L0
+
+            h_dot_DF = calculate_h_dot(dq_wrist_rad, self.r, SIGN_DF, self.L0_sim)
+            h_dot_F  = calculate_h_dot(dq_wrist_rad, self.r, SIGN_F,  self.L0_sim)
+            h_dot_G  = calculate_h_dot(dq_grip_rad,  self.r, SIGN_G,  self.L0_sim)
+
+            # 4. 摩擦力の計算 (Pressure-Dependent Hysteresis + Viscosity)
+            # 変更点: 静止摩擦係数(static_friction)を固定値ではなく、圧力Pに比例させる形に変更
+            # 理由: 空気圧が高いほどメッシュとゴムの接触圧が上がり、ヒステリシス(摩擦)が大きくなるため
+            
+            def calculate_friction_force(h_dot, viscosity, hys_coef_p, hys_const, pressure):
+                """
+                h_dot: 収縮速度 [1/s] (収縮方向が正)
+                viscosity: 粘性係数 (速度に比例)
+                hys_coef_p: 圧力依存ヒステリシス係数 (圧力に比例)
+                hys_const: 基礎ヒステリシス項 (圧力ゼロでも残る摩擦など)
+                pressure: 現在の空気圧 [kPa] または正規化値
+                """
+                
+                # A. 粘性項 (Viscosity)
+                # 速度に比例して抵抗。ダンピング効果としてシステムの安定性にも寄与。
+                f_viscous = -1.0 * viscosity * h_dot 
+                
+                # B. ヒステリシス項 (Pressure-Dependent Coulomb Friction)
+                # 圧力Pに応じて摩擦の大きさが変化するモデル。
+                # 収縮時(h_dot > 0) -> 力が減る(負)
+                # 伸長時(h_dot < 0) -> 力が増える(正)
+                
+                # 摩擦の大きさ = (定数項 + 圧力比例項 * P)
+                # ※ Pは負にならないよう念のため max(0, P) 等で保護しても良い
+                friction_magnitude = hys_const + hys_coef_p * pressure
+                
+                # tanhで符号反転を滑らかにする (チャタリング防止)
+                f_hysteresis = -1.0 * friction_magnitude * torch.tanh(h_dot / 0.01)
+                
+                return f_viscous + f_hysteresis
+
+            # パラメータ設定 (これらはクラスの __init__ 等で定義・調整が必要)
+            # 例: self.pam_hys_coef_p = 20.0 (圧力1単位あたりの摩擦増加量)
+            #     self.pam_hys_const = 5.0  (基礎摩擦)
+            
+            # 各筋肉について計算
+            fric_DF = calculate_friction_force(h_dot_DF, self.pam_viscosity, self.pam_hys_coef_p, self.pam_hys_const, P_DF)
+            fric_F  = calculate_friction_force(h_dot_F,  self.pam_viscosity, self.pam_hys_coef_p, self.pam_hys_const, P_F)
+            fric_G  = calculate_friction_force(h_dot_G,  self.pam_viscosity, self.pam_hys_coef_p, self.pam_hys_const, P_G)
+
+            # 5. 合力計算
+            F_DF_total_raw = F_DF_static + fric_DF
+            F_F_total_raw  = F_F_static  + fric_F
+            F_G_total_raw  = F_G_static  + fric_G
+            
+            # 負の力は物理的にありえないので 0 でクリップ (ワイヤーは押せない)
+            F_DF_total_raw = torch.clamp(F_DF_total_raw, min=0.0)
+            F_F_total_raw  = torch.clamp(F_F_total_raw,  min=0.0)
+            F_G_total_raw  = torch.clamp(F_G_total_raw,  min=0.0)
+
+            # --- Soft Engagement (Slack処理) ---
+            if self.h0_map is not None:
+                h0_DF, h0_F, h0_G = self.h0_map(P_DF), self.h0_map(P_F), self.h0_map(P_G)
+            
+            F_DF = apply_soft_engagement(F_DF_total_raw, h_DF, h0_DF, self.transition_width)
+            F_F  = apply_soft_engagement(F_F_total_raw,  h_F,  h0_F,  self.transition_width)
+            F_G  = apply_soft_engagement(F_G_total_raw,  h_G,  h0_G,  self.transition_width)
 
         # トルク計算 (F_DF: 上向き力, F_F: 下向き力)
         tau_w = self.r * (F_DF - F_F)
