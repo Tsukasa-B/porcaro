@@ -79,6 +79,8 @@ class PorcaroRLEnv(DirectRLEnv):
         # ---------------------------------------------------------
         dt_ctrl = self.cfg.sim.dt
         ctrl_cfg = self.cfg.controller
+
+        pam_tau_scale_range = getattr(self.cfg, "pam_tau_scale_range", (1.0, 1.0))
         
         self.action_controller = TorqueActionController(
             dt_ctrl=dt_ctrl,
@@ -97,6 +99,7 @@ class PorcaroRLEnv(DirectRLEnv):
             h0_map_csv=ctrl_cfg.h0_map_csv,
             use_pressure_dependent_tau=ctrl_cfg.use_pressure_dependent_tau,
             geometric_cfg=self.cfg.pam_geometric_cfg,
+            pam_tau_scale_range=pam_tau_scale_range,
         )
         self.action_controller.reset(self.num_envs, self.device)
 

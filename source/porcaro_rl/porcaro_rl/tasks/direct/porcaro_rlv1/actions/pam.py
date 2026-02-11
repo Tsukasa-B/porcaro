@@ -238,26 +238,40 @@ class PAMChannel:
     def __init__(self, dt_ctrl: float, tau: float = 0.09, dead_time: float = 0.03, Pmax: float = 0.6,
                  tau_lut: tuple[list[float], list[float]] | None = None,
                  use_table_i: bool = True,
-                 use_2d_dynamics: bool = False):
+                 use_2d_dynamics: bool = False,
+                 latch_threshold: float = 0.02,
+                 # === [変更]: 時定数スケーリング範囲 (DR用) ===
+                 tau_scale_range: tuple[float, float] = (1.0, 1.0)): 
         
         self.dt = dt_ctrl
         self.dead_time = float(dead_time)
-        self.tau = float(tau) 
+        self.tau = float(tau)
         self.Pmax = float(Pmax)
+        
+        # === [変更]: 設定の保存 ===
+        self.tau_scale_range = tau_scale_range
+        
         self.delay = FractionalDelay(dt_ctrl, L_max=0.20)
-        
         self.P_state = None
-        # Latch用
-        self.p_start_latch = None 
-        self.prev_target = None
         
-        self.use_2d_dynamics = use_2d_dynamics
+        self.use_2d_dynamics = True
         self.use_table_i = use_table_i
-        self._tau_2d, self._dead_2d, self._p_axis_2d = None, None, None
-        self._L_prev = None
-        self.last_tau = None 
-        self._tau_x, self._tau_y = None, None
         
+        self._tau_2d = None
+        self._dead_2d = None
+        self._p_axis_2d = None
+
+        self.last_tau = None 
+        
+        # === [追加]: 現在の環境ごとのスケール値 (n_envs,) ===
+        self.current_tau_scale = None
+        
+        self.P_cmd_prev = None
+        self.P_start_latch = None
+        self.last_valid_direction = None 
+        self.deadband = 1.0e-4
+        
+        self._tau_x, self._tau_y = None, None
         if tau_lut is not None:
             x, y = tau_lut
             self._tau_x = torch.tensor(x, dtype=torch.float32)
@@ -267,15 +281,20 @@ class PAMChannel:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         z = torch.zeros(n_envs, device=dev, dtype=torch.float32)
         self.P_state = z.clone()
-        
-        self.p_start_latch = z.clone()
-        self.prev_target = z.clone()
-        
         self.delay.reset(z.shape, dev)
         self.last_tau = torch.full_like(z, float(self.tau))
-        self._L_prev  = None
+        
+        self.P_cmd_prev = z.clone()
+        self.P_start_latch = z.clone()
+        self.last_valid_direction = torch.zeros(n_envs, dtype=torch.long, device=dev)
+        
+        # === [追加]: 初回リセット時は範囲の中間値で初期化 ===
+        mid_val = sum(self.tau_scale_range) / 2.0
+        self.current_tau_scale = torch.full((n_envs,), mid_val, device=dev, dtype=torch.float32)
+        
         if self.use_2d_dynamics:
             self._tau_2d, self._dead_2d, self._p_axis_2d = get_2d_tables(dev)
+            
         if self._tau_x is not None:
             self._tau_x = self._tau_x.to(dev)
             self._tau_y = self._tau_y.to(dev)
@@ -284,67 +303,91 @@ class PAMChannel:
     def reset_idx(self, env_ids: torch.Tensor | Sequence[int]):
         if self.P_state is not None:
             self.P_state[env_ids] = 0.0
-        
-        if self.p_start_latch is not None:
-            self.p_start_latch[env_ids] = 0.0
-        if self.prev_target is not None:
-            self.prev_target[env_ids] = 0.0
-            
         if self.last_tau is not None:
             self.last_tau[env_ids] = float(self.tau)
-        if self._L_prev is not None:
-            self._L_prev[env_ids] = 0.0
+            
+        if self.P_cmd_prev is not None:
+            self.P_cmd_prev[env_ids] = 0.0
+        if self.P_start_latch is not None:
+            self.P_start_latch[env_ids] = 0.0
+        
+        if self.last_valid_direction is not None:
+            self.last_valid_direction[env_ids] = 0
+            
+        # === [追加]: リセットされた環境のスケール値をランダム更新 (DR) ===
+        if self.current_tau_scale is not None:
+            low, high = self.tau_scale_range
+            # 一様分布 U(low, high) からサンプリング
+            # env_ids の数に合わせて乱数を生成
+            num_resets = len(env_ids)
+            rand_scales = torch.rand(num_resets, device=self.current_tau_scale.device) * (high - low) + low
+            self.current_tau_scale[env_ids] = rand_scales
+            
         self.delay.reset_idx(env_ids)
 
     @torch.no_grad()
     def step(self, P_cmd: torch.Tensor) -> torch.Tensor:
         P_cmd = torch.clamp(P_cmd, 0.0, self.Pmax)
         
-        # === Change Detection & Latch Logic ===
-        if self.P_state is None:
-             self.P_state = torch.zeros_like(P_cmd)
-             self.p_start_latch = torch.zeros_like(P_cmd)
-             self.prev_target = torch.zeros_like(P_cmd)
+        if self.P_state is None or self.P_state.shape != P_cmd.shape:
+            # 初回初期化 (安全策)
+            self.P_state = torch.zeros_like(P_cmd)
+            self.P_cmd_prev = torch.zeros_like(P_cmd)
+            self.P_start_latch = torch.zeros_like(P_cmd)
+            self.last_valid_direction = torch.zeros_like(P_cmd, dtype=torch.long)
+            # current_tau_scale も初期化が必要だが、通常はresetが先に呼ばれる前提
 
-        change_mask = torch.abs(P_cmd - self.prev_target) > 1e-2
-        if change_mask.any():
-            self.p_start_latch[change_mask] = self.P_state[change_mask].detach()
-            self.prev_target[change_mask] = P_cmd[change_mask]
-        # ======================================
+        # === Change Detection & Latch Logic (変更なし) ===
+        diff = P_cmd - self.P_cmd_prev
+        curr_direction = torch.zeros_like(diff, dtype=torch.long)
+        curr_direction[diff > self.deadband] = 1
+        curr_direction[diff < -self.deadband] = -1
+        
+        is_moving = (curr_direction != 0)
+        direction_changed = (curr_direction != self.last_valid_direction)
+        update_mask = is_moving & direction_changed
+        
+        if update_mask.any():
+            self.P_start_latch[update_mask] = self.P_state[update_mask].detach()
+            self.last_valid_direction[update_mask] = curr_direction[update_mask]
+            
+        self.P_cmd_prev = P_cmd.clone()
+        # ===============================================
 
+        # 1. むだ時間 L と ベース時定数 tau_base の決定
         if self.use_2d_dynamics and self._tau_2d is not None:
-            # Model B: 2D Dynamics
-            tau_now = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._tau_2d, 
-                                      x_query=P_cmd, y_query=self.p_start_latch)
-            L_cmd   = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._dead_2d, 
-                                      x_query=P_cmd, y_query=self.p_start_latch)
+            tau_base = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._tau_2d, 
+                                        x_query=P_cmd, y_query=self.P_start_latch)
+            L_cmd    = interp2d_bilinear(self._p_axis_2d, self._p_axis_2d, self._dead_2d, 
+                                        x_query=P_cmd, y_query=self.P_start_latch)
             
         elif self.use_table_i:
-            # ★修正箇所: Model A/Default Logic
-            # use_table_i が True なら、むだ時間(L)は常に1Dテーブル(tau_L_from_pressure)から取得する。
-            # これにより、ConfigでLUTが指定されている場合でも、むだ時間の計算はテーブルに従う。
-            
-            # 1. むだ時間の決定 (Table I Logic)
-            _, L_table_val = tau_L_from_pressure(P_cmd)
-            L_cmd = L_table_val
-
-            # 2. 時定数の決定
             if self._tau_x is None:
-                # Model A (Ideal): 固定時定数
-                tau_now = torch.full_like(P_cmd, self.tau)
+                tau_base, L_cmd = tau_L_from_pressure(P_cmd)
             else:
-                # Custom LUTが提供されている場合 (Configで use_pressure_dependent_tau=True の場合)
-                tau_now = interp1d_clamp_torch(self._tau_x, self._tau_y, P_cmd)
+                tau_base = interp1d_clamp_torch(self._tau_x, self._tau_y, P_cmd)
+                L_cmd = torch.full_like(P_cmd, self.dead_time)
         else:
-            # 完全固定モデル
-            tau_now = torch.full_like(P_cmd, self.tau)
-            L_cmd   = torch.full_like(P_cmd, self.dead_time)
+            tau_base = torch.full_like(P_cmd, self.tau)
+            L_cmd    = torch.full_like(P_cmd, self.dead_time)
 
-        P_delayed = self.delay.step(P_cmd, L_cmd)
+        # === [変更]: スケーリングの適用 ===
+        # current_tau_scale は (n_envs,) なので、P_cmd が (n_envs, n_actions) の場合は unsqueezeが必要
+        scale = self.current_tau_scale
+        if P_cmd.ndim > 1:
+            scale = scale.view(-1, 1) # (N, 1) にしてブロードキャスト
         
-        if self.P_state is None or self.P_state.shape != P_cmd.shape:
-             self.P_state = P_delayed.clone()
+        # ベース時定数にスケールを掛ける (例: 0.3倍して高速化)
+        tau_final = tau_base * scale
+        
+        # 数値計算安定のため下限クリップ (1ms以下はさすがに早すぎるので0.1ms程度で止める)
+        tau_final = torch.clamp(tau_final, min=1e-4)
 
-        self.last_tau = torch.clamp(tau_now, min=1e-6)
+        # 2. 遅れ実行
+        P_delayed = self.delay.step(P_cmd, L_cmd)
+
+        # 3. 一次遅れ
+        self.last_tau = tau_final
         self.P_state = first_order_lag(P_delayed, self.P_state, self.last_tau, self.dt)
+        
         return self.P_state

@@ -103,6 +103,9 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # [追加]: ランダム時のBPM範囲
     bpm_range: tuple[float, float] = (10.0, 160.0)
 
+    # デフォルトは (1.0, 1.0) でスケーリングなし（既存挙動維持）
+    pam_tau_scale_range: tuple[float, float] = (1.0, 1.0)
+
     # --- モジュール別設定 ---
     controller: TorqueControllerCfg = TorqueControllerCfg()
     logging: LoggingCfg = LoggingCfg()
@@ -132,7 +135,7 @@ def apply_domain_randomization(cfg: PorcaroRLEnvCfg):
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "mass_distribution_params": (0.9, 1.05),
+            "mass_distribution_params": (0.9, 1.1),
             "operation": "scale",
         },
     )
@@ -211,6 +214,9 @@ class PorcaroRLEnvCfg_ModelB_DR(PorcaroRLEnvCfg_ModelB):
     def __post_init__(self):
         super().__post_init__()
         apply_domain_randomization(self)
+
+        # 下限 0.3 (高速・高周波応答) 〜 上限 1.0 (低速・ステップ応答)
+        self.pam_tau_scale_range = (0.3, 1.0)
 
 
 # --- [Model C] ActuatorNet ---

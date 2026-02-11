@@ -40,6 +40,7 @@ class TorqueActionController(ActionController):
                  pam_p_dot_scale: float = 0.5,
                  pam_contract_gain: float = 1.0,  # 収縮: 少し弱める
                  pam_extend_gain: float = -0.4,    # 伸長: 強める (落下防止)
+                 pam_tau_scale_range: tuple[float, float] = (1.0, 1.0),
                  ):    # 感度は控えめに
 
         self.dt_ctrl = float(dt_ctrl)
@@ -59,6 +60,7 @@ class TorqueActionController(ActionController):
         self.pam_p_dot_scale = float(pam_p_dot_scale)
         self.pam_contract_gain = float(pam_contract_gain)
         self.pam_extend_gain = float(pam_extend_gain)
+        self.pam_tau_scale_range = pam_tau_scale_range
 
         # Force Mapの読み込み
         print("-" * 60)
@@ -107,10 +109,18 @@ class TorqueActionController(ActionController):
             tau_vals   = [0.043,0.045,0.060,0.066,0.094,0.131]
             tau_lut = (tau_P_axis, tau_vals)
 
-        # PAMChannel 初期化
-        self.ch_DF = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut, use_2d_dynamics=use_2d)
-        self.ch_F  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut, use_2d_dynamics=use_2d)
-        self.ch_G  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut, use_2d_dynamics=use_2d)
+        # PAMChannel 初期化 (修正箇所: tau_scale_range を渡す)
+        self.ch_DF = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, 
+                                tau_lut=tau_lut, use_2d_dynamics=use_2d,
+                                tau_scale_range=self.pam_tau_scale_range) # <--- 追加
+        
+        self.ch_F  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, 
+                                tau_lut=tau_lut, use_2d_dynamics=use_2d,
+                                tau_scale_range=self.pam_tau_scale_range) # <--- 追加
+        
+        self.ch_G  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, 
+                                tau_lut=tau_lut, use_2d_dynamics=use_2d,
+                                tau_scale_range=self.pam_tau_scale_range) # <--- 追加
         
         self._last_telemetry: dict | None = None
         self.pressure_shrink_gain = float(pressure_shrink_gain)
