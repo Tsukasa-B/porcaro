@@ -184,6 +184,56 @@ def apply_soft_engagement(force: torch.Tensor, epsilon: torch.Tensor, h0: torch.
     
     return force * mask_val
 
+def calculate_simple_latched_friction(
+    h_dot: torch.Tensor, 
+    p_dot: torch.Tensor, 
+    pressure: torch.Tensor,
+    prev_direction: torch.Tensor, # 前回の向き (記憶)
+    viscosity: float, 
+    hys_coef_p: float, 
+    hys_const: float, 
+    p_dot_scale: float = 1.0,
+    tanh_width: float = 0.1,
+    latch_epsilon: float = 0.25,   # これ以下の動きなら「停止」とみなして記憶を使う
+    contract_gain: float = 1.0,
+    extend_gain: float = 1.0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sim-to-Real用 シンプル・ラッチ摩擦モデル
+    - 非対称ゲインなし（元のヒステリシス形状に戻す）
+    - Latchingあり（停止時に摩擦を維持して振動/落下を防ぐ）
+    """
+    
+    # 1. 粘性項
+    f_viscous = -1.0 * viscosity * h_dot
+
+    # 2. 摩擦の大きさ (Magnitude)
+    friction_magnitude = hys_const + hys_coef_p * torch.abs(pressure)
+
+    # 3. 摩擦の方向決定 (Direction Logic)
+    v_virtual = torch.clamp(p_dot * p_dot_scale, min=-1.0, max=1.0) 
+    v_effective = h_dot + v_virtual
+
+    # 方向算出
+    current_dir = torch.tanh(v_effective / tanh_width)
+    
+    # Latching (静止時は前回の向きを維持)
+    mask = (torch.abs(v_effective) > latch_epsilon).float()
+    final_direction = current_dir * mask + prev_direction * (1.0 - mask)
+    
+    # 4. 非対称ゲインの適用
+    # final_direction > 0 (収縮) -> contract_gain
+    # final_direction < 0 (伸長) -> extend_gain
+    blend_pos = 0.5 * (1.0 + final_direction) # 収縮成分
+    blend_neg = 0.5 * (1.0 - final_direction) # 伸長成分
+    
+    asym_scale = (contract_gain * blend_pos) + (extend_gain * blend_neg)
+
+    # 最終摩擦力
+    f_hysteresis = -1.0 * (friction_magnitude * asym_scale) * final_direction
+
+    return f_viscous + f_hysteresis, final_direction
+
 class PAMChannel:
     def __init__(self, dt_ctrl: float, tau: float = 0.09, dead_time: float = 0.03, Pmax: float = 0.6,
                  tau_lut: tuple[list[float], list[float]] | None = None,
@@ -192,7 +242,7 @@ class PAMChannel:
         
         self.dt = dt_ctrl
         self.dead_time = float(dead_time)
-        self.tau = float(tau) # 修正: デフォルト値を 1.09 -> 0.09 へ
+        self.tau = float(tau) 
         self.Pmax = float(Pmax)
         self.delay = FractionalDelay(dt_ctrl, L_max=0.20)
         
@@ -256,7 +306,7 @@ class PAMChannel:
              self.p_start_latch = torch.zeros_like(P_cmd)
              self.prev_target = torch.zeros_like(P_cmd)
 
-        change_mask = torch.abs(P_cmd - self.prev_target) > 1e-4
+        change_mask = torch.abs(P_cmd - self.prev_target) > 1e-2
         if change_mask.any():
             self.p_start_latch[change_mask] = self.P_state[change_mask].detach()
             self.prev_target[change_mask] = P_cmd[change_mask]

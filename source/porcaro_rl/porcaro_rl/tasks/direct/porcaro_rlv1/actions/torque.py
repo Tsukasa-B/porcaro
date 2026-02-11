@@ -7,7 +7,9 @@ from .pam import (
     PamForceMap, H0Map,
     apply_soft_engagement,
     calculate_absolute_contraction,
-    apply_model_a_force
+    apply_model_a_force,
+    # [MODIFIED] シンプル版関数に変更
+    calculate_simple_latched_friction,
 )
 from ..cfg.actuator_cfg import PamGeometricCfg
 
@@ -17,21 +19,28 @@ class TorqueActionController(ActionController):
                  control_mode: str = "pressure", 
                  r: float = 0.014, L: float = 0.150,
                  theta_t_DF_deg: float = 0.0,
-                 theta_t_F_deg:  float = 90.0,
-                 theta_t_G_deg:  float = 45.0,
+                 theta_t_F_deg:  float = 0.0,
+                 theta_t_G_deg:  float = 0.0,
                  Pmax: float = 0.6,
                  tau: float = 0.09, dead_time: float = 0.03,
                  N: float = 630.0,
-                 pam_viscosity: float = 5.0,
-                 pam_hys_const: float = 5.0,
-                 pam_hys_coef_p: float = 20.0,
+                 # ▼▼▼ 推奨パラメータ (振動防止版) ▼▼▼
+                 pam_viscosity: float = 0.0,      # 少し強めの粘性で安定化
+                 pam_hys_const: float = 60.0,      # 基礎摩擦
+                 pam_hys_coef_p: float = 200.0,     # 圧力依存摩擦
+                 # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                  force_map_csv: str | None = None,
                  force_scale: float = 1.0,
                  h0_map_csv: str | None = None,
                  use_pressure_dependent_tau: bool = True,
                  geometric_cfg: PamGeometricCfg | None = None,
                  transition_width: float = 0.01,
-                 pressure_shrink_gain: float = 0.0,):
+                 pressure_shrink_gain: float = 0.0,
+                 # [NEW] シンプルな感度設定のみ
+                 pam_p_dot_scale: float = 0.5,
+                 pam_contract_gain: float = 1.0,  # 収縮: 少し弱める
+                 pam_extend_gain: float = -0.4,    # 伸長: 強める (落下防止)
+                 ):    # 感度は控えめに
 
         self.dt_ctrl = float(dt_ctrl)
         self.control_mode = control_mode
@@ -46,6 +55,10 @@ class TorqueActionController(ActionController):
         self.pam_hys_coef_p = float(pam_hys_coef_p)
         self.force_scale = float(force_scale)
         self.transition_width = float(transition_width)
+
+        self.pam_p_dot_scale = float(pam_p_dot_scale)
+        self.pam_contract_gain = float(pam_contract_gain)
+        self.pam_extend_gain = float(pam_extend_gain)
 
         # Force Mapの読み込み
         print("-" * 60)
@@ -95,14 +108,17 @@ class TorqueActionController(ActionController):
             tau_lut = (tau_P_axis, tau_vals)
 
         # PAMChannel 初期化
-        # Model A (use_absolute=True) -> use_2d_dynamics=False -> use_table_i=True (tau固定/L可変)
-        # Model B (use_absolute=False) -> use_2d_dynamics=True
         self.ch_DF = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut, use_2d_dynamics=use_2d)
         self.ch_F  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut, use_2d_dynamics=use_2d)
         self.ch_G  = PAMChannel(dt_ctrl, tau=tau, dead_time=dead_time, Pmax=self.Pmax, tau_lut=tau_lut, use_2d_dynamics=use_2d)
         
         self._last_telemetry: dict | None = None
         self.pressure_shrink_gain = float(pressure_shrink_gain)
+        
+        # [NEW] 状態変数の初期化
+        self.prev_P_stack = None
+        self.prev_direction_stack = None 
+
     def reset(self, n_envs: int, device: str | torch.device):
         self.ch_DF.reset(n_envs, device)
         self.ch_F.reset(n_envs, device)
@@ -111,11 +127,19 @@ class TorqueActionController(ActionController):
         if self.h0_map is not None: self.h0_map.to(device)
         self.slack_offsets = self.slack_offsets.to(device)
         self._last_telemetry = None
+        
+        # 状態リセット
+        self.prev_P_stack = None
+        self.prev_direction_stack = torch.zeros((n_envs, 3), device=device, dtype=torch.float32)
 
     def reset_idx(self, env_ids: torch.Tensor):
         self.ch_DF.reset_idx(env_ids)
         self.ch_F.reset_idx(env_ids)
         self.ch_G.reset_idx(env_ids)
+        if self.prev_P_stack is not None:
+            self.prev_P_stack[env_ids] = 0.0
+        if self.prev_direction_stack is not None:
+            self.prev_direction_stack[env_ids] = 0.0
 
     def compute_pressure(self, actions: torch.Tensor) -> torch.Tensor:
         actions = torch.nan_to_num(actions, nan=0.0)
@@ -149,7 +173,7 @@ class TorqueActionController(ActionController):
         wid, gid = joint_ids
         n_envs = int(q.shape[0])
 
-        # 速度取得 (Sim生:下=正 -> Code:上=正 へ変換)
+        # 速度取得
         dq_sim = robot.data.joint_vel  
         dq_wrist = -torch.rad2deg(dq_sim[:, wid]) 
         dq_grip  = -torch.rad2deg(dq_sim[:, gid])
@@ -167,18 +191,27 @@ class TorqueActionController(ActionController):
         # 1) 指令値計算
         P_cmd_stack = self._compute_command_pressure(actions)
 
-        # 2) 遅れ計算 (Dynamics) - ここが計算の本体
+        # 2) 遅れ計算
         P_DF = self.ch_DF.step(P_cmd_stack[:, 0])
         P_F  = self.ch_F.step(P_cmd_stack[:, 1])
         P_G  = self.ch_G.step(P_cmd_stack[:, 2])
 
+        # P_dot 計算
+        P_current_stack = torch.stack([P_DF, P_F, P_G], dim=1)
+        if self.prev_P_stack is None:
+            self.prev_P_stack = torch.zeros_like(P_current_stack)
+        if self.prev_direction_stack is None:
+             self.prev_direction_stack = torch.zeros_like(P_current_stack)
+        
+        P_dot_stack = (P_current_stack - self.prev_P_stack) / self.dt_ctrl
+        self.prev_P_stack = P_current_stack.clone()
+
         q_wrist = torch.rad2deg(q[:, joint_ids[0]])
         q_grip  = torch.rad2deg(q[:, joint_ids[1]])
 
-        # 動作方向 (Code座標系: 上=正)
-        SIGN_DF =  1.0      # 上がると縮む
-        SIGN_F  = -1.0      # 上がると伸びる
-        SIGN_G  = -1.0      # 上がると伸びる
+        SIGN_DF =  1.0
+        SIGN_F  = -1.0
+        SIGN_G  = -1.0
 
         if self.use_absolute_geometry:
             # === [Model A] ===
@@ -200,6 +233,7 @@ class TorqueActionController(ActionController):
 
         else:
             # === [Model B] ===
+            # 1. 有効収縮率 h の計算
             h_DF = calculate_effective_contraction(
                     q_wrist, self.theta_t["DF"], self.r, self.L0_sim, self.slack_offsets[0], 
                     pressure=P_DF, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_DF) 
@@ -210,12 +244,12 @@ class TorqueActionController(ActionController):
                     q_grip, self.theta_t["G"], self.r, self.L0_sim, self.slack_offsets[2], 
                     pressure=P_G, shrink_gain=self.pressure_shrink_gain, clamp=False, sign=SIGN_G)
 
-            # 静的力
+            # 2. 静的力
             F_DF_static = self.force_map(P_DF, h_DF) * self.force_scale
             F_F_static  = self.force_map(P_F,  h_F)  * self.force_scale
-            F_G_static  = self.force_map(P_G,  h_G)  * self.force_scale# 3. 収縮速度 h_dot の計算 (dq [rad/s] を利用)
-            # h = (r * sign * (theta - theta_t)) / L0
-            # h_dot = (r * sign * dq) / L0
+            F_G_static  = self.force_map(P_G,  h_G)  * self.force_scale
+
+            # 3. 収縮速度
             def calculate_h_dot(dq_rad, r, sign, L0):
                 return (r * sign * dq_rad) / L0
 
@@ -223,57 +257,45 @@ class TorqueActionController(ActionController):
             h_dot_F  = calculate_h_dot(dq_wrist_rad, self.r, SIGN_F,  self.L0_sim)
             h_dot_G  = calculate_h_dot(dq_grip_rad,  self.r, SIGN_G,  self.L0_sim)
 
-            # 4. 摩擦力の計算 (Pressure-Dependent Hysteresis + Viscosity)
-            # 変更点: 静止摩擦係数(static_friction)を固定値ではなく、圧力Pに比例させる形に変更
-            # 理由: 空気圧が高いほどメッシュとゴムの接触圧が上がり、ヒステリシス(摩擦)が大きくなるため
+            # 4. 摩擦力 (シンプル・ラッチ版)
+            fric_DF, new_dir_DF = calculate_simple_latched_friction(
+                h_dot_DF, P_dot_stack[:, 0], P_DF, 
+                self.prev_direction_stack[:, 0],
+                self.pam_viscosity, self.pam_hys_coef_p, self.pam_hys_const,
+                p_dot_scale=self.pam_p_dot_scale,
+                contract_gain=self.pam_contract_gain,
+                extend_gain=self.pam_extend_gain
+            )
+            fric_F, new_dir_F = calculate_simple_latched_friction(
+                h_dot_F, P_dot_stack[:, 1], P_F, 
+                self.prev_direction_stack[:, 1],
+                self.pam_viscosity, self.pam_hys_coef_p, self.pam_hys_const,
+                p_dot_scale=self.pam_p_dot_scale,
+                contract_gain=self.pam_contract_gain,
+                extend_gain=self.pam_extend_gain
+            )
+            fric_G, new_dir_G = calculate_simple_latched_friction(
+                h_dot_G, P_dot_stack[:, 2], P_G, 
+                self.prev_direction_stack[:, 2],
+                self.pam_viscosity, self.pam_hys_coef_p, self.pam_hys_const,
+                p_dot_scale=self.pam_p_dot_scale,
+                contract_gain=self.pam_contract_gain,
+                extend_gain=self.pam_extend_gain
+            )
             
-            def calculate_friction_force(h_dot, viscosity, hys_coef_p, hys_const, pressure):
-                """
-                h_dot: 収縮速度 [1/s] (収縮方向が正)
-                viscosity: 粘性係数 (速度に比例)
-                hys_coef_p: 圧力依存ヒステリシス係数 (圧力に比例)
-                hys_const: 基礎ヒステリシス項 (圧力ゼロでも残る摩擦など)
-                pressure: 現在の空気圧 [kPa] または正規化値
-                """
-                
-                # A. 粘性項 (Viscosity)
-                # 速度に比例して抵抗。ダンピング効果としてシステムの安定性にも寄与。
-                f_viscous = -1.0 * viscosity * h_dot 
-                
-                # B. ヒステリシス項 (Pressure-Dependent Coulomb Friction)
-                # 圧力Pに応じて摩擦の大きさが変化するモデル。
-                # 収縮時(h_dot > 0) -> 力が減る(負)
-                # 伸長時(h_dot < 0) -> 力が増える(正)
-                
-                # 摩擦の大きさ = (定数項 + 圧力比例項 * P)
-                # ※ Pは負にならないよう念のため max(0, P) 等で保護しても良い
-                friction_magnitude = hys_const + hys_coef_p * pressure
-                
-                # tanhで符号反転を滑らかにする (チャタリング防止)
-                f_hysteresis = -1.0 * friction_magnitude * torch.tanh(h_dot / 0.01)
-                
-                return f_viscous + f_hysteresis
-
-            # パラメータ設定 (これらはクラスの __init__ 等で定義・調整が必要)
-            # 例: self.pam_hys_coef_p = 20.0 (圧力1単位あたりの摩擦増加量)
-            #     self.pam_hys_const = 5.0  (基礎摩擦)
-            
-            # 各筋肉について計算
-            fric_DF = calculate_friction_force(h_dot_DF, self.pam_viscosity, self.pam_hys_coef_p, self.pam_hys_const, P_DF)
-            fric_F  = calculate_friction_force(h_dot_F,  self.pam_viscosity, self.pam_hys_coef_p, self.pam_hys_const, P_F)
-            fric_G  = calculate_friction_force(h_dot_G,  self.pam_viscosity, self.pam_hys_coef_p, self.pam_hys_const, P_G)
+            # 方向の更新
+            self.prev_direction_stack = torch.stack([new_dir_DF, new_dir_F, new_dir_G], dim=1)
 
             # 5. 合力計算
             F_DF_total_raw = F_DF_static + fric_DF
             F_F_total_raw  = F_F_static  + fric_F
             F_G_total_raw  = F_G_static  + fric_G
             
-            # 負の力は物理的にありえないので 0 でクリップ (ワイヤーは押せない)
             F_DF_total_raw = torch.clamp(F_DF_total_raw, min=0.0)
             F_F_total_raw  = torch.clamp(F_F_total_raw,  min=0.0)
             F_G_total_raw  = torch.clamp(F_G_total_raw,  min=0.0)
 
-            # --- Soft Engagement (Slack処理) ---
+            # --- Soft Engagement ---
             if self.h0_map is not None:
                 h0_DF, h0_F, h0_G = self.h0_map(P_DF), self.h0_map(P_F), self.h0_map(P_G)
             
@@ -281,12 +303,11 @@ class TorqueActionController(ActionController):
             F_F  = apply_soft_engagement(F_F_total_raw,  h_F,  h0_F,  self.transition_width)
             F_G  = apply_soft_engagement(F_G_total_raw,  h_G,  h0_G,  self.transition_width)
 
-        # トルク計算 (F_DF: 上向き力, F_F: 下向き力)
+        # トルク計算
         tau_w = self.r * (F_DF - F_F)
         tau_g = self.r * (- F_G)
 
         tau_full = torch.zeros(n_envs, robot.num_joints, device=q.device, dtype=q.dtype)
-        # Code(上=正) -> Sim(下=正) 変換のため符号反転
         tau_full[:, wid] = -tau_w
         tau_full[:, gid] = -tau_g
         robot.set_joint_effort_target(tau_full)

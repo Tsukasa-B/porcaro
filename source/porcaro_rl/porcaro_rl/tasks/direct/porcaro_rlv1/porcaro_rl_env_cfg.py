@@ -38,7 +38,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     """Porcaro 環境用の設定クラス (基本構成 - DRなし)"""
 
     # --- RL 設定 ---
-    decimation: int = 10 
+    decimation: int = 4#10 
     
     # [変更]: 4小節構造 (BPM60時) に耐えられるよう十分な長さを確保
     # 実際のエピソード終了は BPM に基づき動的に判定されます
@@ -46,7 +46,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     
     # --- シミュレーション設定 ---
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 500,     # 1ms
+        dt=1 / 200,#500,     # 1ms
         render_interval=decimation, # ここは絶対に変えてはいけない
         physics_material=sim_utils.RigidBodyMaterialCfg(
             static_friction=0.0, dynamic_friction=0.0, restitution=0.0, # restitutionは０
@@ -95,13 +95,13 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # BPM範囲などを明示的に定義
     use_simple_rhythm: bool = True   
     simple_rhythm_mode: str = "single" 
-    simple_rhythm_bpm: float = 20.0    
+    simple_rhythm_bpm: float = 10.0    
     target_hit_force: float = 30.0
 
     lookahead_horizon: float = 0.5
     
     # [追加]: ランダム時のBPM範囲
-    bpm_range: tuple[float, float] = (30.0, 160.0)
+    bpm_range: tuple[float, float] = (10.0, 160.0)
 
     # --- モジュール別設定 ---
     controller: TorqueControllerCfg = TorqueControllerCfg()
@@ -141,9 +141,9 @@ def apply_domain_randomization(cfg: PorcaroRLEnvCfg):
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "static_friction_range": (0.7, 1.3),
-            "dynamic_friction_range": (0.7, 1.3),
-            "restitution_range": (0.8, 1.0),
+            "static_friction_range": (0.75, 1.25),
+            "dynamic_friction_range": (0.75, 1.25),
+            "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
     )

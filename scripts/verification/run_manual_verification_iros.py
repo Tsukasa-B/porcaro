@@ -1,62 +1,71 @@
-# scripts/verification/run_manual_verification.py
 """
-Porcaro Robot: Multi-Model Manual Verification Script
-GUI Crash Fix Included & Time-Sync Logic Improved (Zero-Order Hold Fix applied)
+Porcaro Robot: IROS 2026 Validation Experiment Runner (Sim)
+Target: Isaac Lab (Model A/B)
+Author: Robo-Dev Partner
+
+[Directory Structure Assumption]
+porcaro/ (Project Root)
+  ├── scripts/verification/run_manual_verification_iros.py
+  └── external_data/jetson_project/IROS/test_signals/ (CSV files here)
+
+[Usage]
+  python scripts/verification/run_manual_verification_iros.py exp1_static_hysteresis
+  python scripts/verification/run_manual_verification_iros.py exp1_static_hysteresis --model_type B
+  python scripts/verification/run_manual_verification_iros.py exp2_step_response --model_type B
+  python scripts/verification/run_manual_verification_iros.py exp3_frequency_sweep --model_type B
+  python scripts/verification/run_manual_verification_iros.py data_exp1_static_hysteresis_TIMESTAMP
+
 """
-import argparse
-import sys
-import os
 
 # =============================================================================
-# ★最重要修正: GUIクラッシュ対策
+# ★ GUI Crash Fix (Must be first)
 # =============================================================================
 import matplotlib
 matplotlib.use('Agg') 
 
+import argparse
+import sys
+import os
+import glob
+import traceback
+import math
+import numpy as np
+import pandas as pd
+import torch
+from scipy.interpolate import interp1d
+from datetime import datetime
+
 # -----------------------------------------------------------------------------
-# 1. 引数定義
+# 1. Arguments
 # -----------------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Multi-Model Verification Script")
-parser.add_argument("--model_type", type=str, default="A", choices=["A", "B", "C"])
-parser.add_argument("--dr", action="store_true")
-parser.add_argument("--no_drum", action="store_true")
-parser.add_argument("--replay_csv", type=str, default=None)
-parser.add_argument("--mode", type=str, default="double", choices=["sine", "step", "const", "double"])
-parser.add_argument("--bpm", type=float, default=120.0)
-parser.add_argument("--pattern", type=str, default="1,1,0,0")
-parser.add_argument("--pressure_high", type=float, default=0.55)
-parser.add_argument("--pressure_low", type=float, default=0.05)
-parser.add_argument("--pressure_grip", type=float, default=0.3)
-parser.add_argument("--duty_cycle", type=float, default=0.5)
-parser.add_argument("--freq", type=float, default=1.0)
-parser.add_argument("--amp", type=float, default=0.25)
-parser.add_argument("--offset", type=float, default=0.3)
-parser.add_argument("--step_interval", type=float, default=1.0)
-parser.add_argument("--num_envs", type=int, default=1)
-parser.add_argument("--headless", action="store_true")
+parser = argparse.ArgumentParser(description="IROS Validation Runner (Sim)")
+
+# Positional Argument: CSV Name
+parser.add_argument("csv_name", nargs="?", type=str, default=None, help="Experiment CSV name (e.g. exp1_static_hysteresis)")
+
+# Options
+parser.add_argument("--model_type", type=str, default="B", choices=["A", "B", "C"], help="Model Type (A:Old, B:New, C:Future)")
+parser.add_argument("--dr", action="store_true", help="Enable Domain Randomization")
+parser.add_argument("--no_drum", action="store_true", default=True, help="Remove drum (Default: True)")
+parser.add_argument("--headless", action="store_true", help="Run without GUI")
+parser.add_argument("--tau", type=float, default=0.15, help="Pressure Time Constant (tau) for reconstruction [s]")
 
 args, unknown = parser.parse_known_args()
 
 # -----------------------------------------------------------------------------
-# 2. App起動
+# 2. Launch Isaac Lab
 # -----------------------------------------------------------------------------
 from isaaclab.app import AppLauncher
 app_launcher = AppLauncher(headless=args.headless)
 simulation_app = app_launcher.app
 
 # -----------------------------------------------------------------------------
-# 3. その他ライブラリ (App起動後にimport)
+# 3. Imports
 # -----------------------------------------------------------------------------
-import traceback
-import torch
-import numpy as np
-import math
-import pandas as pd
-from scipy.interpolate import interp1d
-
 try:
     from porcaro_rl.tasks.direct.porcaro_rlv1.porcaro_rl_env import PorcaroRLEnv
     from porcaro_rl.tasks.direct.porcaro_rlv1.porcaro_rl_env_cfg import (
+        PorcaroRLEnvCfg,
         PorcaroRLEnvCfg_ModelA, PorcaroRLEnvCfg_ModelA_DR,
         PorcaroRLEnvCfg_ModelB, PorcaroRLEnvCfg_ModelB_DR,
         PorcaroRLEnvCfg_ModelC, PorcaroRLEnvCfg_ModelC_DR
@@ -66,9 +75,8 @@ except Exception as e:
     simulation_app.close()
     sys.exit(1)
 
-
 # -----------------------------------------------------------------------------
-# 4. エージェントクラス
+# 4. Agent Class
 # -----------------------------------------------------------------------------
 class SignalGeneratorAgent:
     def __init__(self, num_envs, dt, device, args):
@@ -79,226 +87,207 @@ class SignalGeneratorAgent:
         self.t = 0.0
         self.P_MAX = 0.6 
         
-        self.is_replay = args.replay_csv is not None
+        # Internal Pressure State (for logging)
+        # P_new = P_old + (dt/tau)*(P_cmd - P_old)
+        self.pres_state = np.zeros(3) # [DF, F, G]
+        self.alpha = self.dt / (self.args.tau + self.dt)
+
+        self.is_replay = False
         self.replay_finished = False
+        self.csv_path = None
+        self.last_cmd = np.zeros(3)
 
-        if self.is_replay:
-            self._init_replay(args.replay_csv)
+        if args.csv_name:
+            self.is_replay = True
+            self.csv_path = self._resolve_path(args.csv_name)
+            self._init_replay(self.csv_path)
         else:
-            self._init_pattern_mode(args)
+            print(f"[Agent] No CSV specified. Using Dummy Mode.")
 
-    def _init_replay(self, csv_filename):
-        # パス解決ロジック
-        candidates = [
-            csv_filename,
-            os.path.join("IROS", "test_signals", csv_filename),
-            os.path.join("external_data", "jetson_project", "IROS", "test_signals", csv_filename),
-            os.path.join("porcaro_rl", "external_data", "jetson_project", "IROS", "test_signals", csv_filename),
-            os.path.join("..", "external_data", "jetson_project", "IROS", "test_signals", csv_filename)
-        ]
-        final_path = None
-        for path in candidates:
-            if os.path.exists(path):
-                final_path = path
-                break
+    def _resolve_path(self, name):
+        """Find the CSV file recursively"""
+        if not name.endswith('.csv'): name += '.csv'
         
-        if final_path is None:
-            print(f"\n[ERROR] CSV File not found: {csv_filename}")
-            print(f"Searched in: {candidates}")
-            sys.exit(1)
+        # Priority 1: Direct path
+        if os.path.exists(name): return name
+        
+        # Priority 2: Recursive search in current dir
+        files = glob.glob(f"**/{name}", recursive=True)
+        if files: return files[0]
+        
+        # Priority 3: Fuzzy search (keyword match)
+        base_name = os.path.splitext(name)[0]
+        files = glob.glob(f"**/*{base_name}*.csv", recursive=True)
+        if files:
+            print(f"[Info] Exact match not found. Using: {files[0]}")
+            return files[0]
 
-        print(f"\n[Agent] REPLAY MODE: Loading {final_path} ...")
+        print(f"\n[ERROR] CSV File not found: {name}")
+        sys.exit(1)
+
+    def _init_replay(self, path):
+        print(f"\n[Agent] Loading Replay Sequence: {path}")
         try:
-            df = pd.read_csv(final_path)
+            df = pd.read_csv(path)
             
-            # --- 時間カラムの判定 ---
-            time_col = None
-            if 'time' in df.columns:
-                time_col = 'time'
-            elif 'timestamp' in df.columns:
-                time_col = 'timestamp'
-            else:
-                raise ValueError("CSV must contain 'time' or 'timestamp' column.")
-
-            # 時間順にソート & 重複削除
-            df = df.sort_values(by=time_col)
-            df = df.drop_duplicates(subset=time_col, keep='first')
-            
-            # Simのt=0に合わせて時間を正規化
-            t_real = df[time_col].values
+            # Time column detection
+            t_col = next((c for c in ['time', 'timestamp', 'Time'] if c in df.columns), df.columns[0])
+            df = df.sort_values(by=t_col)
+            t_real = df[t_col].values
             t_real = t_real - t_real[0]
-            
-            # Sim制御周期(50Hz) < CSV記録周期(100Hz) の場合もあるため、
-            # 補間を作成して、Simのステップ時間(self.t)に厳密に合わせる
-            cmd_data = df[['cmd_pressure_DF', 'cmd_pressure_F', 'cmd_pressure_G']].values if 'cmd_pressure_DF' in df.columns else df[['cmd_DF', 'cmd_F', 'cmd_G']].values
 
-            # ★修正箇所: linear(線形補間) -> previous(0次ホールド/前回値保持)
-            # これにより、シミュレーションが未来の値を先読みしてフライングするのを防ぐ
+            # Pressure Command Selection
+            # 1. Real Measured Pressure (Best for validation)
+            if 'meas_pres_DF' in df.columns:
+                print(" -> Using REAL MEASURED pressure as Command (Input Realism)")
+                cmd_data = df[['meas_pres_DF', 'meas_pres_F', 'meas_pres_G']].values
+            # 2. Command Pressure
+            elif 'cmd_pressure_DF' in df.columns:
+                print(" -> Using COMMAND pressure")
+                cmd_data = df[['cmd_pressure_DF', 'cmd_pressure_F', 'cmd_pressure_G']].values
+            # 3. Fallback
+            elif 'cmd_DF' in df.columns:
+                 cmd_data = df[['cmd_DF', 'cmd_F', 'cmd_G']].values
+            else:
+                raise ValueError("CSV format error: Pressure columns not found.")
+            
+            # Fill NaN
+            cmd_data = np.nan_to_num(cmd_data, nan=0.0)
+
             self.replay_interpolator = interp1d(
-                t_real, cmd_data, axis=0, 
-                kind='previous',   # <--- 修正!
+                t_real, cmd_data, axis=0, kind='linear', 
                 bounds_error=False, fill_value=(cmd_data[0], cmd_data[-1])
             )
             self.max_replay_time = t_real[-1]
-            
-            print(f" -> Loaded {len(df)} rows. Duration: {self.max_replay_time:.2f}s")
-            print(f" -> Time Column: '{time_col}'")
-            print(f" -> Sim Control DT: {self.dt:.4f}s")
+            print(f" -> Duration: {self.max_replay_time:.2f}s")
             
         except Exception as e:
-            print(f"[Agent] Error loading CSV: {e}")
+            print(f"[Error] Failed to load CSV: {e}")
             sys.exit(1)
 
-    def _init_pattern_mode(self, args):
-        self.pattern_seq = [int(x) for x in args.pattern.split(",")]
-        self.beat_sec = 60.0 / args.bpm
-        self.note_sec = self.beat_sec / 4.0 
-        self.total_cycle_sec = self.note_sec * len(self.pattern_seq)
-        print(f"\n[Agent] Mode: {args.mode}")
-
-    def _pressure_to_action(self, p_mpa):
-        # 0.0~0.6MPa -> -1.0~1.0 (Normalized Action)
-        p = np.clip(p_mpa, 0.0, self.P_MAX)
-        return 2.0 * (p / self.P_MAX) - 1.0
-
     def get_action(self, obs=None):
-        p_df, p_f, p_g = 0.0, 0.0, 0.0
+        cmd = np.zeros(3) # [DF, F, G]
         
         if self.is_replay:
-            if self.t > self.max_replay_time + 0.5:
+            if self.t > self.max_replay_time + 1.0:
                 self.replay_finished = True
                 return torch.zeros((self.num_envs, 3), device=self.device)
             
-            # 現在のシミュレーション時刻(self.t)における正確な指令値を補間取得
-            cmds = self.replay_interpolator(self.t)
-            p_df, p_f, p_g = cmds[0], cmds[1], cmds[2]
+            cmd = self.replay_interpolator(self.t)
+        else:
+            cmd = np.array([0.3, 0.3, 0.3])
 
-        elif self.args.mode == "double":
-            t_in_cycle = self.t % self.total_cycle_sec
-            note_idx = int(t_in_cycle / self.note_sec)
-            t_in_note = t_in_cycle % self.note_sec
-            if note_idx >= len(self.pattern_seq): note_idx = 0
-            is_hit = self.pattern_seq[note_idx] == 1
-            target_f = self.args.pressure_low
-            target_df = self.args.pressure_high
-            if is_hit:
-                if t_in_note < (self.note_sec * self.args.duty_cycle):
-                    target_f = self.args.pressure_high
-                    target_df = self.args.pressure_low
-            p_f = target_f; p_df = target_df; p_g = self.args.pressure_grip
+        self.last_cmd = cmd
 
-        elif self.args.mode == "sine":
-            sine_val = math.sin(2 * math.pi * self.args.freq * self.t)
-            base = self.args.offset + self.args.amp * sine_val
-            p_df = base
-            p_f = self.args.offset - (base - self.args.offset)
-            p_g = self.args.pressure_grip
-            
-        elif self.args.mode == "step":
-            is_high = int(self.t / self.args.step_interval) % 2 == 0
-            val = self.args.pressure_high if is_high else self.args.pressure_low
-            p_df = self.args.pressure_low; p_f = val; p_g = self.args.pressure_grip
-            
-        elif self.args.mode == "const":
-            p_df = self.args.offset; p_f = self.args.offset; p_g = self.args.pressure_grip
+        # --- Reconstruct Internal Pressure Dynamics (Sim Logic) ---
+        # Update internal pressure state (Low-pass filter)
+        self.pres_state = self.pres_state + self.alpha * (cmd - self.pres_state)
 
+        # Normalize Action (0.0~0.6MPa -> -1.0~1.0)
+        # Note: We send the *Command* to the Sim. Sim will apply the delay internally.
+        # But we also calculate 'pres_state' here just for logging comparison.
         actions = torch.zeros((self.num_envs, 3), device=self.device)
-        actions[:, 0] = self._pressure_to_action(p_df)
-        actions[:, 1] = self._pressure_to_action(p_f)
-        actions[:, 2] = self._pressure_to_action(p_g)
+        actions[:, 0] = np.clip(2.0 * (cmd[0] / self.P_MAX) - 1.0, -1.0, 1.0)
+        actions[:, 1] = np.clip(2.0 * (cmd[1] / self.P_MAX) - 1.0, -1.0, 1.0)
+        actions[:, 2] = np.clip(2.0 * (cmd[2] / self.P_MAX) - 1.0, -1.0, 1.0)
         
-        # 次のステップへ時間を進める (Sim制御周期分)
         self.t += self.dt
         return actions
 
 # -----------------------------------------------------------------------------
-# 5. メイン処理
+# 5. Main Loop
 # -----------------------------------------------------------------------------
 def main():
     env = None
+    sim_logs = []
+
     try:
+        # Config Selection
         cfg_map = {
             ("A", False): PorcaroRLEnvCfg_ModelA, ("A", True): PorcaroRLEnvCfg_ModelA_DR,
             ("B", False): PorcaroRLEnvCfg_ModelB, ("B", True): PorcaroRLEnvCfg_ModelB_DR,
             ("C", False): PorcaroRLEnvCfg_ModelC, ("C", True): PorcaroRLEnvCfg_ModelC_DR,
         }
-        target_cfg_cls = cfg_map.get((args.model_type, args.dr))
-        if target_cfg_cls is None: raise ValueError("Invalid Model/DR combination.")
-            
-        print(f"\n[System] Selecting Config: {target_cfg_cls.__name__}")
+        target_cfg = cfg_map.get((args.model_type, args.dr))
         
-        env_cfg = target_cfg_cls()
-        env_cfg.scene.num_envs = args.num_envs
-        env_cfg.controller.control_mode = "pressure" 
-        
-        env_cfg.episode_length_s = 1000.0
-        if hasattr(env_cfg, "terminations"):
-            env_cfg.terminations = None
-            
-        if args.no_drum:
-            # ドラム位置の退避処理
-            try:
-                if hasattr(env_cfg, "drum_cfg"):
-                    env_cfg.drum_cfg.init_state.pos = (0.0, 0.0, -10.0)
-                elif hasattr(env_cfg.scene, "drum"):
-                    env_cfg.scene.drum.init_state.pos = (0.0, 0.0, -10.0)
-            except:
-                pass
-
-        dr_str = "DR" if args.dr else "Ideal"
-        if args.replay_csv:
-            base_csv = os.path.splitext(os.path.basename(args.replay_csv))[0]
-            log_name = f"verify_Model{args.model_type}_{dr_str}_REPLAY_{base_csv}.csv"
+        if target_cfg:
+            print(f"\n[System] Config: {target_cfg.__name__}")
+            env_cfg = target_cfg()
         else:
-            log_name = f"verify_Model{args.model_type}_{dr_str}_{args.mode}_{int(args.bpm)}bpm.csv"
+            print(f"\n[Warning] No specific config found. Using Base.")
+            env_cfg = PorcaroRLEnvCfg()
+
+        env_cfg.scene.num_envs = 1
+        env_cfg.episode_length_s = 1000.0
         
-        if hasattr(env_cfg, "logging"):
-            env_cfg.logging.enabled = True
-            env_cfg.logging.filepath = log_name
-
-        print(f"[System] Log file: {log_name}")
-
-        # 環境の初期化
+        # Remove Drum
+        if args.no_drum:
+            try:
+                if hasattr(env_cfg, "drum_cfg"): env_cfg.drum_cfg.init_state.pos = (0.0, 0.0, -10.0)
+                elif hasattr(env_cfg.scene, "drum"): env_cfg.scene.drum.init_state.pos = (0.0, 0.0, -10.0)
+            except: pass
+        
         env = PorcaroRLEnv(cfg=env_cfg)
         
-        # --- DTの計算 (環境のデフォルト値を考慮) ---
-        if hasattr(env, "step_dt"):
-             dt_step = env.step_dt
-        else:
-             sim_dt = env.cfg.sim.dt # 通常0.005
-             decimation = getattr(env.cfg, "decimation", 4)
-             dt_step = sim_dt * decimation
-             print(f"[System] Calculated dt: {dt_step:.5f}s (Freq: {1/dt_step:.1f}Hz)")
+        # Fixed dt for Validation (50Hz)
+        dt_step = 0.02 
+        print(f"[System] Simulation dt fixed to: {dt_step}s (50Hz)")
 
-        if dt_step < 0.001:
-            print(f"[WARNING] dt_step too small ({dt_step}). Check config.")
-            
-        # エージェント初期化
         agent = SignalGeneratorAgent(env.num_envs, dt_step, env.device, args)
         
         obs, _ = env.reset()
-        print("[System] Simulation Loop Started...")
+        print("[System] Simulation Started...")
 
         while simulation_app.is_running():
-            # 現在時刻(self.t)に基づきアクション決定
             actions = agent.get_action(obs)
             
             if agent.is_replay and agent.replay_finished:
                 print("[System] Replay finished.")
                 break
 
-            # ステップ実行 (ここで物理時間がdt_step分進む)
-            obs, rew, terminated, truncated, info = env.step(actions)
+            obs, _, _, _, _ = env.step(actions)
             
+            # --- Logging All Elements ---
+            # 1. Angle (obs is typically normalized or raw rad. Assuming Rad here based on porcaro_rl_env)
+            # If obs is normalized, we should multiply by scale. But for 'direct' task, usually it's rad.
+            angle_rad = obs["policy"][0, 0].item() 
+            angle_vel = obs["policy"][0, 1].item()
+            
+            sim_logs.append({
+                'time': agent.t,
+                'cmd_DF': agent.last_cmd[0],
+                'cmd_F': agent.last_cmd[1],
+                'cmd_G': agent.last_cmd[2],
+                'sim_pres_DF': agent.pres_state[0], # Calculated Internal Pressure
+                'sim_pres_F': agent.pres_state[1],
+                'sim_pres_G': agent.pres_state[2],
+                'sim_angle_deg': math.degrees(angle_rad),
+                'sim_vel_deg': math.degrees(angle_vel),
+                'model_type': args.model_type
+            })
+
     except KeyboardInterrupt:
-        print("\n[Info] Interrupted by user.")
+        print("\n[Info] Interrupted.")
     except Exception as e:
-        print(f"\n[CRITICAL ERROR] {e}")
+        print(f"\n[Error] {e}")
         traceback.print_exc()
     finally:
-        if env is not None:
-            print("\n[System] Closing environment and saving logs...")
-            env.close()
+        # Save CSV
+        if sim_logs:
+            input_name = args.csv_name if args.csv_name else "manual"
+            input_base = os.path.splitext(os.path.basename(input_name))[0]
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            filename = f"sim_log_Model{args.model_type}_{input_base}_{timestamp}.csv"
+            save_dir = os.path.join(os.getcwd(), "verification_logs")
+            os.makedirs(save_dir, exist_ok=True)
+            
+            path = os.path.join(save_dir, filename)
+            pd.DataFrame(sim_logs).to_csv(path, index=False)
+            print(f"\n[Saved] Sim Log: {path}")
+            print(f"  -> Contains: time, cmd_*, sim_pres_*, sim_angle_deg, sim_vel_deg")
+        
+        if env: env.close()
         simulation_app.close()
 
 if __name__ == "__main__":
