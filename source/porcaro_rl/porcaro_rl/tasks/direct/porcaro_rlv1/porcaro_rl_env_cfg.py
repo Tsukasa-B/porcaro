@@ -93,7 +93,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     # --- シンプルリズム生成設定 ---
     # [変更]: 統合された RhythmGenerator を使うため、モード指定等は維持しつつ
     # BPM範囲などを明示的に定義
-    use_simple_rhythm: bool = True   
+    use_simple_rhythm: bool = False   
     simple_rhythm_mode: str = "single" 
     simple_rhythm_bpm: float = 10.0    
     target_hit_force: float = 30.0
@@ -101,7 +101,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     lookahead_horizon: float = 0.5
     
     # [追加]: ランダム時のBPM範囲
-    bpm_range: tuple[float, float] = (10.0, 160.0)
+    bpm_range: tuple[float, float] = (60.0, 160.0)
 
     # デフォルトは (1.0, 1.0) でスケーリングなし（既存挙動維持）
     pam_tau_scale_range: tuple[float, float] = (1.0, 1.0)
