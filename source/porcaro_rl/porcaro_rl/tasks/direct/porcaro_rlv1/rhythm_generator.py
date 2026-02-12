@@ -11,10 +11,17 @@ class RhythmGenerator:
     1. 4小節構造 (4-Bar Structure) に基づくルーディメンツ生成
     2. GPU並列演算 (Conv1d) による高速な波形生成
     3. 学習用ランダムモードと検証用固定モードのシームレスな切り替え
-       (SimpleRhythmGeneratorの機能を完全に包含)
+    
+    【改良点 (Sim-to-Real戦略に基づく)】
+    - BPMを連続値ではなく、キリの良い離散値 (60, 80...160) から選択
+    - パターンを基礎的な「シングル」「ダブル」に限定し、片手での確実な習得を目指す
+    【カリキュラム学習の実装】
+    - Lv0: BPM60-80, Single打ちのみ
+    - Lv1: BPM60-120, Double打ち解禁
+    - Lv2: BPM60-160, 全パターン (高速対応)
     """
     def __init__(self, num_envs, device, dt, max_episode_length, 
-                 bpm_range=(60, 160), target_force=20.0):
+                 bpm_range=None, target_force=0.0):
         
         self.num_envs = num_envs
         self.device = device
@@ -23,9 +30,31 @@ class RhythmGenerator:
         self.target_peak_force = target_force
         
         # --- BPM設定 ---
-        self.bpm_min = bpm_range[0]
-        self.bpm_max = bpm_range[1]
-        
+        # 実機検証と比較しやすいよう、20刻みの離散値を採用
+        self.bpm_options = torch.tensor([60.0, 80.0, 100.0, 120.0, 140.0, 160.0], device=device)
+
+        # --- カリキュラム設定 ---
+        self.curriculum_level = 0
+        # レベルごとの許可される最大BPMインデックス
+        self.max_bpm_idx_per_level = [1, 3, 5]
+
+
+        # --- ルーディメンツ定義 (16分音符グリッド: 0~15) ---
+        # 1小節(4拍) = 16個の16分音符スロット
+        # 片手タスクとして物理的に無理がなく、かつ重要な基礎動作のみに絞る
+        self.rudiments = {
+            # 表打ち (4分音符) - 最も基礎的な動作
+            "single_4":  [0, 4, 8, 12],
+            # 8ビート (8分音符) - 連続動作の基本
+            "single_8":  [0, 2, 4, 6, 8, 10, 12, 14],
+            # ダブルストローク (RRLL...) - バネ性を活かしたリバウンド動作の学習用
+            # 片手で16分音符2つを叩く [0, 1] ...
+            "double":    [0, 1, 4, 5, 8, 9, 12, 13],
+            # 休符 - 待機姿勢と脱力の学習用
+            "rest":      []
+        }
+        self.pattern_keys = ["single_4", "single_8", "double", "rest"]
+
         # --- 内部状態 ---
         self.current_bpms = torch.zeros(num_envs, device=device, dtype=torch.float32)
         self.target_trajectories = torch.zeros(
@@ -35,31 +64,7 @@ class RhythmGenerator:
         # --- テスト/検証モード設定 ---
         self.test_mode = False
         self.test_bpm = 120.0
-        self.test_pattern = "single"
-
-        # --- ルーディメンツ定義 (16分音符グリッド: 0~15) ---
-        # 1小節(4拍) = 16個の16分音符スロット
-        self.rudiments = {
-            # 表打ち (4分音符)
-            "single_4":  [0, 4, 8, 12],
-            # 8ビート (8分音符)
-            "single_8":  [0, 2, 4, 6, 8, 10, 12, 14],
-            # ダブルストローク (RRLL...)
-            "double":    [0, 1, 4, 5, 8, 9, 12, 13],
-            # パラディドル (RLRR LRLL)
-            "paradiddle":[0, 2, 4, 5, 8, 10, 12, 13],
-            # シンコペーション (裏拍)
-            "upbeat":    [2, 6, 10, 14],
-            # 3-3-2 (Clave)
-            "clave":     [0, 3, 6, 8, 10, 12],
-            # 全休符
-            "rest":      []
-        }
-        
-        # 学習時のパターン出現確率重み
-        self.pattern_keys = list(self.rudiments.keys())
-        # [single_4, single_8, double, paradiddle, upbeat, clave, rest]
-        self.pattern_probs = torch.tensor([0.2, 0.3, 0.2, 0.1, 0.1, 0.05, 0.05], device=device)
+        self.test_pattern = "single_8"
 
         # --- 波形生成用カーネル (ガウス関数) ---
         # width_sec=0.05 (約50ms)
@@ -80,10 +85,13 @@ class RhythmGenerator:
         self.test_pattern = pattern
         # パターン名が辞書にない場合のフォールバック
         if pattern not in self.rudiments and pattern != "random":
-             # 簡易的なマッピング
              if "double" in pattern: self.test_pattern = "double"
-             elif "para" in pattern: self.test_pattern = "paradiddle"
+             elif "single" in pattern: self.test_pattern = "single_8"
              else: self.test_pattern = "single_4"
+
+    def set_curriculum_level(self, level: int):
+        """難易度レベルを設定 (0:基礎 -> 2:完全ランダム)"""
+        self.curriculum_level = min(level, 2)
 
     def reset(self, env_ids):
         """
@@ -95,16 +103,16 @@ class RhythmGenerator:
             return
 
         # ==========================================
-        # 1. BPMの決定
+        # 1. BPMの決定 (カリキュラム適用)
         # ==========================================
         if self.test_mode:
             bpms = torch.full((num_reset,), self.test_bpm, device=self.device)
         else:
-            # 60 ~ 160 の範囲でランダム
-            rand_factor = torch.rand(num_reset, device=self.device)
-            bpms = self.bpm_min + rand_factor * (self.bpm_max - self.bpm_min)
-            # 整数に近いBPMにする（任意）
-            bpms = torch.round(bpms / 5.0) * 5.0
+            # 現在のレベルに応じた上限インデックスを取得
+            max_idx = self.max_bpm_idx_per_level[self.curriculum_level]
+            # 0 〜 max_idx の範囲でランダム選択
+            idxs = torch.randint(0, max_idx + 1, (num_reset,), device=self.device)
+            bpms = self.bpm_options[idxs]
 
         self.current_bpms[env_ids] = bpms
 
@@ -127,21 +135,38 @@ class RhythmGenerator:
             # この小節の開始ステップ位置
             # 1小節 = 16グリッド
             bar_start_steps = bar_idx * 16 * steps_per_16th # [num_reset]
+            
+            # --- 1小節目は常に休符 (Count-in) ---
+            if bar_idx == 0:
+                # ★重要: 最初の1小節は「指揮者の合図（Count-in）」として強制的に休符にする
+                # これにより、ロボットは初期位置(Down)から振りかぶる時間を確保できる
+                selected_patterns = ["rest"] * num_reset
 
             # パターンの選択
+            # テストモード (2小節目以降)
             if self.test_mode:
-                # テストモードは全環境同じパターン
                 selected_patterns = [self.test_pattern] * num_reset
+            # 学習モード (2小節目以降はランダム)
+            # ランダムに選択 (Categorical分布)
+            # pattern_indices: [num_reset]
+            # --- 学習モード ---
             else:
-                # ランダムに選択 (Categorical分布)
-                # pattern_indices: [num_reset]
-                p_indices = torch.multinomial(
-                    self.pattern_probs, num_reset, replacement=True
-                )
+                # ★ここが修正ポイント: レベルに応じて確率分布を変える
+                if self.curriculum_level == 0:
+                    # Lv0: Singleのみ (Double確率=0.0)
+                    # [single_4, single_8, double, rest]
+                    probs = torch.tensor([0.4, 0.5, 0.0, 0.1], device=self.device)
+                elif self.curriculum_level == 1:
+                    # Lv1: Double解禁
+                    probs = torch.tensor([0.2, 0.4, 0.3, 0.1], device=self.device)
+                else:
+                    # Lv2: 全開
+                    probs = torch.tensor([0.2, 0.3, 0.4, 0.1], device=self.device)
+                
+                p_indices = torch.multinomial(probs, num_reset, replacement=True)
                 selected_patterns = [self.pattern_keys[i] for i in p_indices.tolist()]
 
             # 環境ごとにスパイクを配置
-            # NOTE: ここはパターン種類数(最大7種類)のループになるため高速
             unique_patterns = set(selected_patterns)
             
             for pat_name in unique_patterns:

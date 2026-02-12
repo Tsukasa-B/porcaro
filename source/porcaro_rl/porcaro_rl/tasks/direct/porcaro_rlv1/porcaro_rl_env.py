@@ -47,6 +47,14 @@ class PorcaroRLEnv(DirectRLEnv):
         # ActuatorNet / Dynamics モデル（Noneで初期化）
         self.actuator_net: ActuatorNetModel | None = None
 
+        # [追加]: カリキュラム学習用のステップカウンタ
+        self.total_env_steps = 0
+        
+        # [追加]: カリキュラム閾値 (累積ステップ数)
+        # Lv0 -> Lv1: 100 iters (約70M steps)
+        # Lv1 -> Lv2: +200 iters (累積 約210M steps)
+        self.curriculum_thresholds = [70_000_000, 210_000_000]
+
         # 親クラスの __init__ を呼ぶ
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -241,6 +249,26 @@ class PorcaroRLEnv(DirectRLEnv):
         self.scene.sensors["drum_contact"] = self.drum_sensor
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        # =========================================================
+        # [追加]: カリキュラムレベルの更新ロジック
+        # =========================================================
+        # 今回のステップ数を加算 (並列数分だけ経験が進む)
+        self.total_env_steps += self.num_envs
+        
+        # 現在のレベルを判定
+        current_level = 0
+        if self.total_env_steps > self.curriculum_thresholds[1]:
+            current_level = 2
+        elif self.total_env_steps > self.curriculum_thresholds[0]:
+            current_level = 1
+            
+        # Generatorに適用 (変更がある場合のみログ出力などをしても良い)
+        if hasattr(self, "rhythm_generator"):
+            # レベルが上がった瞬間だけ通知したい場合はここで判定を入れる
+            if self.rhythm_generator.curriculum_level != current_level:
+                print(f"[Curriculum] Level Up! {self.rhythm_generator.curriculum_level} -> {current_level} (Steps: {self.total_env_steps})")
+                self.rhythm_generator.set_curriculum_level(current_level)
+        
         # -- (1) Pre-physics --
         self._pre_physics_step(actions)
         
