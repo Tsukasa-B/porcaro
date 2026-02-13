@@ -26,20 +26,20 @@ class TorqueActionController(ActionController):
                  N: float = 630.0,
                  # ▼▼▼ 推奨パラメータ (振動防止版) ▼▼▼
                  pam_viscosity: float = 0.0,      # 少し強めの粘性で安定化
-                 pam_hys_const: float = 5,#60.0,      # 基礎摩擦
-                 pam_hys_coef_p: float = 30,#200.0,     # 圧力依存摩擦
+                 pam_hys_const: float = 0.5,     # 基礎摩擦
+                 pam_hys_coef_p: float = 15,#30,     # 圧力依存摩擦
                  # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                  force_map_csv: str | None = None,
                  force_scale: float = 1.0,
                  h0_map_csv: str | None = None,
                  use_pressure_dependent_tau: bool = True,
                  geometric_cfg: PamGeometricCfg | None = None,
-                 transition_width: float = 0.001,
+                 transition_width: float = 0.0,
                  pressure_shrink_gain: float = 0.0,
                  # [NEW] シンプルな感度設定のみ
-                 pam_p_dot_scale: float = 0.5,
-                 pam_contract_gain: float = 1.0,  # 収縮: 少し弱める
-                 pam_extend_gain: float = 0.0,    # 伸長: 強める (落下防止)
+                 pam_p_dot_scale: float = 100,       # 圧力のなめらかな変化をとる
+                 pam_contract_gain: float = 1.5,  # 収縮: 少し弱める
+                 pam_extend_gain: float = 1.0,    # 伸長: 強める (落下防止)
                  pam_tau_scale_range: tuple[float, float] = (1.0, 1.0),
                  ):    # 感度は控えめに
 
@@ -173,9 +173,12 @@ class TorqueActionController(ActionController):
         else:
             P_cmd_stack = torch.zeros_like(actions) 
         
-        STEP_SIZE = 0.05
-        P_cmd_quantized = torch.round(P_cmd_stack / STEP_SIZE) * STEP_SIZE
-        return torch.clamp(P_cmd_quantized, 0.0, self.Pmax)
+        # --- 変更箇所: 量子化(階段化)を削除 ---
+        # 理由: STEP_SIZE=0.05による丸めが実機のカクつき(Jerky motion)の主原因であるため。
+        # STEP_SIZE = 0.05
+        # P_cmd_quantized = torch.round(P_cmd_stack / STEP_SIZE) * STEP_SIZE
+        # return torch.clamp(P_cmd_quantized, 0.0, self.Pmax)
+        return torch.clamp(P_cmd_stack, 0.0, self.Pmax)
 
     @torch.no_grad()
     def apply(self, *, actions: torch.Tensor, q: torch.Tensor,

@@ -14,6 +14,7 @@ from .pneumatic import(
     interp1d_clamp_torch,
     interp2d_bilinear,
     get_2d_tables,
+    upsample_2d_bicubic,
 )
 
 # === Model A 用の計算ロジック ===
@@ -56,11 +57,23 @@ def apply_model_a_force(force_map: PamForceMap, h0_map: H0Map, pressure: torch.T
 # === 以下、既存クラス定義 ===
 
 class PamForceMap(nn.Module):
-    def __init__(self, P_axis, h_axis, F_table):
+    def __init__(self, P_axis, h_axis, F_table, upsample: bool = True):
         super().__init__()
-        self.register_buffer('P', torch.as_tensor(P_axis, dtype=torch.float32))
-        self.register_buffer('h', torch.as_tensor(h_axis, dtype=torch.float32))
-        self.register_buffer('F', torch.as_tensor(F_table, dtype=torch.float32))
+        
+        if upsample:
+            # 読み込み時に高解像度化 (128x128グリッドへ)
+            # これにより実行時の双一次補間が、実質的に滑らかな曲線になります
+            P_fine, h_fine, F_fine = upsample_2d_bicubic(
+                P_axis, h_axis, F_table, 
+                num_x=128, num_y=128, device='cpu' # CPUで計算してから登録
+            )
+            self.register_buffer('P', P_fine)
+            self.register_buffer('h', h_fine)
+            self.register_buffer('F', F_fine)
+        else:
+            self.register_buffer('P', torch.as_tensor(P_axis, dtype=torch.float32))
+            self.register_buffer('h', torch.as_tensor(h_axis, dtype=torch.float32))
+            self.register_buffer('F', torch.as_tensor(F_table, dtype=torch.float32))
 
     @staticmethod
     def from_csv(path: str):
@@ -72,15 +85,26 @@ class PamForceMap(nn.Module):
             if not r or r[0] == "": continue
             P_axis.append(float(r[0]))
             F.append([float(x) for x in r[1:1+len(h_axis)]])
-        h_axis = [x / 100.0 for x in h_axis]
-        return PamForceMap(P_axis, h_axis, F)
+        h_axis = [x / 100.0 for x in h_axis] # % -> ratio
+        
+        # upsample=True で初期化するように変更
+        return PamForceMap(P_axis, h_axis, F, upsample=True)
 
     def forward(self, P_in: torch.Tensor, h_in: torch.Tensor) -> torch.Tensor:
         P_in = P_in.squeeze(-1)
         h_in = h_in.squeeze(-1)
-        P_axis = self.P; h_axis = self.h; Ftab = self.F
+        
+        # データが高解像度化されているので、単純な線形補間でも滑らかになります
+        P_axis = self.P
+        h_axis = self.h
+        Ftab = self.F
+        
         P_in = torch.clamp(P_in, P_axis[0], P_axis[-1])
         h_in = torch.clamp(h_in, h_axis[0], h_axis[-1])
+
+        # interp2d_bilinearは [y_idx, x_idx] の順でデータを参照します。
+        # ここでは x=P, y=h なので、Zデータは [h, P] の形である必要があります。
+        # upsample_2d_bicubic は [P, h] を返すので、転置(.T)して渡します。
         return interp2d_bilinear(P_axis, h_axis, Ftab.T, P_in, h_in)
 
 class H0Map(nn.Module):

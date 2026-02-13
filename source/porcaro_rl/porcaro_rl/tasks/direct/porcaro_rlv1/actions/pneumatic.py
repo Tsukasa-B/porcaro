@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import torch
 from typing import Sequence
+import numpy as np  # 追加
+from scipy.interpolate import PchipInterpolator, RectBivariateSpline
 
 # =========================================================
 #  Physical Parameters (Single Source of Truth)
@@ -102,6 +104,58 @@ def interp2d_bilinear(
     
     val = r0 * (1 - wy) + r1 * wy
     return val
+
+@torch.no_grad()
+def upsample_1d_pchip(x_coarse: Sequence[float], y_coarse: Sequence[float], num_points: int = 100, device='cpu'):
+    """
+    1次元データをPCHIP補間（単調性維持）で高解像度化し、Torch Tensorとして返す。
+    """
+    x_np = np.array(x_coarse)
+    y_np = np.array(y_coarse)
+    
+    # 念のためソート
+    idx = np.argsort(x_np)
+    x_np = x_np[idx]
+    y_np = y_np[idx]
+
+    interpolator = PchipInterpolator(x_np, y_np)
+    
+    x_fine_np = np.linspace(x_np[0], x_np[-1], num_points)
+    y_fine_np = interpolator(x_fine_np)
+    
+    return (
+        torch.as_tensor(x_fine_np, dtype=torch.float32, device=device),
+        torch.as_tensor(y_fine_np, dtype=torch.float32, device=device)
+    )
+
+@torch.no_grad()
+def upsample_2d_bicubic(x_axis: Sequence[float], y_axis: Sequence[float], z_data: list[list[float]], 
+                        num_x: int = 100, num_y: int = 100, device='cpu'):
+    """
+    2次元データを双3次スプライン(Bicubic)で高解像度化し、Torch Tensorとして返す。
+    """
+    x_np = np.array(x_axis)
+    y_np = np.array(y_axis)
+    z_np = np.array(z_data) 
+
+    # 配列形状の整合性チェックと転置
+    if z_np.shape != (len(x_np), len(y_np)):
+        z_np = z_np.T
+
+    # 双3次スプライン補間 (kx=3, ky=3)
+    interpolator = RectBivariateSpline(x_np, y_np, z_np, kx=3, ky=3)
+    
+    x_fine_np = np.linspace(x_np[0], x_np[-1], num_x)
+    y_fine_np = np.linspace(y_np[0], y_np[-1], num_y)
+    
+    # 新しいグリッド上の値を計算
+    z_fine_np = interpolator(x_fine_np, y_fine_np)
+    
+    return (
+        torch.as_tensor(x_fine_np, dtype=torch.float32, device=device),
+        torch.as_tensor(y_fine_np, dtype=torch.float32, device=device),
+        torch.as_tensor(z_fine_np, dtype=torch.float32, device=device)
+    )
 
 @torch.no_grad()
 def tau_L_from_pressure(P, zero_mode="clamp"):
