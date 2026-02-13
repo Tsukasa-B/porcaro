@@ -38,7 +38,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     """Porcaro 環境用の設定クラス (基本構成 - DRなし)"""
 
     # --- RL 設定 ---
-    decimation: int = 4#10 
+    decimation: int = 20 # decimation*dt = 50Hz
     
     # [変更]: 4小節構造 (BPM60時) に耐えられるよう十分な長さを確保
     # 実際のエピソード終了は BPM に基づき動的に判定されます
@@ -46,7 +46,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     
     # --- シミュレーション設定 ---
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 200,#500,     # 1ms
+        dt=1 / 1000,     # 2ms
         render_interval=decimation, # ここは絶対に変えてはいけない
         physics_material=sim_utils.RigidBodyMaterialCfg(
             static_friction=0.0, dynamic_friction=0.0, restitution=0.0, # restitutionは０
@@ -91,7 +91,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     )
 
     # --- シンプルリズム生成設定 (RhythmGenerator用) ---
-    use_simple_rhythm: bool = False   
+    use_simple_rhythm: bool = False  
     simple_rhythm_mode: str = "single_8" 
     simple_rhythm_bpm: float = 120.0    
     target_hit_force: float = 30.0
@@ -106,7 +106,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
 
     # --- モジュール別設定 ---
     controller: TorqueControllerCfg = TorqueControllerCfg()
-    logging: LoggingCfg = LoggingCfg()
+    logging: LoggingCfg = LoggingCfg(enabled=False)
     rewards: RewardsCfg = RewardsCfg() 
     reward_logging: RewardLoggingCfg = RewardLoggingCfg()
     

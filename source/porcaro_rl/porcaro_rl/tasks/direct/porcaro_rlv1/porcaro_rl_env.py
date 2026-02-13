@@ -274,8 +274,13 @@ class PorcaroRLEnv(DirectRLEnv):
         
         self.max_force_z_buffer[:] = 0.0
         
-        # 安全策として履歴リストを用意
-        force_history_list = []
+        # GPU上でメモリを一度だけ確保し、インデックスで書き込む方が圧倒的に高速です
+        # shape: [NumEnvs, Decimation, 3]
+        force_history_tensor = torch.zeros(
+            (self.num_envs, self.cfg.decimation, 3), 
+            device=self.device, 
+            dtype=torch.float32
+        )
         
         # P_cmd の値を保持する変数 (ログ用)
         # _apply_action で計算されるが、ここでログ用に取得したい場合は
@@ -293,16 +298,15 @@ class PorcaroRLEnv(DirectRLEnv):
             self.sim.step()
             self.scene.update(dt=self.cfg.sim.dt)
             
-            # 3. センサーデータ取得 (修正箇所)
+            # 3. センサーデータ取得
+            # clone() は最小限に。必要なデータだけをバッファに入れる
             if self.stick_sensor.data.net_forces_w.dim() == 3:
-                # [NumEnvs, 1, 3] -> [NumEnvs, 3]
-                raw_impulse_vec = self.stick_sensor.data.net_forces_w[:, 0, :] 
+                current_force_vec = self.stick_sensor.data.net_forces_w[:, 0, :] 
             else:
-                raw_impulse_vec = self.stick_sensor.data.net_forces_w
+                current_force_vec = self.stick_sensor.data.net_forces_w
             
-            current_force_vec = raw_impulse_vec #/ sim_dt
-
-            force_history_list.append(current_force_vec.clone())
+            # ★改善点2: Tensorへの直接代入 (高速化)
+            force_history_tensor[:, i, :] = current_force_vec
             
             # 以前: current_force_z = current_force_vec[:, 2].clamp(min=0.0)
             current_force_mag = torch.norm(current_force_vec, dim=-1)
@@ -325,6 +329,7 @@ class PorcaroRLEnv(DirectRLEnv):
                 # テレメトリ取得
                 telemetry = self.action_controller.get_last_telemetry()
                 if telemetry is None: telemetry = {}
+                q_log, qd_log = self._get_corrected_full_state()
                 
                 # Model Cの補完など (必要なら)
                 if self.actuator_net is not None:
@@ -337,13 +342,13 @@ class PorcaroRLEnv(DirectRLEnv):
                 
                 # バッファに追加
                 self.logging_manager.buffer_step_data(
-                    q_full=q_log,   # <--- 修正
-                    qd_full=qd_log, # <--- 修正
+                    q_full=q_log,
+                    qd_full=qd_log,
                     telemetry=telemetry,
                     actions=self.actions,
                     current_sim_time=self.sim.current_time,
-                    target_force=tgt_val,
-                    target_bpm=tgt_bpm
+                    target_force=self.rhythm_generator.get_current_target(self.episode_length_buf)[0].item(),
+                    target_bpm=self.rhythm_generator.current_bpms[0].item()
                 )
 
         # -- (3) Post-processing (RL Step) --
@@ -360,16 +365,15 @@ class PorcaroRLEnv(DirectRLEnv):
         # Reset Mask Definition
         reset_mask = terminated | time_outs
 
-        # 5. ★ログ書き込み確定
+        # 5. ログ書き込み確定
         if self.logging_manager.enable_logging:
-            force_history_tensor = torch.stack(force_history_list, dim=1) # [N, Decimation, 3]
-            
+            # force_history_tensor は既に Tensor なので stack 不要
             f1_val = torch.zeros_like(rew)
             if hasattr(self.reward_manager, "get_first_hit_force"):
                  f1_val = self.reward_manager.get_first_hit_force()
             
             self.logging_manager.finalize_log_step(
-                peak_force=force_history_tensor,
+                peak_force=force_history_tensor, # そのまま渡す
                 f1_force=f1_val,
                 step_reward=rew
             )
@@ -560,6 +564,12 @@ class PorcaroRLEnv(DirectRLEnv):
         
         # 安全策: バッファ溢れ防止
         time_outs |= (self.episode_length_buf >= self.max_episode_length - 1)
+
+        # 2. ★追加：数値発散（爆発）の検知
+        # 関節角度が異常な値（例：3.14rad以上やNaN）になったら強制終了
+        q, _ = self._get_corrected_joint_state()
+        is_exploded = torch.any(torch.abs(q) > 4.0, dim=-1) # 角度が約230度を超えたら異常
+        is_exploded |= torch.any(torch.isnan(q), dim=-1)    # NaNが出たら異常
 
         self.reset_terminated[:] = False
         return self.reset_terminated, time_outs

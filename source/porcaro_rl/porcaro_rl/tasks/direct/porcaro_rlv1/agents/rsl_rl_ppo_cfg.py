@@ -25,7 +25,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     
     # 💡 修正点2: PolicyクラスをRecurrentバージョンに変更
     policy = RslRlPpoActorCriticRecurrentCfg(
-        init_noise_std=1.5,
+        init_noise_std=1.0,
         # RNNを使う場合、観測の正規化をONにすることが推奨されます
         actor_obs_normalization=True, 
         critic_obs_normalization=True, 
@@ -49,7 +49,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.01, # 探索がすぐ収束してしまうようなら 0.01 -> 0.02 に上げる
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=3.0e-3,
+        learning_rate=3.0e-4,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
