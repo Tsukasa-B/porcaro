@@ -212,7 +212,7 @@ def calculate_simple_latched_friction(
 
     # 3. 摩擦の方向決定 (Direction Logic)
     v_virtual = torch.clamp(p_dot * p_dot_scale, min=-1.0, max=1.0) 
-    v_effective = h_dot + v_virtual
+    v_effective = v_virtual
 
     # 方向算出
     current_dir = torch.tanh(v_effective / tanh_width)

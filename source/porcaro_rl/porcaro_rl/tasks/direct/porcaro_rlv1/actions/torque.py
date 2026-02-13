@@ -26,20 +26,20 @@ class TorqueActionController(ActionController):
                  N: float = 630.0,
                  # ▼▼▼ 推奨パラメータ (振動防止版) ▼▼▼
                  pam_viscosity: float = 0.0,      # 少し強めの粘性で安定化
-                 pam_hys_const: float = 60.0,      # 基礎摩擦
-                 pam_hys_coef_p: float = 200.0,     # 圧力依存摩擦
+                 pam_hys_const: float = 5,#60.0,      # 基礎摩擦
+                 pam_hys_coef_p: float = 30,#200.0,     # 圧力依存摩擦
                  # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                  force_map_csv: str | None = None,
                  force_scale: float = 1.0,
                  h0_map_csv: str | None = None,
                  use_pressure_dependent_tau: bool = True,
                  geometric_cfg: PamGeometricCfg | None = None,
-                 transition_width: float = 0.01,
+                 transition_width: float = 0.001,
                  pressure_shrink_gain: float = 0.0,
                  # [NEW] シンプルな感度設定のみ
                  pam_p_dot_scale: float = 0.5,
                  pam_contract_gain: float = 1.0,  # 収縮: 少し弱める
-                 pam_extend_gain: float = -0.4,    # 伸長: 強める (落下防止)
+                 pam_extend_gain: float = 0.0,    # 伸長: 強める (落下防止)
                  pam_tau_scale_range: tuple[float, float] = (1.0, 1.0),
                  ):    # 感度は控えめに
 
