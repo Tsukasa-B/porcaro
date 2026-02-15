@@ -7,6 +7,10 @@
 
 """Launch Isaac Sim Simulator first."""
 
+"""
+python scripts/rsl_rl/play.py   --task Template-Porcaro-Direct-ModelB --num_envs 1 --video  --checkpoint=logs/rsl_rl/porcaro_rslrl_lstm_modelB_DR/2026-02-13_16-15-01/model_2700.pt
+"""
+
 import argparse
 import sys
 

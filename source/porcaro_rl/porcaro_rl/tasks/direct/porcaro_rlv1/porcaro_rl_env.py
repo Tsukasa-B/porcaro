@@ -55,6 +55,9 @@ class PorcaroRLEnv(DirectRLEnv):
         # Lv1 -> Lv2: +200 iters (累積 約210M steps)
         self.curriculum_thresholds = [70_000_000, 210_000_000]
 
+        # 物理パラメータを変えずに、強化学習が見る値だけを実機スケールに合わせる
+        self.force_scale_sim_to_real = 1.0
+
         # 親クラスの __init__ を呼ぶ
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -304,6 +307,8 @@ class PorcaroRLEnv(DirectRLEnv):
                 current_force_vec = self.stick_sensor.data.net_forces_w[:, 0, :] 
             else:
                 current_force_vec = self.stick_sensor.data.net_forces_w
+
+            current_force_vec = current_force_vec * self.force_scale_sim_to_real
             
             # ★改善点2: Tensorへの直接代入 (高速化)
             force_history_tensor[:, i, :] = current_force_vec

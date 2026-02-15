@@ -46,7 +46,7 @@ parser.add_argument("csv_name", nargs="?", type=str, default=None, help="Experim
 # Options
 parser.add_argument("--model_type", type=str, default="B", choices=["A", "B", "C"], help="Model Type (A:Old, B:New, C:Future)")
 parser.add_argument("--dr", action="store_true", help="Enable Domain Randomization")
-parser.add_argument("--no_drum", action="store_true", default=True, help="Remove drum (Default: True)")
+parser.add_argument("--no_drum", action="store_true", default=False, help="Remove drum (Default: True)")
 parser.add_argument("--headless", action="store_true", help="Run without GUI")
 parser.add_argument("--tau", type=float, default=0.15, help="Pressure Time Constant (tau) for reconstruction [s]")
 
@@ -240,29 +240,38 @@ def main():
 
         while simulation_app.is_running():
             actions = agent.get_action(obs)
-            
             if agent.is_replay and agent.replay_finished:
                 print("[System] Replay finished.")
                 break
 
-            obs, _, _, _, _ = env.step(actions)
+            # 変更点: extras を受け取るように修正
+            obs, rew, terminated, truncated, extras = env.step(actions)
             
-            # --- Logging All Elements ---
-            # 1. Angle (obs is typically normalized or raw rad. Assuming Rad here based on porcaro_rl_env)
-            # If obs is normalized, we should multiply by scale. But for 'direct' task, usually it's rad.
-            angle_rad = obs["policy"][0, 0].item() 
-            angle_vel = obs["policy"][0, 1].item()
+            # 変更点: env.py で計算済みのピーク力を extras から取得
+            # extras["force/max_force_pooled"] には環境ごとの平均（ここでは1環境なのでその値）が入っています
+            sim_force_n = extras.get("force/max_force_pooled", 0.0)
+            if torch.is_tensor(sim_force_n):
+                sim_force_n = sim_force_n.item()
+
+            # 変更点: 観測値のインデックスを修正
+            # env.py の _get_observations に基づき、0:手首角度, 1:グリップ角度, 2:手首速度, 3:グリップ速度
+            policy_obs = obs["policy"][0]
+            angle_wrist_deg = math.degrees(policy_obs[0].item())
+            angle_grip_deg = math.degrees(policy_obs[1].item())
+            vel_wrist_deg = math.degrees(policy_obs[2].item())
             
             sim_logs.append({
                 'time': agent.t,
                 'cmd_DF': agent.last_cmd[0],
                 'cmd_F': agent.last_cmd[1],
                 'cmd_G': agent.last_cmd[2],
-                'sim_pres_DF': agent.pres_state[0], # Calculated Internal Pressure
+                'sim_pres_DF': agent.pres_state[0],
                 'sim_pres_F': agent.pres_state[1],
                 'sim_pres_G': agent.pres_state[2],
-                'sim_angle_deg': math.degrees(angle_rad),
-                'sim_vel_deg': math.degrees(angle_vel),
+                'sim_angle_deg': angle_wrist_deg,      # 手首角度
+                'sim_angle_grip_deg': angle_grip_deg, # グリップ角度
+                'sim_vel_deg': vel_wrist_deg,          # 手首速度
+                'sim_force_n': sim_force_n,           # 変更点: 打撃力(N)を追加
                 'model_type': args.model_type
             })
 

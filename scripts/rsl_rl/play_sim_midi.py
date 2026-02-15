@@ -3,7 +3,11 @@ Play script with MIDI Injection (No Env Modification Ver.)
 既存の環境コードを変更せず、外部からMIDIデータを注入してテストします。
 
 Usage:
-  python scripts/rsl_rl/play_sim_midi.py --task Isaac-Porcaro-Direct-v0 --load_run [RunName] --midi songs/test.mid
+  python scripts/rsl_rl/play_sim_midi.py \
+  --task Template-Porcaro-Direct-ModelB \
+  --load_run [YOUR_RUN_NAME] \
+  --midi songs/test_single4_bpm60.mid \
+  --video
 """
 
 import argparse
