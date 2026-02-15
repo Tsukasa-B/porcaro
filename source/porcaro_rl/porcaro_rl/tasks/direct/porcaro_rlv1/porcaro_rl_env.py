@@ -355,9 +355,30 @@ class PorcaroRLEnv(DirectRLEnv):
         self.episode_length_buf += 1
         
         obs = self._get_observations()
+
+        # =========================================================
+        # ★ [重要] Observation Sanitization (NaNガード)
+        # =========================================================
+        # 観測値にNaNやInfが含まれていたら、0.0に置換して「なかったこと」にする
+        # これをやらないと、一瞬の爆発で学習全体がクラッシュします
+        # obs は {"policy": Tensor} の辞書形式なので、中身を走査してガードします
+        if isinstance(obs, dict):
+            for key, val in obs.items():
+                if isinstance(val, torch.Tensor):
+                    if torch.isnan(val).any() or torch.isinf(val).any():
+                        # NaN/Infがあったら0.0に置換して書き戻す
+                        obs[key] = torch.nan_to_num(val, nan=0.0, posinf=0.0, neginf=0.0)
+        elif isinstance(obs, torch.Tensor):
+            # 万が一 Tensor が直接返ってきた場合のフォールバック
+            if torch.isnan(obs).any() or torch.isinf(obs).any():
+                obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
         
+        # 報酬のガード (こちらはTensorなのでそのままでOK)
         target_force_tensor = torch.full((self.num_envs,), self.target_hit_force, device=self.device)
         rew, reward_terms = self._get_rewards(force_max=self.max_force_z_buffer, target_ref=target_force_tensor)
+        
+        if torch.isnan(rew).any() or torch.isinf(rew).any():
+            rew = torch.nan_to_num(rew, nan=0.0, posinf=0.0, neginf=0.0)
         
         self.reset_terminated[:] = False
         terminated, time_outs = self._get_dones()
