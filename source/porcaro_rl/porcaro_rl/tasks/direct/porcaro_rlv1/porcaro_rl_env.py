@@ -56,7 +56,7 @@ class PorcaroRLEnv(DirectRLEnv):
         self.curriculum_thresholds = [70_000_000, 210_000_000]
 
         # 物理パラメータを変えずに、強化学習が見る値だけを実機スケールに合わせる
-        self.force_scale_sim_to_real = 1.0
+        self.force_scale_sim_to_real = 10.0
 
         # 親クラスの __init__ を呼ぶ
         super().__init__(cfg, render_mode, **kwargs)
