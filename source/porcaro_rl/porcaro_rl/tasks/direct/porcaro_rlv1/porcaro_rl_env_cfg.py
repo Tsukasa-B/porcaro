@@ -49,7 +49,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
         dt=1 / 200,     # 2ms
         render_interval=decimation, # ここは絶対に変えてはいけない
         physics_material=sim_utils.RigidBodyMaterialCfg(
-            static_friction=0.0, dynamic_friction=0.0, restitution=0.0, # restitutionは０
+            static_friction=0.0, dynamic_friction=0.0, restitution=0.8,
         ),
     )
 

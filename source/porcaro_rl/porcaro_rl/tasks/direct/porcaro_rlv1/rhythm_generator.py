@@ -44,12 +44,12 @@ class RhythmGenerator:
         # 片手タスクとして物理的に無理がなく、かつ重要な基礎動作のみに絞る
         self.rudiments = {
             # 表打ち (4分音符) - 最も基礎的な動作
-            "single_4":  [0, 8],
+            "single_4":  [0, 8], # 最大約600
             # 8ビート (8分音符) - 連続動作の基本
-            "single_8":  [0, 4, 8, 12],
+            "single_8":  [0, 4, 8, 12], # 最大約1200
             # ダブルストローク (RRLL...) - バネ性を活かしたリバウンド動作の学習用
             # 片手で16分音符2つを叩く [0, 1] ...
-            "double":    [0, 1, 4, 5, 8, 9, 12, 13],
+            "double":    [0, 1, 4, 5, 8, 9, 12, 13], #最大約2400
             # 休符 - 待機姿勢と脱力の学習用
             "rest":      []
         }
@@ -67,8 +67,8 @@ class RhythmGenerator:
         self.test_pattern = "single_8"
 
         # --- 波形生成用カーネル (ガウス関数) ---
-        # width_sec=0.05 (約50ms)
-        width_sec = 0.05
+        # width_sec=0.01 (約10ms)
+        width_sec = 0.035
         sigma = width_sec / 2.0
         kernel_radius = int(width_sec / dt) 
         t_vals = torch.arange(-kernel_radius, kernel_radius + 1, device=device, dtype=torch.float32) * dt
