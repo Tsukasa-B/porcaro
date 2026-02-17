@@ -4,6 +4,7 @@ import argparse
 import torch
 import math
 from collections.abc import Sequence
+from collections import deque
 
 # Isaac Lab imports
 import isaaclab.sim as sim_utils
@@ -57,6 +58,13 @@ class PorcaroRLEnv(DirectRLEnv):
 
         # 物理パラメータを変えずに、強化学習が見る値だけを実機スケールに合わせる
         self.force_scale_sim_to_real = 10.0
+
+        # [追加]: BPMごとの報酬ログ用バッファ (移動平均用)
+        # キー: BPM(int), 値: deque(maxlen=20) ← 直近20回分のエピソード平均を保持
+        self.bpm_reward_history = {
+            bpm: deque(maxlen=20) 
+            for bpm in [60, 80, 100, 120, 140, 160]
+        }
 
         # 親クラスの __init__ を呼ぶ
         super().__init__(cfg, render_mode, **kwargs)
@@ -390,6 +398,7 @@ class PorcaroRLEnv(DirectRLEnv):
         
         # Reset Mask Definition
         reset_mask = terminated | time_outs
+        
 
         # 5. ログ書き込み確定
         if self.logging_manager.enable_logging:
@@ -421,6 +430,27 @@ class PorcaroRLEnv(DirectRLEnv):
 
         if reset_mask.any():
             env_ids = reset_mask.nonzero(as_tuple=False).flatten()
+            # --- [修正箇所 START] ---
+            if hasattr(self, "rhythm_generator"):
+                done_bpms = self.rhythm_generator.current_bpms[env_ids]
+                done_rewards = self.episode_sums["total"][env_ids]
+                
+                target_check_bpms = [60.0, 80.0, 100.0, 120.0, 140.0, 160.0]
+
+                for t_bpm in target_check_bpms:
+                    # 許容誤差 1.0 で判定
+                    bpm_mask = (torch.abs(done_bpms - t_bpm) < 1.0)
+                    
+                    if bpm_mask.any():
+                        # そのBPMだった環境の平均報酬
+                        avg_bpm_reward = done_rewards[bpm_mask].mean().item()
+                        
+                        # ★バッファに追加 (ここではまだログ出力しない)
+                        # キーは int型 (60, 80...) に統一
+                        bpm_key = int(t_bpm)
+                        if bpm_key in self.bpm_reward_history:
+                            self.bpm_reward_history[bpm_key].append(avg_bpm_reward)
+            # --- [修正箇所 END] ---
             episode_info = {}
             episode_info["reward"] = self.episode_sums["total"][env_ids]
             for key, count in self.episode_sums.items():
@@ -435,7 +465,17 @@ class PorcaroRLEnv(DirectRLEnv):
         else:
             if "episode" in self.extras:
                 self.extras.pop("episode")
-        
+
+        # ------------------------------------------------------------------
+        # ★ [追加] ここで毎ステップ、バッファにある最新の平均値をログに載せる
+        # ------------------------------------------------------------------
+        for t_bpm, history in self.bpm_reward_history.items():
+            if len(history) > 0:
+                # 直近N回の平均を計算してログに渡す
+                current_avg = sum(history) / len(history)
+                self.extras["log"][f"Episode_Reward/BPM_{t_bpm}"] = current_avg
+
+        # Step Rewardのログなど (既存)
         for k, v in reward_terms.items():
              self.extras["log"][f"Step_Reward/{k}"] = torch.mean(v)
 
@@ -558,17 +598,15 @@ class PorcaroRLEnv(DirectRLEnv):
 
     def _get_rewards(self, force_max: torch.Tensor = None, target_ref: torch.Tensor = None) -> torch.Tensor:
         if force_max is None: force_max = self.max_force_z_buffer
-        
         dt_step = self.cfg.sim.dt * self.cfg.decimation
-        
         current_steps = self.episode_length_buf
         target_trace = self.rhythm_generator.get_current_target(current_steps).view(-1)
-        
         if target_ref is None:
             target_ref = torch.full((self.num_envs,), self.target_hit_force, device=self.device)
-
-        # ★修正: joint_pos に補正済みの値を渡す
         q_corr, _ = self._get_corrected_joint_state()
+
+        # [追加] BPM情報をRewardManagerに渡す
+        current_bpms = self.rhythm_generator.current_bpms if hasattr(self, "rhythm_generator") else None
 
         total_reward, reward_terms = self.reward_manager.compute_rewards(
             actions=self.actions,
@@ -576,11 +614,10 @@ class PorcaroRLEnv(DirectRLEnv):
             force_z=force_max, 
             target_force_trace=target_trace, 
             target_force_ref=target_ref,
-            dt=dt_step
+            dt=dt_step,
+            current_bpm=current_bpms  # <--- ここで渡す
         )
-        
         if not hasattr(self, "extras"): self.extras = {}
-
         return total_reward, reward_terms
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:

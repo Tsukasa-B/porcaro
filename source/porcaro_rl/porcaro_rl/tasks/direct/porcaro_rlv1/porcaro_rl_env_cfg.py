@@ -91,9 +91,10 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     )
 
     # --- シンプルリズム生成設定 (RhythmGenerator用) ---
-    use_simple_rhythm: bool = True  
+    use_simple_rhythm: bool = False  
     simple_rhythm_mode: str = "single_8" 
     simple_rhythm_bpm: float = 120.0    
+    
     target_hit_force: float = 30.0
 
     lookahead_horizon: float = 0.5
