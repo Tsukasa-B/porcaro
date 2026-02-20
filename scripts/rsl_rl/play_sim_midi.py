@@ -34,7 +34,7 @@ parser = argparse.ArgumentParser(description="Play RL agent with MIDI Input (Inj
 
 # 1. Custom MIDI Args
 parser.add_argument("--midi", type=str, required=True, help="Path to MIDI file.")
-parser.add_argument("--force_scale", type=float, default=50.0, help="Target Force [N].")
+parser.add_argument("--force_scale", type=float, default=30.0, help="Target Force [N].")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos.")
 parser.add_argument("--video_length", type=int, default=2000, help="Length of video (steps).")
 
@@ -97,7 +97,7 @@ except ImportError:
 # MIDI Helper Class
 # ==============================================================================
 class MidiInjector:
-    def __init__(self, midi_path, dt, device, target_force=50.0):
+    def __init__(self, midi_path, dt, device, target_force=20.0):
         self.device = device
         self.dt = dt
         self.target_force = target_force
@@ -187,6 +187,16 @@ def main(env_cfg, agent_cfg):
         env_cfg.sim.device = args_cli.device
         
     env_cfg.episode_length_s = 300.0
+
+    # --- ▼▼▼ 変更箇所: ログ出力を有効化するための設定を追加 ▼▼▼ ---
+    # 理由: play.pyで行われていたDataLoggerの設定とフラグの強制ONを移植するため。
+    env_cfg.log_dir = log_dir
+    if hasattr(env_cfg, "logging"):
+        env_cfg.logging.enabled = True
+        print("[INFO] Play mode detected: Logging enabled (force).")
+    if hasattr(env_cfg, "reward_logging"):
+        env_cfg.reward_logging.enabled = True
+    # ------------------------------------------------------------------
     
     # 2. 環境構築
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -251,8 +261,13 @@ def main(env_cfg, agent_cfg):
     except KeyboardInterrupt:
         print("Stopped by user.")
     
-    env.close()
-    simulation_app.close()
+    # --- ▼▼▼ 変更箇所: 環境を閉じる際にログを保存させるため、finallyブロックを使う構成に変更 ▼▼▼ ---
+    # 理由: 途中で終了条件を満たしてbreakした場合や、Ctrl+Cで停止した場合でも確実にログのフラッシュとファイルクローズを行わせるため。
+    finally:
+        print("[INFO] Closing environment and saving logs...")
+        env.close()
+        simulation_app.close()
+    # ------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()

@@ -51,19 +51,25 @@ class PorcaroRLEnv(DirectRLEnv):
         # [追加]: カリキュラム学習用のステップカウンタ
         self.total_env_steps = 0
         
-        # [追加]: カリキュラム閾値 (累積ステップ数)
+        # [追加]: カリキュラム閾値 (累積ステップ数)総ステップ数737280000
         # Lv0 -> Lv1: 100 iters (約70M steps)
         # Lv1 -> Lv2: +200 iters (累積 約210M steps)
-        self.curriculum_thresholds = [70_000_000, 210_000_000]
+        self.curriculum_thresholds = [200_000_000, 400_000_000]
 
         # 物理パラメータを変えずに、強化学習が見る値だけを実機スケールに合わせる
-        self.force_scale_sim_to_real = 10.0
+        self.force_scale_sim_to_real = 1.0
 
         # [追加]: BPMごとの報酬ログ用バッファ (移動平均用)
         # キー: BPM(int), 値: deque(maxlen=20) ← 直近20回分のエピソード平均を保持
         self.bpm_reward_history = {
             bpm: deque(maxlen=20) 
             for bpm in [60, 80, 100, 120, 140, 160]
+        }
+
+        # ★ [追加]: パターンごとの報酬ログ用バッファ
+        self.pattern_keys = ["single_4", "single_8", "double", "rest"]
+        self.pattern_reward_history = {
+            pat: deque(maxlen=20) for pat in self.pattern_keys
         }
 
         # 親クラスの __init__ を呼ぶ
@@ -164,7 +170,7 @@ class PorcaroRLEnv(DirectRLEnv):
         # リズム生成器の切り替えロジック (維持)
         # =========================================================
         self.dt_ctrl_step = self.cfg.sim.dt * self.cfg.decimation
-        self.target_hit_force = getattr(self.cfg, "target_hit_force", 50.0)
+        self.target_hit_force = getattr(self.cfg, "target_hit_force", 20.0)
 
         self.rhythm_generator = RhythmGenerator(
             num_envs=self.num_envs,
@@ -433,23 +439,23 @@ class PorcaroRLEnv(DirectRLEnv):
             # --- [修正箇所 START] ---
             if hasattr(self, "rhythm_generator"):
                 done_bpms = self.rhythm_generator.current_bpms[env_ids]
+                done_pat_idxs = self.rhythm_generator.current_pattern_idxs[env_ids]
                 done_rewards = self.episode_sums["total"][env_ids]
                 
-                target_check_bpms = [60.0, 80.0, 100.0, 120.0, 140.0, 160.0]
 
-                for t_bpm in target_check_bpms:
-                    # 許容誤差 1.0 で判定
+                # 1. BPMごとの集計
+                for t_bpm in [60.0, 80.0, 100.0, 120.0, 140.0, 160.0]:
                     bpm_mask = (torch.abs(done_bpms - t_bpm) < 1.0)
-                    
                     if bpm_mask.any():
-                        # そのBPMだった環境の平均報酬
                         avg_bpm_reward = done_rewards[bpm_mask].mean().item()
-                        
-                        # ★バッファに追加 (ここではまだログ出力しない)
-                        # キーは int型 (60, 80...) に統一
-                        bpm_key = int(t_bpm)
-                        if bpm_key in self.bpm_reward_history:
-                            self.bpm_reward_history[bpm_key].append(avg_bpm_reward)
+                        self.bpm_reward_history[int(t_bpm)].append(avg_bpm_reward)
+
+                # 2. パターンごとの集計
+                for pat_idx, pat_name in enumerate(self.pattern_keys):
+                    pat_mask = (done_pat_idxs == pat_idx)
+                    if pat_mask.any():
+                        avg_pat_reward = done_rewards[pat_mask].mean().item()
+                        self.pattern_reward_history[pat_name].append(avg_pat_reward)
             # --- [修正箇所 END] ---
             episode_info = {}
             episode_info["reward"] = self.episode_sums["total"][env_ids]
@@ -471,9 +477,16 @@ class PorcaroRLEnv(DirectRLEnv):
         # ------------------------------------------------------------------
         for t_bpm, history in self.bpm_reward_history.items():
             if len(history) > 0:
-                # 直近N回の平均を計算してログに渡す
-                current_avg = sum(history) / len(history)
-                self.extras["log"][f"Episode_Reward/BPM_{t_bpm}"] = current_avg
+                self.extras["log"][f"Episode_Reward/BPM_{t_bpm}"] = sum(history) / len(history)
+            else:
+                self.extras["log"][f"Episode_Reward/BPM_{t_bpm}"] = 0.0
+
+        # 2. パターン別ログ
+        for pat_name, history in self.pattern_reward_history.items():
+            if len(history) > 0:
+                self.extras["log"][f"Episode_Reward/Pattern_{pat_name}"] = sum(history) / len(history)
+            else:
+                self.extras["log"][f"Episode_Reward/Pattern_{pat_name}"] = 0.0
 
         # Step Rewardのログなど (既存)
         for k, v in reward_terms.items():
@@ -639,32 +652,31 @@ class PorcaroRLEnv(DirectRLEnv):
 
     def _reset_idx(self, env_ids: torch.Tensor) -> None:
         super()._reset_idx(env_ids)
-        if hasattr(self, "event_manager") and self.event_manager is not None:
-            self.event_manager.reset(env_ids)
-
-        # 1. 現在の関節位置バッファを複製
-        q_target = self.robot.data.joint_pos[env_ids].clone()
-        qd_target = self.robot.data.joint_vel[env_ids].clone()
+        # ==========================================================
+        # ★ 変更箇所: 初期角度のオーバーライド問題を解消するリセットロジック
+        # 理由: 
+        # 1. assets.py で設定された正しい初期値 (default_joint_pos) を直接使用する。
+        # 2. 二重にマイナスを掛けてしまう手動上書きロジックを排除。
+        # 3. EventManager を後に呼ぶことで、DR(Domain Randomization) のランダム化効果を潰さずに適用する。
+        # ==========================================================
         
-        # 1. assets.py から読み込んだ定数 (ラジアン)
-        val_wrist = torch.tensor(WRIST_J0, device=self.device)
-        val_grip  = torch.tensor(GRIP_J0,  device=self.device)
+        # 1. assets.py の InitialStateCfg で設定されたデフォルトの関節位置/速度を取得
+        q_target = self.robot.data.default_joint_pos[env_ids].clone()
+        qd_target = self.robot.data.default_joint_vel[env_ids].clone()
         
-        # 2. インデックスを使って書き換え
-        wrist_idx = self.dof_idx[0]
-        grip_idx  = self.dof_idx[1]
-        
-        # ★修正: Simへの書き込みなので、符号を反転させる (Code(Up+) -> Sim(Down+))
-        q_target[:, wrist_idx] = -val_wrist # <--- 反転
-        q_target[:, grip_idx]  = -val_grip
-        qd_target[:] = 0.0
-        
-        # 3. 物理エンジンへの書き込み
+        # 2. 物理エンジンへの初期値書き込み
         self.robot.write_joint_state_to_sim(
             position=q_target, 
             velocity=qd_target, 
             env_ids=env_ids
         )
+
+        # 3. イベントマネージャによるリセット (DRなど) を後から適用
+        # これにより、上記で書き込んだ default_joint_pos を基準としたスケールランダム化が正しく乗る
+        if hasattr(self, "event_manager") and self.event_manager is not None:
+            self.event_manager.reset(env_ids)
+
+        # ==========================================================
 
         # [追加]: リズムリセット & エピソード長再計算
         if hasattr(self, "rhythm_generator"):

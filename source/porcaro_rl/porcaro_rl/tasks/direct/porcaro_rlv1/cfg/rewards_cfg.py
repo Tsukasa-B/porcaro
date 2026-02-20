@@ -9,6 +9,10 @@ class RewardsCfg:
     # --- 正規化オプション ---
     scale_reward_by_force_magnitude: bool = False 
 
+    # --- ズル防止パラメータ ---
+    # 手首が8.1度で打面に接触するため、9.0度を「振りかぶった」と認めるギリギリの閾値とする
+    swing_amplitude_threshold_deg: float = 0.5 
+
     # --- 報酬重み (w_i) ---
 
     # [Note]: 以下の *_s (秒数設定) は初期値です。
@@ -24,6 +28,7 @@ class RewardsCfg:
 
     # 3. 接触継続ペナルティ (Anti-Pushing)
     # これが重要。「速い曲なのに長く触っている」と強烈に罰せられます
+    # ※強く叩くようになって学習が停滞する場合は、ここを -20.0 程度に緩めてみてください。
     weight_contact_continuous: float = -50.0 
     max_contact_duration_s: float = 0.1 # (Adaptive Rewardにより上書きされます)
 

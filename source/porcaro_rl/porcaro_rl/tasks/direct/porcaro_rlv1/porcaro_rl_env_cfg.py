@@ -95,7 +95,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     simple_rhythm_mode: str = "single_8" 
     simple_rhythm_bpm: float = 120.0    
     
-    target_hit_force: float = 30.0
+    target_hit_force: float = 20.0
 
     lookahead_horizon: float = 0.5
     
