@@ -57,7 +57,7 @@ class PorcaroRLEnv(DirectRLEnv):
         self.curriculum_thresholds = [200_000_000, 400_000_000]
 
         # 物理パラメータを変えずに、強化学習が見る値だけを実機スケールに合わせる
-        self.force_scale_sim_to_real = 1.0
+        self.force_scale_sim_to_real = 3.0
 
         # [追加]: BPMごとの報酬ログ用バッファ (移動平均用)
         # キー: BPM(int), 値: deque(maxlen=20) ← 直近20回分のエピソード平均を保持

@@ -12,7 +12,7 @@ from isaaclab.sim.schemas import MassPropertiesCfg
 
 # --- 定数 ---
 WRIST_J0       = math.radians(0.0)
-GRIP_J0        = math.radians(-8.1) # シミュレーション座標系
+GRIP_J0        = math.radians(0.0)#-8.1) # シミュレーション座標系
 
 # --- ヘルパー関数 ---
 def quat_from_euler_zyx(yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):

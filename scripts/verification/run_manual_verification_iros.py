@@ -12,7 +12,7 @@ porcaro/ (Project Root)
   python scripts/verification/run_manual_verification_iros.py exp1_static_hysteresis
   python scripts/verification/run_manual_verification_iros.py exp1_static_hysteresis --model_type B
   python scripts/verification/run_manual_verification_iros.py exp2_step_response --model_type B
-  python scripts/verification/run_manual_verification_iros.py exp3_frequency_sweep --model_type B
+  python scripts/verification/run_manual_verification_iros.py exp3_frequency_sweep --no_drum --model_type B
   python scripts/verification/run_manual_verification_iros.py data_exp1_static_hysteresis_TIMESTAMP
 
 """
