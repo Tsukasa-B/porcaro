@@ -34,7 +34,6 @@ class RhythmGenerator:
 
         # --- 内部状態 ---
         self.current_bpms = torch.zeros(num_envs, device=device, dtype=torch.float32)
-        # ★追加: 現在のパターンID(0~3)を記憶するバッファ
         self.current_pattern_idxs = torch.zeros(num_envs, device=device, dtype=torch.long)
         
         self.target_trajectories = torch.zeros(
@@ -46,13 +45,15 @@ class RhythmGenerator:
         self.test_bpm = 120.0
         self.test_pattern = "single_8"
 
-        # --- 波形生成用カーネル ---
+        # --- 波形生成用カーネル (フラットトップ波形への改良) ---
         width_sec = 0.035
         sigma = width_sec / 2.0
         kernel_radius = int(width_sec / dt) 
         t_vals = torch.arange(-kernel_radius, kernel_radius + 1, device=device, dtype=torch.float32) * dt
         
-        kernel = self.target_peak_force * torch.exp(-0.5 * (t_vals / sigma) ** 2)
+        # 変更箇所: 指数を 2乗(**2) から 4乗(**4) に変更 (Super-Gaussian)
+        # 頂上付近の 20N が長く維持され、裾野だけが急激に 0.0N へ落ちるため、高BPMでの重なりを防ぐ
+        kernel = self.target_peak_force * torch.exp(-0.5 * (t_vals / sigma) ** 4)
         self.kernel = kernel.view(1, 1, -1)
         self.kernel_padding = kernel_radius
 
@@ -78,17 +79,14 @@ class RhythmGenerator:
         # ==========================================
         if self.test_mode:
             bpms = torch.full((num_reset,), self.test_bpm, device=self.device)
-            # パターンの決定
             pat_idx = self.pattern_keys.index(self.test_pattern) if self.test_pattern in self.pattern_keys else 0
             ep_pat_idxs = torch.full((num_reset,), pat_idx, device=self.device, dtype=torch.long)
             ep_patterns = [self.pattern_keys[pat_idx]] * num_reset
         else:
-            # BPM抽選
             max_idx = self.max_bpm_idx_per_level[self.curriculum_level]
             idxs = torch.randint(0, max_idx + 1, (num_reset,), device=self.device)
             bpms = self.bpm_options[idxs]
 
-            # パターン抽選 (エピソード開始時に1回だけ)
             if self.curriculum_level == 0:
                 probs = torch.tensor([0.4, 0.5, 0.0, 0.1], device=self.device)
             elif self.curriculum_level == 1:
@@ -100,7 +98,6 @@ class RhythmGenerator:
             ep_patterns = [self.pattern_keys[i] for i in ep_pat_idxs.tolist()]
 
         self.current_bpms[env_ids] = bpms
-        # ★追加: 選ばれたパターンIDを保存
         self.current_pattern_idxs[env_ids] = ep_pat_idxs
 
         # ==========================================
@@ -116,10 +113,8 @@ class RhythmGenerator:
             bar_start_steps = bar_idx * 16 * steps_per_16th 
             
             if bar_idx == 0:
-                # 1小節目は休符
                 selected_patterns = ["rest"] * num_reset
             else:
-                # ★修正: エピソード固定のパターンを使用する
                 selected_patterns = ep_patterns
 
             unique_patterns = set(selected_patterns)

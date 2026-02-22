@@ -1,8 +1,12 @@
+# source/porcaro_rl/porcaro_rl/tasks/direct/porcaro_rlv1/scripts/rsl_rl/play_sim_midi.py
+# (または保存されているディレクトリの同名ファイル)
+
 """
 Play script with MIDI Injection (Version 4.5 - Auto Exit)
 修正点:
 1. ループ動作を廃止。
 2. 「曲完走」または「転倒/リセット」でスクリプトを自動終了するように変更。
+3. 波形生成をスーパーガウシアン（フラットトップ波形）にアップデート。
 
 Usage:
   python scripts/rsl_rl/play_sim_midi.py \
@@ -34,7 +38,7 @@ parser = argparse.ArgumentParser(description="Play RL agent with MIDI Input (Inj
 
 # 1. Custom MIDI Args
 parser.add_argument("--midi", type=str, required=True, help="Path to MIDI file.")
-parser.add_argument("--force_scale", type=float, default=30.0, help="Target Force [N].")
+parser.add_argument("--force_scale", type=float, default=20.0, help="Target Force [N].")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos.")
 parser.add_argument("--video_length", type=int, default=2000, help="Length of video (steps).")
 
@@ -128,11 +132,15 @@ class MidiInjector:
             if idx < total_steps:
                 spike_tensor[0, 0, idx] = 1.0
         
-        width_sec = 0.05
+        # --- 変更箇所: リズムジェネレータと波形を統一 (Super-Gaussian) ---
+        width_sec = 0.035 # 0.05 -> 0.035へ変更
         sigma = width_sec / 2.0
         radius = int(width_sec / dt)
         t_vals = torch.arange(-radius, radius + 1, device=device, dtype=torch.float32) * dt
-        kernel = (target_force * torch.exp(-0.5 * (t_vals / sigma) ** 2)).view(1, 1, -1)
+        
+        # 指数を2乗(**2)から4乗(**4)に変更し、裾野の重なりを防ぐ
+        kernel = (target_force * torch.exp(-0.5 * (t_vals / sigma) ** 4)).view(1, 1, -1)
+        # ------------------------------------------------------------------
         
         with torch.no_grad():
             traj = F.conv1d(spike_tensor, kernel, padding=radius)
@@ -188,15 +196,12 @@ def main(env_cfg, agent_cfg):
         
     env_cfg.episode_length_s = 300.0
 
-    # --- ▼▼▼ 変更箇所: ログ出力を有効化するための設定を追加 ▼▼▼ ---
-    # 理由: play.pyで行われていたDataLoggerの設定とフラグの強制ONを移植するため。
     env_cfg.log_dir = log_dir
     if hasattr(env_cfg, "logging"):
         env_cfg.logging.enabled = True
         print("[INFO] Play mode detected: Logging enabled (force).")
     if hasattr(env_cfg, "reward_logging"):
         env_cfg.reward_logging.enabled = True
-    # ------------------------------------------------------------------
     
     # 2. 環境構築
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -261,13 +266,10 @@ def main(env_cfg, agent_cfg):
     except KeyboardInterrupt:
         print("Stopped by user.")
     
-    # --- ▼▼▼ 変更箇所: 環境を閉じる際にログを保存させるため、finallyブロックを使う構成に変更 ▼▼▼ ---
-    # 理由: 途中で終了条件を満たしてbreakした場合や、Ctrl+Cで停止した場合でも確実にログのフラッシュとファイルクローズを行わせるため。
     finally:
         print("[INFO] Closing environment and saving logs...")
         env.close()
         simulation_app.close()
-    # ------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()

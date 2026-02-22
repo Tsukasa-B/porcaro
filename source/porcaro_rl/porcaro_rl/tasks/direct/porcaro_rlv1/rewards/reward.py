@@ -16,26 +16,20 @@ class RewardManager:
         
         # 基準BPM
         self.default_bpm = 120.0
-        self.rest_threshold = 1.0 
+        
+        # 変更箇所: 休符判定を絶対値(1.0)から「目標値の10%」の相対値へ変更
+        self.rest_threshold = self.target_ref_val * 0.10 
 
         # --- 状態管理用バッファ ---
-        # hit_state: 0=空中, 1=正常な接触中, 2=無効な接触(振りかぶり不足のズル)
         self.hit_state = torch.zeros(num_envs, dtype=torch.long, device=self.device) 
         self.current_peak_force = torch.zeros(num_envs, device=self.device)
         self.contact_duration = torch.zeros(num_envs, device=self.device)
-        
-        # 【重要】接触期間中の「ターゲット波形の最大重なり度」を記憶するバッファ
         self.peak_timing_scale = torch.zeros(num_envs, device=self.device)
-
-        # 最後にヒット判定を行い、報酬を与えた「エピソード内経過時間(秒)」を記録
         self.last_reward_time = torch.full((num_envs,), -1.0, device=self.device)
-        
         self.prev_is_rest = torch.ones(num_envs, dtype=torch.bool, device=self.device)
         self.current_time_s = torch.zeros(num_envs, device=self.device)
-
-        # ズル防止用の「振りかぶり高さ」監視バッファ
         self.max_height_since_last_hit = torch.full((num_envs,), -1.0, device=self.device)
-        # Configの度数(deg)をラジアン(rad)に変換して保存
+        
         threshold_deg = getattr(cfg, "swing_amplitude_threshold_deg", 9.0)
         self.swing_threshold = threshold_deg * (math.pi / 180.0)
 
@@ -55,14 +49,10 @@ class RewardManager:
         self.current_peak_force[env_ids] = 0.0
         self.contact_duration[env_ids] = 0.0
         self.peak_timing_scale[env_ids] = 0.0
-        
         self.last_reward_time[env_ids] = -1.0
         self.prev_is_rest[env_ids] = True
         self.current_time_s[env_ids] = 0.0
-        
-        # リセット時に最大高さバッファも初期化
         self.max_height_since_last_hit[env_ids] = -1.0
-        
         for key in self.episode_sums:
             self.episode_sums[key][env_ids] = 0.0
 
@@ -77,23 +67,22 @@ class RewardManager:
         
         self.current_time_s += dt
 
-        # 常に手首角度（joint_pos[:, 0]）の最大値を監視して記録
         wrist_pos = joint_pos[:, 0]
         self.max_height_since_last_hit = torch.max(self.max_height_since_last_hit, wrist_pos)
 
-        # --- BPMスケーリングの準備 ---
         if current_bpm is None:
              safe_bpm = torch.full((self.num_envs,), self.default_bpm, device=self.device)
         else:
              safe_bpm = current_bpm.clamp(min=10.0)
 
         t_16th = 15.0 / safe_bpm
-        dyn_max_contact   = t_16th * 0.50
-        dyn_cooltime      = t_16th * 0.50
+        
+        # 変更箇所: クールタイムと接触許容時間の大幅緩和
+        dyn_max_contact   = t_16th * 0.60 # バウンドでもたつくのを長めに許容 (0.50 -> 0.60)
+        dyn_cooltime      = t_16th * 0.25 # 16分音符の1/4の時間で次の打撃(2打目)を許容する (0.50 -> 0.25)
         dyn_impact_window = t_16th * 0.40
         dyn_miss_thresh   = t_16th * 2.00
 
-        # スケーリング係数
         match_scale_factor = torch.ones_like(safe_bpm)
         time_scale_factor = (safe_bpm / 120.0)
 
@@ -133,24 +122,30 @@ class RewardManager:
         if rising.any():
             ids = torch.where(rising)[0]
             
-            # 振りかぶりが閾値(9.0度)を超えているか判定
-            valid_swing = self.max_height_since_last_hit[ids] > self.swing_threshold
+            # 変更箇所: ダブルストローク（連打）の2打目は振りかぶり閾値を大幅に下げる
+            time_since_last = self.current_time_s[ids] - self.last_reward_time[ids]
+            # 直前の打撃から16分音符の1.8倍以内であれば「連打」とみなす
+            is_quick_succession = (self.last_reward_time[ids] > 0.0) & (time_since_last < t_16th[ids] * 1.8)
             
-            # 十分な振りかぶりがあれば 1 (有効), なければ 2 (無効なズル) とする
+            # 連打時は要求する振りかぶり角度を 20% (例: 9度 -> 1.8度) に緩和
+            dynamic_swing_threshold = torch.where(
+                is_quick_succession,
+                self.swing_threshold * 0.2, 
+                self.swing_threshold
+            )
+            
+            valid_swing = self.max_height_since_last_hit[ids] > dynamic_swing_threshold
+            
             self.hit_state[ids] = torch.where(valid_swing, torch.tensor(1, device=self.device), torch.tensor(2, device=self.device))
             
             self.current_peak_force[ids] = force_z[ids]
             self.peak_timing_scale[ids] = (target_force_trace[ids] / self.target_ref_val).clamp(0.0, 1.0)
-            
-            # 次のストローク監視のためリセット（めり込みを考慮し十分低い値に）
             self.max_height_since_last_hit[ids] = -10.0
         
-        # B. Sustain (接触中: 最大値を追いかけ続ける)
-        # hit_state == 2 (無効な打撃) の場合でも力のトラッキングは行う
+        # B. Sustain (接触中)
         sustain = ((self.hit_state == 1) | (self.hit_state == 2)) & is_touching
         if sustain.any():
             ids = torch.where(sustain)[0]
-            # 物理的な立ち上がり窓 (dyn_impact_window) 以内であれば更新
             in_window = (self.contact_duration[ids] <= dyn_impact_window[ids])
             if in_window.any():
                 upd_ids = ids[in_window]
@@ -167,13 +162,12 @@ class RewardManager:
         if falling.any():
             ids = torch.where(falling)[0]
             
-            # hit_state が 1 (有効な振りかぶり打撃) の場合のみ報酬対象とする
             valid_hits = (self.hit_state[ids] == 1) 
             if valid_hits.any():
                 valid_ids = ids[valid_hits]
                 
-                # 判定閾値: 接触期間中に一度でも波形の裾野(1%以上)に触れていればHit
-                hit_in_note = (self.peak_timing_scale[valid_ids] > 0.01)
+                # 変更箇所: 判定閾値を微小に緩和 (遅れた2打目も拾えるように 0.01 -> 0.005)
+                hit_in_note = (self.peak_timing_scale[valid_ids] > 0.005)
                 
                 time_since_last = self.current_time_s[valid_ids] - self.last_reward_time[valid_ids]
                 thresholds = dyn_cooltime[valid_ids]
@@ -183,14 +177,11 @@ class RewardManager:
                 
                 success_ids = valid_ids[rewardable_hits]
                 if len(success_ids) > 0:
-                    # 変更箇所: _evaluate_hit から「精度」と「力の大きさ」の2つのスコアを受け取る
                     accuracy_score, magnitude_score = self._evaluate_hit(
                         self.current_peak_force[success_ids], 
                         target_force_ref[success_ids]
                     )
                     
-                    # 変更箇所: 報酬の再配分（参加賞 0.2 + 大きさ 0.4 + 精度 0.4）
-                    # なでるだけだと点数が極端に低くなり、強く叩くインセンティブが生まれます。
                     base_reward = 0.2 + (0.4 * magnitude_score) + (0.4 * accuracy_score)
                     
                     match_reward[success_ids] = base_reward * match_scale_factor[success_ids]
@@ -204,7 +195,6 @@ class RewardManager:
                 if len(rest_hit_ids) > 0:
                     double_hit_penalty_term[rest_hit_ids] = 1.0 * match_scale_factor[rest_hit_ids]
 
-            # hit_state == 2 の場合は一切報酬を与えずに状態だけリセット。
             self.hit_state[ids] = 0
             self.current_peak_force[ids] = 0.0
             self.peak_timing_scale[ids] = 0.0
@@ -220,7 +210,10 @@ class RewardManager:
         terms["rest_reward"] = rest_base * time_scale_factor
 
         violation = is_rest_period & is_touching
-        rest_pen_base = torch.where(violation, (force_z / 10.0), torch.zeros(self.num_envs, device=self.device))
+        
+        # 変更箇所: 休符中のかすり(2.0N以下)を許容するデッドバンド追加
+        force_excess = (force_z - 2.0).clamp(min=0.0)
+        rest_pen_base = torch.where(violation, (force_excess / 10.0), torch.zeros(self.num_envs, device=self.device))
         terms["rest_penalty"] = rest_pen_base * time_scale_factor
 
         over_time = (self.contact_duration - dyn_max_contact).clamp(min=0.0)
@@ -244,16 +237,8 @@ class RewardManager:
         self.prev_is_rest = is_rest_period.clone()
         return total_reward, terms
 
-    # ------------------------------------------------------------------
-    # 変更箇所: _evaluate_hit 関数を「精度スコア」と「大きさスコア」を返すように改修
-    # ------------------------------------------------------------------
     def _evaluate_hit(self, peak_force, target_val):
-        # 1. Accuracy Score (目標値にどれだけ近いか)
         force_error = torch.abs(peak_force - target_val)
         accuracy_score = torch.exp(-force_error / self.cfg.sigma_force)
-        
-        # 2. Magnitude Score (目標の力をどれくらい引き出せたか)
-        # 50N目標で4Nしか出さなければ0.08。50N出せば1.0。
         magnitude_score = (peak_force / target_val).clamp(0.0, 1.0)
-        
         return accuracy_score, magnitude_score
