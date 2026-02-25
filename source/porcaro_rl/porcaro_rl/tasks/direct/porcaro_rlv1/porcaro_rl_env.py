@@ -53,9 +53,9 @@ class PorcaroRLEnv(DirectRLEnv):
         
         # [追加]: カリキュラム閾値 (累積ステップ数)総ステップ数737280000
         # 1iterationあたり246043steps
-        # Lv0 -> Lv1: 200 iters (約50M steps)
-        # Lv1 -> Lv2: +300 iters (累積 約125M steps)
-        self.curriculum_thresholds = [80_000_000, 125_000_000]
+        # Lv0 -> Lv1: 50 iters (約12.5M steps)
+        # Lv1 -> Lv2: 200 iters (累積 約50M steps)
+        self.curriculum_thresholds = [12_500_000, 50_000_000]
 
         # 物理パラメータを変えずに、強化学習が見る値だけを実機スケールに合わせる
         self.force_scale_sim_to_real = 3.0

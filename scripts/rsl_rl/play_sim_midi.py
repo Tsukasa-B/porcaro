@@ -38,7 +38,7 @@ parser = argparse.ArgumentParser(description="Play RL agent with MIDI Input (Inj
 
 # 1. Custom MIDI Args
 parser.add_argument("--midi", type=str, required=True, help="Path to MIDI file.")
-parser.add_argument("--force_scale", type=float, default=30.0, help="Target Force [N].")
+parser.add_argument("--force_scale", type=float, default=20.0, help="Target Force [N].")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos.")
 parser.add_argument("--video_length", type=int, default=2000, help="Length of video (steps).")
 
