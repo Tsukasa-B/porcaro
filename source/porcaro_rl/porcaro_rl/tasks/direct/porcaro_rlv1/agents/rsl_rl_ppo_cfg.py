@@ -18,14 +18,14 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     
     # ★変更: 150 -> 1500
     # 長時間のエピソードで安定したリズムを習得するため、試行回数を増やします。
-    max_iterations = 3000
+    max_iterations = 1000
     
     save_interval = 50
     experiment_name = "porcaro_rslrl_lstm_modelB_DR" # 名前を変えておくと管理しやすいです
     
     # 💡 修正点2: PolicyクラスをRecurrentバージョンに変更
     policy = RslRlPpoActorCriticRecurrentCfg(
-        init_noise_std=0.8,
+        init_noise_std=0.5,
         # RNNを使う場合、観測の正規化をONにすることが推奨されます
         actor_obs_normalization=True, 
         critic_obs_normalization=True, 
@@ -46,7 +46,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01, # 探索がすぐ収束してしまうようなら 0.01 -> 0.02 に上げる
+        entropy_coef=0.001, # 探索がすぐ収束してしまうようなら 0.01 -> 0.02 に上げる
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-4,

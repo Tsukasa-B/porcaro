@@ -52,9 +52,10 @@ class PorcaroRLEnv(DirectRLEnv):
         self.total_env_steps = 0
         
         # [追加]: カリキュラム閾値 (累積ステップ数)総ステップ数737280000
-        # Lv0 -> Lv1: 100 iters (約70M steps)
-        # Lv1 -> Lv2: +200 iters (累積 約210M steps)
-        self.curriculum_thresholds = [200_000_000, 400_000_000]
+        # 1iterationあたり246043steps
+        # Lv0 -> Lv1: 200 iters (約50M steps)
+        # Lv1 -> Lv2: +300 iters (累積 約125M steps)
+        self.curriculum_thresholds = [80_000_000, 125_000_000]
 
         # 物理パラメータを変えずに、強化学習が見る値だけを実機スケールに合わせる
         self.force_scale_sim_to_real = 3.0
@@ -170,7 +171,7 @@ class PorcaroRLEnv(DirectRLEnv):
         # リズム生成器の切り替えロジック (維持)
         # =========================================================
         self.dt_ctrl_step = self.cfg.sim.dt * self.cfg.decimation
-        self.target_hit_force = getattr(self.cfg, "target_hit_force", 30.0)
+        self.target_hit_force = getattr(self.cfg, "target_hit_force", 20.0)
 
         self.rhythm_generator = RhythmGenerator(
             num_envs=self.num_envs,
