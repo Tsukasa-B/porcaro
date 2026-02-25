@@ -103,7 +103,7 @@ class RhythmGenerator:
         # ==========================================
         # 2. グリッド計算
         # ==========================================
-        steps_per_16th = (15.0 / bpms / self.dt).long()
+        steps_per_16th = (15.0 / bpms / self.dt)
         spikes = torch.zeros((num_reset, self.max_steps), device=self.device)
 
         # ==========================================
@@ -134,7 +134,8 @@ class RhythmGenerator:
                 base = bar_start_steps[target_local_indices].unsqueeze(1)
                 step_unit = steps_per_16th[target_local_indices].unsqueeze(1)
                 off_tensor = torch.tensor(offsets, device=self.device).unsqueeze(0)
-                hit_times = base + off_tensor * step_unit
+                hit_times_float = base + off_tensor * step_unit
+                hit_times = torch.round(hit_times_float).long()
                 valid_hits = hit_times < self.max_steps
                 
                 for i in range(len(target_local_indices)):

@@ -170,7 +170,7 @@ class PorcaroRLEnv(DirectRLEnv):
         # リズム生成器の切り替えロジック (維持)
         # =========================================================
         self.dt_ctrl_step = self.cfg.sim.dt * self.cfg.decimation
-        self.target_hit_force = getattr(self.cfg, "target_hit_force", 20.0)
+        self.target_hit_force = getattr(self.cfg, "target_hit_force", 30.0)
 
         self.rhythm_generator = RhythmGenerator(
             num_envs=self.num_envs,

@@ -29,6 +29,8 @@ class RewardManager:
         self.prev_is_rest = torch.ones(num_envs, dtype=torch.bool, device=self.device)
         self.current_time_s = torch.zeros(num_envs, device=self.device)
         self.max_height_since_last_hit = torch.full((num_envs,), -1.0, device=self.device)
+
+        self.has_hit_current_note = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         
         threshold_deg = getattr(cfg, "swing_amplitude_threshold_deg", 9.0)
         self.swing_threshold = threshold_deg * (math.pi / 180.0)
@@ -53,6 +55,7 @@ class RewardManager:
         self.prev_is_rest[env_ids] = True
         self.current_time_s[env_ids] = 0.0
         self.max_height_since_last_hit[env_ids] = -1.0
+        self.has_hit_current_note[env_ids] = False
         for key in self.episode_sums:
             self.episode_sums[key][env_ids] = 0.0
 
@@ -89,6 +92,8 @@ class RewardManager:
         terms = {}
         is_touching = (force_z > self.hit_threshold)
         is_rest_period = (target_force_trace < self.rest_threshold)
+
+        self.has_hit_current_note[is_rest_period] = False
 
         # ----------------------------------------------------
         # 1. Miss Penalty
@@ -173,7 +178,9 @@ class RewardManager:
                 thresholds = dyn_cooltime[valid_ids]
                 is_cooled_down = (time_since_last > thresholds)
 
-                rewardable_hits = hit_in_note & is_cooled_down
+                is_not_locked = ~self.has_hit_current_note[valid_ids]
+
+                rewardable_hits = hit_in_note & is_cooled_down & is_not_locked
                 
                 success_ids = valid_ids[rewardable_hits]
                 if len(success_ids) > 0:
@@ -186,6 +193,8 @@ class RewardManager:
                     
                     match_reward[success_ids] = base_reward * match_scale_factor[success_ids]
                     self.last_reward_time[success_ids] = self.current_time_s[success_ids]
+
+                    self.has_hit_current_note[success_ids] = True
 
                 # ペナルティ判定
                 too_fast_ids = valid_ids[hit_in_note & (~is_cooled_down)]
