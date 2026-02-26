@@ -15,6 +15,8 @@ Usage:
   --load_run 2026-02-15_20-55-46 \
   --midi songs/test_single8_bpm120.mid \
   --video
+
+  python scripts/rsl_rl/play_sim_midi.py   --task Template-Porcaro-Direct-ModelB   --experiment porcaro_rslrl_lstm_modelB_DR   --load_run 2026-02-25_22-28-09  --midi songs/test_single8_bpm160.mid   --video
 """
 
 import argparse
