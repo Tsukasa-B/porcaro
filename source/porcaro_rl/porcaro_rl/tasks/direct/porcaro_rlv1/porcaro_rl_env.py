@@ -55,7 +55,7 @@ class PorcaroRLEnv(DirectRLEnv):
         # 1iterationあたり246043steps
         # Lv0 -> Lv1: 50 iters (約12.5M steps)
         # Lv1 -> Lv2: 200 iters (累積 約50M steps)
-        self.curriculum_thresholds = [12_500_000, 50_000_000]
+        self.curriculum_thresholds = [50_000_000, 150_000_000]
 
         # 物理パラメータを変えずに、強化学習が見る値だけを実機スケールに合わせる
         self.force_scale_sim_to_real = 3.0
