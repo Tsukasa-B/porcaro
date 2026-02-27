@@ -55,7 +55,7 @@ class PorcaroRLEnv(DirectRLEnv):
         # 1iterationあたり246043steps
         # Lv0 -> Lv1: 50 iters (約12.5M steps)
         # Lv1 -> Lv2: 200 iters (累積 約50M steps)
-        self.curriculum_thresholds = [50_000_000, 150_000_000]
+        self.curriculum_thresholds = [25_000_000, 100_000_000]
 
         # 物理パラメータを変えずに、強化学習が見る値だけを実機スケールに合わせる
         self.force_scale_sim_to_real = 3.0
@@ -622,8 +622,16 @@ class PorcaroRLEnv(DirectRLEnv):
         # [追加] BPM情報をRewardManagerに渡す
         current_bpms = self.rhythm_generator.current_bpms if hasattr(self, "rhythm_generator") else None
 
+        telemetry = self.action_controller.get_last_telemetry()
+        if telemetry is not None and "P_out" in telemetry:
+            p_out = telemetry["P_out"]
+        else:
+            # 万が一取得できなかった場合のフォールバック
+            p_out = torch.zeros((self.num_envs, 3), device=self.device)
+
         total_reward, reward_terms = self.reward_manager.compute_rewards(
             actions=self.actions,
+            p_out=p_out,
             joint_pos=q_corr,
             force_z=force_max, 
             target_force_trace=target_trace, 

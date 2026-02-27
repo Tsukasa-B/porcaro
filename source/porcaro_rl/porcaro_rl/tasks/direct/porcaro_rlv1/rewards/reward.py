@@ -32,7 +32,7 @@ class RewardManager:
 
         self.has_hit_current_note = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         
-        threshold_deg = getattr(cfg, "swing_amplitude_threshold_deg", 2.0)
+        threshold_deg = getattr(cfg, "swing_amplitude_threshold_deg", 0.5)
         self.swing_threshold = threshold_deg * (math.pi / 180.0)
 
         # --- ログ・集計用バッファ ---
@@ -43,7 +43,9 @@ class RewardManager:
             "miss_penalty": torch.zeros(num_envs, device=self.device),
             "double_hit_penalty": torch.zeros(num_envs, device=self.device),
             "contact_limit": torch.zeros(num_envs, device=self.device),
-            "joint_limit": torch.zeros(num_envs, device=self.device)
+            "joint_limit": torch.zeros(num_envs, device=self.device),
+            "wrist_co_contract": torch.zeros(num_envs, device=self.device),
+            "grip_penalty": torch.zeros(num_envs, device=self.device)
         }
 
     def reset_idx(self, env_ids: torch.Tensor):
@@ -61,6 +63,7 @@ class RewardManager:
 
     def compute_rewards(self, 
                         actions: torch.Tensor, 
+                        p_out: torch.Tensor,
                         joint_pos: torch.Tensor, 
                         force_z: torch.Tensor, 
                         target_force_trace: torch.Tensor,
@@ -210,7 +213,7 @@ class RewardManager:
         violation = is_rest_period & is_touching
         
         # 変更箇所: 休符中のかすり(2.0N以下)を許容するデッドバンド追加
-        force_excess = (force_z - 2.0).clamp(min=0.0)
+        force_excess = (force_z - 1.0).clamp(min=0.0)
         rest_pen_base = torch.where(violation, (force_excess / 10.0), torch.zeros(self.num_envs, device=self.device))
         terms["rest_penalty"] = rest_pen_base * time_scale_factor
 
@@ -219,8 +222,28 @@ class RewardManager:
         
         terms["joint_limit"] = torch.zeros(self.num_envs, device=self.device)
 
+        # ====================================================
+        # ★ 変更箇所: 実際の内圧(P_out)を用いた身体性制約 ★
+        # ====================================================
+        # p_out [MPa] を最大圧力(0.6)で割って 0.0~1.0 の活性度に変換
+        P_MAX = 0.6
+        act_df = (p_out[:, 0] / P_MAX).clamp(0.0, 1.0)
+        act_f  = (p_out[:, 1] / P_MAX).clamp(0.0, 1.0)
+        act_g  = (p_out[:, 2] / P_MAX).clamp(0.0, 1.0)
+
+        # 1. 手首の共収縮ペナルティ (Wrist Co-contraction)
+        # DFとFの両方に同時に空気が入っていると減点
+        terms["wrist_co_contract"] = (act_df * act_f) * time_scale_factor* dt
+
+        # 2. グリップの脱力ペナルティ (Grip Penalty)
+        # Gを強く握り続けていると減点 (2乗することで一瞬の握りは許容しやすくする)
+        terms["grip_penalty"] = (act_g ** 2) * time_scale_factor *dt
+        # ====================================================
+
         w_miss = getattr(self.cfg, "weight_miss", -10.0)
         w_double = getattr(self.cfg, "weight_double_hit", -5.0)
+        w_wrist_co = getattr(self.cfg, "weight_wrist_co_contract", -0.05)
+        w_grip_pen = getattr(self.cfg, "weight_grip_penalty", -0.01)
 
         total_reward = (
             terms["match"] * self.cfg.weight_match +
@@ -229,7 +252,9 @@ class RewardManager:
             terms["contact_limit"] * self.cfg.weight_contact_continuous +
             terms["joint_limit"] * self.cfg.weight_joint_limits +
             terms["miss_penalty"] * w_miss +
-            terms["double_hit_penalty"] * w_double
+            terms["double_hit_penalty"] * w_double +
+            terms["wrist_co_contract"] * w_wrist_co + # 追加
+            terms["grip_penalty"] * w_grip_pen
         )
         
         self.prev_is_rest = is_rest_period.clone()

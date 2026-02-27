@@ -11,7 +11,7 @@ class RewardsCfg:
 
     # --- ズル防止パラメータ ---
     # grip0のとき，手首が9度ぐらいで打面に接触するため、10度を「振りかぶった」と認めるギリギリの閾値とする
-    swing_amplitude_threshold_deg: float = 2 
+    swing_amplitude_threshold_deg: float = 0.5 
 
     # --- 報酬重み (w_i) ---
 
@@ -25,13 +25,13 @@ class RewardsCfg:
     
     # 2. 休符の遵守 (Rest Compliance)
     # 変更箇所: Matchに合わせて1/10スケールダウン
-    weight_rest: float = 0.01             # 変更: 0.1 -> 0.01
-    weight_rest_penalty: float = -0.5    # 変更: -0.5 -> -0.05
+    weight_rest: float = 0.005             # 変更: 0.1 -> 0.01
+    weight_rest_penalty: float = -0.01    # 変更: -0.5 -> -0.05
 
     # 3. 接触継続ペナルティ (Anti-Pushing)
     # 変更箇所: 1/10スケールダウン
-    weight_contact_continuous: float = -0.5  # 変更: -2.0 -> -0.2
-    max_contact_duration_s: float = 0.05 
+    weight_contact_continuous: float = -0.2  # 変更: -2.0 -> -0.2
+    max_contact_duration_s: float = 0.04 
 
     # 4. その他
     weight_joint_limits: float = 0.0
@@ -42,6 +42,15 @@ class RewardsCfg:
     # 変更箇所: ダブル失敗時のペナルティをさらに緩和して1/10スケールダウン
     # （前回の提案であった「-0.5」のさらに1/10となる「-0.05」を設定します）
     weight_double_hit: float = -0.5      # 変更: -1.0 -> -0.05
+
+    # =========================================================
+    # 変更箇所: 身体性の創発を促すシンプルな制約（追加）
+    # =========================================================
+    # 手首の共収縮(ガチガチ)防止：DFとFが同時に高いとペナルティ
+    weight_wrist_co_contract: float = -0.5
+    
+    # グリップの脱力促進：Gを強く握り続けるとペナルティ
+    weight_grip_penalty: float = -0.5
 
     # --- 評価基準パラメータ ---
     target_force_fd: float = 20.0 # 基準となる力
