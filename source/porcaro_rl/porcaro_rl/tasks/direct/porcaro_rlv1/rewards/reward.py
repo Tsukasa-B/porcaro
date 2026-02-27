@@ -32,7 +32,7 @@ class RewardManager:
 
         self.has_hit_current_note = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         
-        threshold_deg = getattr(cfg, "swing_amplitude_threshold_deg", 9.0)
+        threshold_deg = getattr(cfg, "swing_amplitude_threshold_deg", 2.0)
         self.swing_threshold = threshold_deg * (math.pi / 180.0)
 
         # --- ログ・集計用バッファ ---
@@ -117,7 +117,7 @@ class RewardManager:
         )
 
         # ----------------------------------------------------
-        # 2. Match Reward (打撃判定ロジックの改善)
+        # 2. Match Reward (打撃判定ロジック)
         # ----------------------------------------------------
         match_reward = torch.zeros(self.num_envs, device=self.device)
         double_hit_penalty_term = torch.zeros(self.num_envs, device=self.device)
@@ -127,19 +127,8 @@ class RewardManager:
         if rising.any():
             ids = torch.where(rising)[0]
             
-            # 変更箇所: ダブルストローク（連打）の2打目は振りかぶり閾値を大幅に下げる
-            time_since_last = self.current_time_s[ids] - self.last_reward_time[ids]
-            # 直前の打撃から16分音符の1.8倍以内であれば「連打」とみなす
-            is_quick_succession = (self.last_reward_time[ids] > 0.0) & (time_since_last < t_16th[ids] * 1.8)
-            
-            # 連打時は要求する振りかぶり角度を 20% (例: 9度 -> 1.8度) に緩和
-            dynamic_swing_threshold = torch.where(
-                is_quick_succession,
-                self.swing_threshold * 0.2, 
-                self.swing_threshold
-            )
-            
-            valid_swing = self.max_height_since_last_hit[ids] > dynamic_swing_threshold
+            # 変更箇所: 動的閾値を廃止し、厳格に固定の swing_threshold を要求する
+            valid_swing = self.max_height_since_last_hit[ids] > self.swing_threshold
             
             self.hit_state[ids] = torch.where(valid_swing, torch.tensor(1, device=self.device), torch.tensor(2, device=self.device))
             
@@ -162,48 +151,48 @@ class RewardManager:
                 if is_new_peak.any():
                     self.current_peak_force[upd_ids[is_new_peak]] = curr_force[is_new_peak]
 
-        # C. Falling Edge (離脱: 報酬確定)
+        # C. Falling Edge (離脱: 報酬・ペナルティ確定)
         falling = (self.hit_state != 0) & (~is_touching)
         if falling.any():
             ids = torch.where(falling)[0]
             
-            valid_hits = (self.hit_state[ids] == 1) 
-            if valid_hits.any():
-                valid_ids = ids[valid_hits]
+            hit_in_note = (self.peak_timing_scale[ids] > 0.005)
+            time_since_last_reward = self.current_time_s[ids] - self.last_reward_time[ids]
+            
+            # 変更箇所: クールタイムの動的緩和も廃止し、dyn_cooltime を厳格に適用
+            is_cooled_down = (time_since_last_reward > dyn_cooltime[ids])
+            is_not_locked = ~self.has_hit_current_note[ids]
+
+            # --- 報酬の付与 (hit_state == 1 のみ) ---
+            valid_hits = (self.hit_state[ids] == 1)
+            rewardable_mask = valid_hits & hit_in_note & is_cooled_down & is_not_locked
+            success_ids = ids[rewardable_mask]
+            
+            if len(success_ids) > 0:
+                accuracy_score, magnitude_score = self._evaluate_hit(
+                    self.current_peak_force[success_ids], 
+                    target_force_ref[success_ids]
+                )
+                base_reward = 0.2 + (0.4 * magnitude_score) + (0.4 * accuracy_score)
+                match_reward[success_ids] = base_reward * match_scale_factor[success_ids]
                 
-                # 変更箇所: 判定閾値を微小に緩和 (遅れた2打目も拾えるように 0.01 -> 0.005)
-                hit_in_note = (self.peak_timing_scale[valid_ids] > 0.005)
+                self.last_reward_time[success_ids] = self.current_time_s[success_ids]
+                self.has_hit_current_note[success_ids] = True
+
+            # --- ペナルティの付与 (すべての接触 hit_state == 1 or 2 が対象) ---
+            # 1. ノート内だがクールタイムを満たしていない（マシンガン連打）
+            too_fast_mask = hit_in_note & (~is_cooled_down)
+            too_fast_ids = ids[too_fast_mask]
+            if len(too_fast_ids) > 0:
+                double_hit_penalty_term[too_fast_ids] = 1.0 * match_scale_factor[too_fast_ids]
                 
-                time_since_last = self.current_time_s[valid_ids] - self.last_reward_time[valid_ids]
-                thresholds = dyn_cooltime[valid_ids]
-                is_cooled_down = (time_since_last > thresholds)
+            # 2. ノート外の打撃（休符中の接触、または完全にタイミングを外した打撃）
+            rest_hit_mask = ~hit_in_note
+            rest_hit_ids = ids[rest_hit_mask]
+            if len(rest_hit_ids) > 0:
+                double_hit_penalty_term[rest_hit_ids] = 1.0 * match_scale_factor[rest_hit_ids]
 
-                is_not_locked = ~self.has_hit_current_note[valid_ids]
-
-                rewardable_hits = hit_in_note & is_cooled_down & is_not_locked
-                
-                success_ids = valid_ids[rewardable_hits]
-                if len(success_ids) > 0:
-                    accuracy_score, magnitude_score = self._evaluate_hit(
-                        self.current_peak_force[success_ids], 
-                        target_force_ref[success_ids]
-                    )
-                    
-                    base_reward = 0.2 + (0.4 * magnitude_score) + (0.4 * accuracy_score)
-                    
-                    match_reward[success_ids] = base_reward * match_scale_factor[success_ids]
-                    self.last_reward_time[success_ids] = self.current_time_s[success_ids]
-
-                    self.has_hit_current_note[success_ids] = True
-
-                # ペナルティ判定
-                too_fast_ids = valid_ids[hit_in_note & (~is_cooled_down)]
-                if len(too_fast_ids) > 0:
-                    double_hit_penalty_term[too_fast_ids] = 1.0 * match_scale_factor[too_fast_ids]
-                rest_hit_ids = valid_ids[~hit_in_note]
-                if len(rest_hit_ids) > 0:
-                    double_hit_penalty_term[rest_hit_ids] = 1.0 * match_scale_factor[rest_hit_ids]
-
+            # ステートリセット
             self.hit_state[ids] = 0
             self.current_peak_force[ids] = 0.0
             self.peak_timing_scale[ids] = 0.0

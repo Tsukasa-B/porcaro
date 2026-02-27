@@ -88,11 +88,11 @@ class RhythmGenerator:
             bpms = self.bpm_options[idxs]
 
             if self.curriculum_level == 0:
-                probs = torch.tensor([0.4, 0.5, 0.0, 0.1], device=self.device)
+                probs = torch.tensor([0.4, 0.45, 0.05, 0.1], device=self.device)
             elif self.curriculum_level == 1:
                 probs = torch.tensor([0.2, 0.4, 0.3, 0.1], device=self.device)
             else:
-                probs = torch.tensor([0.2, 0.3, 0.4, 0.1], device=self.device)
+                probs = torch.tensor([0.2, 0.2, 0.5, 0.1], device=self.device)
             
             ep_pat_idxs = torch.multinomial(probs, num_reset, replacement=True)
             ep_patterns = [self.pattern_keys[i] for i in ep_pat_idxs.tolist()]
