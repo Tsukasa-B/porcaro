@@ -645,12 +645,12 @@ class PorcaroRLEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # [変更]: 動的タイムアウト判定
         # BPMに基づく「4小節終了ステップ数」を超えたらタイムアウト
-        #time_outs = self.episode_length_buf >= self.episode_duration_steps
+        time_outs = self.episode_length_buf >= self.episode_duration_steps
         """
         後で修正
         """
         # 代わりに、すべてFalseで初期化する
-        time_outs = torch.zeros_like(self.episode_length_buf, dtype=torch.bool)
+        #time_outs = torch.zeros_like(self.episode_length_buf, dtype=torch.bool)
         
         # 安全策: バッファ溢れ防止
         time_outs |= (self.episode_length_buf >= self.max_episode_length - 1)
