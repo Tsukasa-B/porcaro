@@ -76,8 +76,8 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     drum_contact_cfg: ContactSensorCfg = drum_vs_stick_cfg
     
     action_space: int = 3
-    # q(2) + qd(2) + last_act(2) + phase(2) + bpm(1) + lookahead(25) = 34
-    observation_space: int = 35
+    # q(2) + qd(2) + last_act(2) + phase(2) + bpm(1) + lookahead(50) = 34
+    observation_space: int = 60
     state_space: int = 0
     
     dof_names: list[str] = ["Base_link_Wrist_joint", "Hand_link_Grip_joint"]
@@ -97,7 +97,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     
     target_hit_force: float = 20.0
 
-    lookahead_horizon: float = 0.5
+    lookahead_horizon: float = 1.0
     
     # [情報]: BPM範囲の設定 (Generator側で離散セット[60,80...160]を使用するため、ここは参照用)
     bpm_range: tuple[float, float] = (60.0, 160.0)
@@ -134,7 +134,7 @@ def apply_domain_randomization(cfg: PorcaroRLEnvCfg):
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "mass_distribution_params": (0.9, 1.1),
+            "mass_distribution_params": (0.95, 1.05),
             "operation": "scale",
         },
     )
@@ -143,8 +143,8 @@ def apply_domain_randomization(cfg: PorcaroRLEnvCfg):
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "static_friction_range": (0.75, 1.25),
-            "dynamic_friction_range": (0.75, 1.25),
+            "static_friction_range": (0.95, 1.05),
+            "dynamic_friction_range": (0.95, 1.05),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
@@ -215,7 +215,7 @@ class PorcaroRLEnvCfg_ModelB_DR(PorcaroRLEnvCfg_ModelB):
         apply_domain_randomization(self)
 
         # 下限 0.3 (高速・高周波応答) 〜 上限 1.0 (低速・ステップ応答)
-        self.pam_tau_scale_range = (0.3, 1.0)
+        self.pam_tau_scale_range = (0.8, 1.2)
 
 
 # --- [Model C] ActuatorNet ---

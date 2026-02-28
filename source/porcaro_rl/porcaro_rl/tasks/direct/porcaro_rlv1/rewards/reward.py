@@ -84,7 +84,7 @@ class RewardManager:
         t_16th = 15.0 / safe_bpm
         
         # 変更箇所: クールタイムと接触許容時間の大幅緩和
-        dyn_max_contact   = t_16th * 0.60 # バウンドでもたつくのを長めに許容 (0.50 -> 0.60)
+        dyn_max_contact   = t_16th * 0.40 # バウンドでもたつくのを長めに許容 (0.50 -> 0.60)
         dyn_cooltime      = t_16th * 0.25 # 16分音符の1/4の時間で次の打撃(2打目)を許容する (0.50 -> 0.25)
         dyn_impact_window = t_16th * 0.40
         dyn_miss_thresh   = t_16th * 2.00
