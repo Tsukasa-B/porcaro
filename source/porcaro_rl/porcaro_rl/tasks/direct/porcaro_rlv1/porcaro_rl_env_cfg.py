@@ -42,7 +42,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     
     # [変更]: 4小節構造 (BPM60時) に耐えられるよう十分な長さを確保
     # 実際のエピソード終了は BPM に基づき動的に判定されます
-    episode_length_s: float = 20.0
+    episode_length_s: float = 100.0
     
     # --- シミュレーション設定 ---
     sim: SimulationCfg = SimulationCfg(

@@ -10,7 +10,7 @@ from isaaclab_rl.rsl_rl import (
 ) 
 
 @configclass
-class PPORunnerMlpCfg(RslRlOnPolicyRunnerCfg):
+class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # ★ LSTMの設定と完全に一致させる
     num_steps_per_env = 120
     max_iterations = 1000
