@@ -18,10 +18,10 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     
     # ★変更: 150 -> 1500
     # 長時間のエピソードで安定したリズムを習得するため、試行回数を増やします。
-    max_iterations = 1000
+    max_iterations = 1500
     
     save_interval = 50
-    experiment_name = "porcaro_rslrl_lstm_modelB_noDR" # 名前を変えておくと管理しやすいです
+    experiment_name = "porcaro_rslrl_lstm_modelB_DR_lookahead5" # 名前を変えておくと管理しやすいです
     
     # 💡 修正点2: PolicyクラスをRecurrentバージョンに変更
     policy = RslRlPpoActorCriticRecurrentCfg(

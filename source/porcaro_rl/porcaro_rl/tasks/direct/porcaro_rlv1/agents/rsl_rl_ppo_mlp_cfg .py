@@ -13,11 +13,11 @@ from isaaclab_rl.rsl_rl import (
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # ★ LSTMの設定と完全に一致させる
     num_steps_per_env = 120
-    max_iterations = 1000
+    max_iterations = 1500
     save_interval = 50
     
     # ★変更: 実験名が混ざらないように MLP & DRなし であることを明記
-    experiment_name = "porcaro_rslrl_mlp_modelB_noDR" 
+    experiment_name = "porcaro_rslrl_mlp_modelB_DR_lookahead5" 
     
     # 💡 修正点2: Policyクラスを通常のMLPバージョンに変更
     policy = RslRlPpoActorCriticCfg(
