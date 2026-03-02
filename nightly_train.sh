@@ -18,23 +18,9 @@ BASE_ENV_CFG_DIR="source/porcaro_rl/porcaro_rl/tasks/direct/porcaro_rlv1"
 TARGET_ENV_CFG="${BASE_ENV_CFG_DIR}/porcaro_rl_env_cfg.py"
 SRC_ENV_CFG="${BASE_ENV_CFG_DIR}/porcaro_rl_env_cfgv1.py"
 
-# --- Phase 1: MLP (午前2時開始) ---
-echo "Waiting until 03:00 AM for Phase 1 (MLP)..."
-while [ $(date +%H) -ne 03 ]; do
-    sleep 60
-done
-
-echo "Setting up MLP & Environment configuration..."
-cp "$MLP_SRC" "$TARGET_CFG"
-# 変更箇所: Phase 1開始前に環境設定をv1で上書き
-cp "$SRC_ENV_CFG" "$TARGET_ENV_CFG" 
-
-echo "--- [03:00 AM] Starting Phase 1 (MLP) ---"
-python scripts/rsl_rl/train.py --task Template-Porcaro-Direct-ModelB-DR --num_envs 2048 --headless
-
 
 # --- Phase 2: LSTM (午前6時開始) ---
-echo "Waiting until 06:00 AM for Phase 2 (LSTM)..."
+echo "Waiting until 01:00 AM for Phase 2 (LSTM)..."
 while [ $(date +%H) -lt 08 ]; do
     sleep 60
 done

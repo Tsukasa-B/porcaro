@@ -76,8 +76,8 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     drum_contact_cfg: ContactSensorCfg = drum_vs_stick_cfg
     
     action_space: int = 3
-    # q(2) + qd(2) + last_act(2) + phase(2) + bpm(1) + lookahead(50) = 34
-    observation_space: int = 35
+    # q(2) + qd(2) + last_act(2) + phase(2) + bpm(1) + lookahead(5) = 34
+    observation_space: int = 15
     state_space: int = 0
     
     dof_names: list[str] = ["Base_link_Wrist_joint", "Hand_link_Grip_joint"]
@@ -97,7 +97,7 @@ class PorcaroRLEnvCfg(DirectRLEnvCfg):
     
     target_hit_force: float = 20.0
 
-    lookahead_horizon: float = 0.5
+    lookahead_horizon: float = 0.1
     
     # [情報]: BPM範囲の設定 (Generator側で離散セット[60,80...160]を使用するため、ここは参照用)
     bpm_range: tuple[float, float] = (60.0, 160.0)
